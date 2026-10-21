@@ -69,10 +69,21 @@ typedef struct native_handle {
     int data[0];
 } native_handle_t;
 
-extern const native_handle_t* AHardwareBuffer_getNativeHandle(const AHardwareBuffer* buffer);
+/* AHardwareBuffer_getNativeHandle is exported by libnativewindow.so but is not
+ * in the NDK stubs (it is a vendor/LL-NDK API), so resolve it at run time. */
+typedef const native_handle_t* (*PFN_AHardwareBuffer_getNativeHandle)(const AHardwareBuffer* buffer);
 
 int AHardwareBuffer_getFd(AHardwareBuffer* hardwareBuffer) {
-    const native_handle_t* nativeHandle = AHardwareBuffer_getNativeHandle(hardwareBuffer);
+    static PFN_AHardwareBuffer_getNativeHandle getNativeHandle;
+    if (!getNativeHandle) {
+        getNativeHandle = (PFN_AHardwareBuffer_getNativeHandle)dlsym(RTLD_DEFAULT, "AHardwareBuffer_getNativeHandle");
+        if (!getNativeHandle) {
+            void* lib = dlopen("libnativewindow.so", RTLD_NOW);
+            if (lib) getNativeHandle = (PFN_AHardwareBuffer_getNativeHandle)dlsym(lib, "AHardwareBuffer_getNativeHandle");
+        }
+        if (!getNativeHandle) return -1;
+    }
+    const native_handle_t* nativeHandle = getNativeHandle(hardwareBuffer);
     return nativeHandle && nativeHandle->numFds > 0 ? nativeHandle->data[0] : -1;
 }
 
