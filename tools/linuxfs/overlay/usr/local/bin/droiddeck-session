@@ -292,6 +292,9 @@ if [ -z "${BL_INSIDE:-}" ]; then
     # [mali-g2] No gamescope: it needs a DRM device and dma-buf import, which Vortek does not offer.
     unset STEAM_MULTIPLE_XWAYLANDS STEAM_USE_MANGOAPP STEAM_MANGOAPP_PRESETS_SUPPORTED \
       STEAM_MANGOAPP_HORIZONTAL_SUPPORTED MANGOHUD_CONFIGFILE gamescope_cursor_composite BL_STRETCHED
+    # OpenGL stays on the CPU (llvmpipe): zink cannot run over Vortek. Vulkan goes through Vortek.
+    unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2
+    export GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1
     start_vortek_display || exit 66
   elif [ "$mode" = steam ]; then
     run_gamescope "${args[@]}" -- "$0" "$mode" "$@"

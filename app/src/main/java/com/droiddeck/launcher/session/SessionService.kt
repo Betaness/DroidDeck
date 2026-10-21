@@ -643,6 +643,11 @@ class SessionService : Service() {
             guest.add(LinuxVulkanDriver.ENV + "=" + VortekServerComponent.GUEST_ICD)
             guest.add("VK_ICD_FILENAMES=" + VortekServerComponent.GUEST_ICD)
             guest.add("VK_DRIVER_FILES=" + VortekServerComponent.GUEST_ICD)
+            // OpenGL (the Steam client's own GLX window, its update UI) cannot use zink over Vortek:
+            // zink fails ("failed to load driver: zink") and Steam exits at glXChooseVisual. Use llvmpipe.
+            guest.removeAll { it.startsWith("MESA_LOADER_DRIVER_OVERRIDE=") || it.startsWith("GALLIUM_DRIVER=") || it.startsWith("LIBGL_KOPPER_DRI2=") }
+            guest.add("GALLIUM_DRIVER=llvmpipe")
+            guest.add("LIBGL_ALWAYS_SOFTWARE=1")
             vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
             Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
         }
