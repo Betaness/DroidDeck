@@ -134,11 +134,14 @@ object SessionFiles {
         val fexPreloads = listOf("x86_64", "i386").flatMap { arch ->
             listOf("libblsession.so", "libfakeinput.so", "libfaultreport.so").map { "$arch/$it" to "usr/local/lib/droiddeck-fex/$arch/$it" }
         } + listOf("libvulkan-thunk.so", "libwebkitinput.so").map { "x86_64/$it" to "usr/local/lib/droiddeck-fex/x86_64/$it" }
+        // [mali-g2] Vortek's guest ICD (mali-g2/vortek), used with VortekServerComponent on Mali.
+        val vortek = (listOf("libvulkan_vortek.so", "vortek_icd.aarch64.json").map { "usr/local/lib/droiddeck-vortek/$it" } +
+            listOf("LGPL-2.1", "NOTICE").map { "usr/local/share/licenses/droiddeck-vortek/$it" }).map { it to it }
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads).filter { (asset, _) ->
+        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads + vortek).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }

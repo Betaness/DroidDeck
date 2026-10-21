@@ -2050,7 +2050,7 @@ class MainActivity : ComponentActivity() {
             Thread({ checkCatalog() }, "catalog").start()
             return
         }
-        if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()) { showNonAdreno = release; return }
+        if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.supported(this)) { showNonAdreno = release; return }
         install(release)
     }
 
@@ -2065,7 +2065,7 @@ class MainActivity : ComponentActivity() {
             showPhantomGate = true
             return false
         }
-        val warn = installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()
+        val warn = installed == null && !com.droiddeck.launcher.core.DeviceSupport.supported(this)
         if (warn && available != null) { showNonAdreno = available; return false }
         startActivity(intent)
         return true

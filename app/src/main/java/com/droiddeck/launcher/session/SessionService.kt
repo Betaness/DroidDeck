@@ -58,6 +58,8 @@ class SessionService : Service() {
         super.attachBaseContext(com.droiddeck.launcher.core.AppLanguage.wrap(newBase))
 
     private val components = java.util.concurrent.CopyOnWriteArrayList<SessionPart>()
+    @Volatile private var vortekMode = false
+    @Volatile private var vortekEnv: List<String> = emptyList()
     private var deckBinds: List<String> = emptyList()
     private var inputSysfs: InputSysfsComponent? = null
     private val stopLock = Any()
@@ -394,6 +396,11 @@ class SessionService : Service() {
         val fastPathAt = guest.size
 
         val pulse = startAudio(guest, sessionDir)
+        if (vortekMode) {
+            val vortek = VortekServerComponent(File(runtimeDir, "vortek/V0"), File(sessionDir, "vortek.log"), vortekEnv)
+            vortek.attach(this)
+            components.add(vortek)
+        }
 
         guest.add("BL_WIDTH=" + size.first)
         guest.add("BL_HEIGHT=" + size.second)
@@ -623,6 +630,21 @@ class SessionService : Service() {
         )
         LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
             ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+        // [mali-g2] No Adreno: the guest's Vulkan goes through Vortek to the vendor driver (VortekServerComponent),
+        // and the session runs without gamescope. BL_GPU_MODE=<anything else> in droiddeck-env turns it off.
+        val userEnv = extraEnv()
+        vortekEnv = emptyList()
+        vortekMode = VortekServerComponent.available(this) &&
+            userEnv.lastOrNull { it.startsWith("BL_GPU_MODE=") }.let { it == null || it == "BL_GPU_MODE=" + VortekServerComponent.MODE }
+        if (vortekMode) {
+            guest.add("BL_GPU_MODE=" + VortekServerComponent.MODE)
+            guest.add("VORTEK_SERVER_PATH=" + VortekServerComponent.GUEST_SOCKET)
+            guest.add(LinuxVulkanDriver.ENV + "=" + VortekServerComponent.GUEST_ICD)
+            guest.add("VK_ICD_FILENAMES=" + VortekServerComponent.GUEST_ICD)
+            guest.add("VK_DRIVER_FILES=" + VortekServerComponent.GUEST_ICD)
+            vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
+            Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
+        }
         val tuOverride = tuDebugOverride()
         val tuDriver = sysmemDriver(linuxDriverId)
         (tuOverride ?: "sysmem".takeIf { tuDriver || SessionPrefs.tuSysmem(this) })?.let { guest.add("TU_DEBUG=$it") }
@@ -653,7 +675,7 @@ class SessionService : Service() {
         if (SessionState.mode == MODE_STEAM && SessionPrefs.zramCompression(this) &&
             com.droiddeck.launcher.core.ZramSupport.supported()) guest.add("BL_ZRAM=1")
         guest.add("BANNER_AUDIO_DIRECT_DECAY=0")
-        val extra = extraEnv() + com.droiddeck.launcher.agent.AgentEnv.beginSession(this)
+        val extra = userEnv + com.droiddeck.launcher.agent.AgentEnv.beginSession(this)
         if (extra.none { it.startsWith("TU_DEBUG=") }) guest.add("$GAME_TU_DEBUG=" + (tuOverride ?: if (tuDriver) "sysmem" else ""))
         extra.forEach { guest.add(it) }
         val clientPinned = steamHere && SessionPrefs.clientCpusOverride(this)
@@ -1768,7 +1790,8 @@ class SessionService : Service() {
         private const val ACTION_AUXILIARY_EXITED = "com.droiddeck.launcher.AUXILIARY_EXITED"
         private const val EXTRA_AUXILIARY_PID = "auxiliaryPid"
         private val STRAGGLERS = listOf("droiddeck-session", "gamescope", "Xwayland", "steamrtarm64",
-            "steamwebhelper", "linuxfs/opt/android-host/proot", "/libproot.so", "pulseaudio/libpulseaudio.so")
+            "steamwebhelper", "linuxfs/opt/android-host/proot", "/libproot.so", "pulseaudio/libpulseaudio.so",
+            "/" + VortekServerComponent.BINARY)
         private const val GRACE_MS = 1200L
         private const val STEAM_PICKUP_MS = 1500L
         private const val STEAM_EXIT_MS = 10_000L

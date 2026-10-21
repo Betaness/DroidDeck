@@ -284,6 +284,11 @@ public final class TurnipDriver {
         }
         String quest = QuestExperimental.INSTANCE.defaultAndroidDriver();
         if (quest != null) return quest;
+        // [mali-g2] Turnip only drives Adreno: elsewhere the compositor uses the system Vulkan driver.
+        if (com.droiddeck.launcher.core.DeviceSupport.INSTANCE.vendorVulkanOnly()) {
+            Log.i(TAG, "no Adreno GPU: the compositor uses the system Vulkan driver");
+            return null;
+        }
         String model = gpuModel();
         Log.i(TAG, "gpu model: " + (model == null ? "unknown" : model));
         if (model != null) {

@@ -120,6 +120,44 @@ if [ -n "${BL_VK_DRIVER:-}" ]; then
 fi
 export GAMESCOPE_FORCE_VULKAN_REALTIME=${BL_GAMESCOPE_REALTIME:-0}
 
+# [mali-g2] Mali (BL_GPU_MODE=vortek): the guest's Vulkan driver is Vortek, which the app forwards to
+# the vendor driver (VortekServerComponent, socket $VORTEK_SERVER_PATH). The session's program runs on
+# a rootful Xwayland drawing into the app's compositor with wl_shm (-shm: no glamor, there is no render
+# node), and Vortek presents into X windows with MIT-SHM. Xwayland's own log is xwayland.log.
+start_vortek_display() {
+  local i xfile xnum sock=${VORTEK_SERVER_PATH:-/run/droiddeck/vortek/V0}
+  local -a xw_args
+  for i in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
+  if [ -S "$sock" ]; then
+    echo "== vortek: server socket $sock ready, ICD ${VK_DRIVER_FILES:-none}"
+  else
+    echo "== vortek: NO server socket at $sock - Vulkan will fail (see vortek.log)"
+  fi
+  if ! command -v Xwayland >/dev/null 2>&1; then
+    echo "DD_VORTEK_NO_XWAYLAND: this runtime has no Xwayland, so nothing can be displayed"
+    return 1
+  fi
+  xw_args=(-geometry "${width}x${height}" -nolisten tcp -noreset -shm)
+  timeout 5 Xwayland -help 2>&1 | grep -q -e '-fullscreen' && xw_args+=(-fullscreen)
+  [ -n "${BL_XWAYLAND_ARGS:-}" ] && read -r -a _bl_xw_extra <<<"$BL_XWAYLAND_ARGS" && xw_args+=("${_bl_xw_extra[@]}")
+  # -displayfd, not a fixed display: it also turns off the lock file, which proot cannot link in place.
+  xfile=$(mktemp "${BL_DEBUG_DIR:-/tmp}/xwayland-display.XXXXXX") || return 1
+  echo "== vortek: Xwayland ${xw_args[*]}"
+  Xwayland "${xw_args[@]}" -displayfd 3 3>"$xfile" >>"${BL_DEBUG_DIR:-/tmp}/xwayland.log" 2>&1 &
+  for i in $(seq 1 100); do [ -s "$xfile" ] && break; sleep 0.1; done
+  xnum=$(tr -cd 0-9 < "$xfile")
+  rm -f "$xfile"
+  if [ -z "$xnum" ]; then
+    echo "DD_VORTEK_XWAYLAND_FAILED: Xwayland never answered; see xwayland.log"
+    return 1
+  fi
+  for i in $(seq 1 100); do [ -S "/tmp/.X11-unix/X$xnum" ] && break; sleep 0.1; done
+  export DISPLAY=:$xnum
+  # Everything from here draws through X: Vortek has no Wayland surface support.
+  export WAYLAND_DISPLAY= XDG_SESSION_TYPE=x11
+  echo "== vortek: Xwayland on $DISPLAY at ${width}x${height}, a client of the app's compositor"
+}
+
 start_agent() {
   [ -n "${BL_LAUNCH_DIR:-}" ] && [ -x /usr/local/bin/droiddeck-agent ] || return 0
   mkdir -p "$BL_LAUNCH_DIR/agent"
@@ -250,11 +288,17 @@ if [ -z "${BL_INSIDE:-}" ]; then
     echo "== gamescope: mangoapp on ($(command -v mangoapp), config $MANGOHUD_CONFIGFILE)"
   fi
   export BL_INSIDE=1
-  if [ "$mode" = steam ]; then
+  if [ "${BL_GPU_MODE:-}" = vortek ]; then
+    # [mali-g2] No gamescope: it needs a DRM device and dma-buf import, which Vortek does not offer.
+    unset STEAM_MULTIPLE_XWAYLANDS STEAM_USE_MANGOAPP STEAM_MANGOAPP_PRESETS_SUPPORTED \
+      STEAM_MANGOAPP_HORIZONTAL_SUPPORTED MANGOHUD_CONFIGFILE gamescope_cursor_composite BL_STRETCHED
+    start_vortek_display || exit 66
+  elif [ "$mode" = steam ]; then
     run_gamescope "${args[@]}" -- "$0" "$mode" "$@"
     exit $?
+  else
+    exec gamescope "${args[@]}" -- "$0" "$mode" "$@"
   fi
-  exec gamescope "${args[@]}" -- "$0" "$mode" "$@"
 fi
 
 bl_displays() {
@@ -392,6 +436,10 @@ case $mode in
         droiddeck-steam-x64 --sync-login || true
       fi
       steam_client=("$steam_root/steamrtarm64/steam")
+    fi
+    # [mali-g2] Vortek: the client's web views draw in software unless BL_CEF_GPU=1.
+    if [ "${BL_GPU_MODE:-}" = vortek ] && [ "${BL_CEF_GPU:-0}" != 1 ]; then
+      steam_cef_gpu=0
     fi
     _bl_proton_root=$steam_root
     if [ "$steam_x64" = 1 ]; then
@@ -796,6 +844,7 @@ BUSCONF
     [ "${BL_STEAM_UI:-}" = desktop ] && _bl_ui=()
     _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=vulkan)
     [ "${steam_cef_gpu:-1}" = 1 ] || _bl_cef=(-cef-disable-gpu)
+    [ "${BL_GPU_MODE:-}" = vortek ] && [ "${steam_cef_gpu:-1}" = 0 ] && _bl_cef+=(-cef-disable-gpu-compositing)
     if [ "${BL_DESKTOP:-}" = 1 ] && [ "${BL_STEAM_UI:-}" = desktop ]; then
       _bl_cef=(-cef-disable-gpu)
       _bl_ui=(-nobigpicture)
