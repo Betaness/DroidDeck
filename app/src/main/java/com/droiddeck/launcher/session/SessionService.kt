@@ -648,6 +648,8 @@ class SessionService : Service() {
             guest.removeAll { it.startsWith("MESA_LOADER_DRIVER_OVERRIDE=") || it.startsWith("GALLIUM_DRIVER=") || it.startsWith("LIBGL_KOPPER_DRI2=") }
             guest.add("GALLIUM_DRIVER=llvmpipe")
             guest.add("LIBGL_ALWAYS_SOFTWARE=1")
+            // Bring-up: Proton writes ~/steam-<appid>.log (DXVK output included); SessionArtifacts collects it.
+            if (userEnv.none { it.startsWith("PROTON_LOG=") }) guest.add("PROTON_LOG=1")
             vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
             Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
         }
