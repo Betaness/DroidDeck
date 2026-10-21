@@ -9,3 +9,6 @@
 #ifndef VORTEK_SERVER_PATH
 #define VORTEK_SERVER_PATH "/run/droiddeck/vortek/V0"
 #endif
+
+/* [mali-g2] DroidDeck-only client changes (vortek-0003 and later). */
+#define VORTEK_DROIDDECK 1

@@ -1,0 +1,59 @@
+diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
+index 1e3eaa2..56ae655 100644
+--- a/src/vulkan_calls.c
++++ b/src/vulkan_calls.c
+@@ -245,7 +245,54 @@ VkResult vt_call_vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevic
+     return VK_SUCCESS;
+ }
+ 
++#ifdef VORTEK_DROIDDECK
++static void* findVkDispatchFuncWithName(const char* name);
++#include "ext_commands.h"
++
++/* [mali-g2] Only advertise device extensions whose commands this client implements: the
++ * loader aborts when an app calls a command of an advertised extension that the ICD cannot
++ * resolve (Steam's webhelper died on vkGetPhysicalDeviceFragmentShadingRatesKHR). */
++static bool vt_extension_supported(const char* name) {
++    for (size_t i = 0; i < sizeof(vt_ext_commands) / sizeof(vt_ext_commands[0]); i++) {
++        if (strcmp(vt_ext_commands[i].extension, name) != 0) continue;
++        for (const char* const* c = vt_ext_commands[i].commands; *c; c++) {
++            if (!findVkDispatchFuncWithName(*c)) return false;
++        }
++        return true;
++    }
++    return true;
++}
++
++static VkResult vt_call_vkEnumerateDeviceExtensionPropertiesRaw(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties);
++
++VkResult vt_call_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
++    uint32_t total = 0;
++    VkResult result = vt_call_vkEnumerateDeviceExtensionPropertiesRaw(physicalDevice, pLayerName, &total, NULL);
++    if (result != VK_SUCCESS) return result;
++    VkExtensionProperties* all = calloc(total ? total : 1, sizeof(VkExtensionProperties));
++    if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
++    result = vt_call_vkEnumerateDeviceExtensionPropertiesRaw(physicalDevice, pLayerName, &total, all);
++    if (result != VK_SUCCESS && result != VK_INCOMPLETE) { free(all); return result; }
++    uint32_t kept = 0;
++    for (uint32_t i = 0; i < total; i++) {
++        if (vt_extension_supported(all[i].extensionName)) all[kept++] = all[i];
++    }
++    if (!pProperties) {
++        *pPropertyCount = kept;
++        free(all);
++        return VK_SUCCESS;
++    }
++    uint32_t n = *pPropertyCount < kept ? *pPropertyCount : kept;
++    memcpy(pProperties, all, n * sizeof(VkExtensionProperties));
++    *pPropertyCount = n;
++    free(all);
++    return n < kept ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++static VkResult vt_call_vkEnumerateDeviceExtensionPropertiesRaw(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
++#else
+ VkResult vt_call_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
++#endif
+     VT_CALL_LOCK();
+     if (!pProperties) *pPropertyCount = 0;
+     VkObject* physicalDeviceObject = VkObject_fromHandle(physicalDevice);
