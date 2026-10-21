@@ -372,6 +372,7 @@ class SessionService : Service() {
         // Earlier sessions' reports still read the Steam logs and VAC marker this session replaces.
         SessionArtifacts.awaitCollections()
         SessionArtifacts.finishAbandoned(this)
+        SessionArtifacts.mirrorRecent(this) // [mali-g2]
         VacDiagnostics.arm(this)
         com.droiddeck.launcher.agent.AgentGuest.reset(this)
         com.droiddeck.launcher.stores.gog.GogComet.begin()

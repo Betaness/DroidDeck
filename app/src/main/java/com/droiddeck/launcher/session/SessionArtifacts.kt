@@ -75,9 +75,36 @@ object SessionArtifacts {
             markScrubbed(scrubTree(record))
             SessionEvents.record("session.artifacts_collected", mapOf("reason" to reason), dir)
             File(dir, COMPLETE_MARKER).writeText("collected: $reason at ${now()}\n")
+            mirrorToExternal(context, dir)
         } catch (e: Exception) {
             Log.w(TAG, "collecting session artifacts", e)
         }
+    }
+
+    /**
+     * [mali-g2] Copy a finished, scrubbed session folder to getExternalFilesDir()/logs, where
+     * `adb shell` can read it (the app is not debuggable, so run-as cannot). Keeps the newest 5.
+     */
+    fun mirrorToExternal(context: Context, dir: File) {
+        try {
+            val base = File(context.getExternalFilesDir(null) ?: return, "logs").apply { mkdirs() }
+            val dest = File(base, dir.name)
+            dest.deleteRecursively()
+            dir.copyRecursively(dest, overwrite = true)
+            base.listFiles { f -> f.isDirectory }?.sortedByDescending { it.name }?.drop(5)?.forEach { it.deleteRecursively() }
+            Log.i(TAG, "session logs mirrored to $dest")
+        } catch (e: Exception) {
+            Log.w(TAG, "mirroring session logs", e)
+        }
+    }
+
+    /** [mali-g2] Mirror the newest finished session folders that are not mirrored yet (e.g. from before an update). */
+    fun mirrorRecent(context: Context) {
+        val base = context.getExternalFilesDir(null)?.let { File(it, "logs") }
+        LinuxRuntime.logDir(context).listFiles { f -> SessionPaths.isSessionFolder(f) && File(f, COMPLETE_MARKER).exists() }
+            ?.sortedByDescending { it.name }?.take(3)
+            ?.filter { base == null || !File(base, it.name).exists() }
+            ?.forEach { mirrorToExternal(context, it) }
     }
 
     @Synchronized
