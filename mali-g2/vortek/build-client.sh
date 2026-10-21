@@ -27,7 +27,7 @@ cp "$SYSVK/vk_icd.h" "$SYSVK/vulkan_xlib.h" "$SYSVK/vulkan_xcb.h" "$INC/vulkan/"
 
 cmake -S "$WORK/vortek" -B "$BUILD/cmake" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_FLAGS="-I$INC -include $HERE/src/droiddeck_defaults.h" \
-  -DVORTEK_STANDALONE_SOURCES="$HERE/src/client_x11_present.c" \
+  -DVORTEK_STANDALONE_SOURCES="$HERE/src/client_x11_present.c;$HERE/src/droiddeck_maint.c" \
   -DVORTEK_STANDALONE_INCLUDE="$HERE/src"
 make -C "$BUILD/cmake" -j"$JOBS" --no-print-directory
 install -m644 "$BUILD/cmake/libvulkan_vortek.so" "$DEST/libvulkan_vortek.so"

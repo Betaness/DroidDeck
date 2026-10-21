@@ -19,6 +19,9 @@ for ext in root.iter("extension"):
         continue
     cmds = []
     for req in ext.iter("require"):
+        # Commands that only exist together with another extension do not decide support.
+        if req.get("depends"):
+            continue
         for c in req.iter("command"):
             n = c.get("name")
             if n not in cmds:
