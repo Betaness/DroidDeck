@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the glibc aarch64 Vortek client ICD (libvulkan_vortek.so) and its ICD
 # manifest for the DroidDeck guest. Run on an aarch64 Linux host (the CI uses
-# ubuntu-24.04-arm) after ./fetch.sh. Needs: cmake, make, a C compiler,
+# ubuntu-24.04-arm) after ./fetch.sh. Needs: cmake, make, a C compiler, libx11-dev,
 # libxcb1-dev, libxcb-shm0-dev and libvulkan-dev (for vk_icd.h / vulkan_xlib.h /
 # vulkan_xcb.h; the other Vulkan headers are vortekrenderer's 1.4.302 copy).
 #

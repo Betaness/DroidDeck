@@ -45,7 +45,7 @@ Mali 设备（例如 Mali-G2 / v15，Android 17）也能在 DroidDeck 的 Linux 
 
 ```sh
 ./fetch.sh
-./build-client.sh out/client                       # aarch64 Linux，需要 cmake libxcb1-dev libxcb-shm0-dev libvulkan-dev
+./build-client.sh out/client                       # aarch64 Linux，需要 cmake libx11-dev libxcb1-dev libxcb-shm0-dev libvulkan-dev
 NDK=/path/to/ndk ./build-server.sh out/libvortekserver.so
 ```
 
