@@ -1,0 +1,31 @@
+diff --git a/include/vortek.h b/include/vortek.h
+index 8ec80c2..3855d01 100755
+--- a/include/vortek.h
++++ b/include/vortek.h
+@@ -5,7 +5,10 @@
+ #define MEMORY_POOL_MAX_SIZE 65536
+ #define SERVER_RING_BUFFER_SIZE 4194304
+ #define CLIENT_RING_BUFFER_SIZE 262144
+-#define VORTEK_SERVER_PATH "/data/data/com.winlator/files/rootfs/tmp/.vortek/V0"
++#ifndef VORTEK_SERVER_PATH
++#define VORTEK_SERVER_PATH "/tmp/.vortek/V0"
++#endif
++#define VORTEK_SERVER_PATH_ENV "VORTEK_SERVER_PATH"
+ #define VK_HANDLE_BYTE_COUNT 8
+ #define THREAD_POOL_NUM_THREADS 8
+ 
+diff --git a/src/main.c b/src/main.c
+index cea0e5c..8a28911 100755
+--- a/src/main.c
++++ b/src/main.c
+@@ -19,7 +19,9 @@ static int vortekServerConnect() {
+     memset(&server_addr, 0, sizeof(server_addr));
+     server_addr.sun_family = AF_LOCAL;
+ 
+-    strncpy(server_addr.sun_path, VORTEK_SERVER_PATH, sizeof(server_addr.sun_path) - 1);
++    const char* serverPath = getenv(VORTEK_SERVER_PATH_ENV);
++    if (!serverPath || !serverPath[0]) serverPath = VORTEK_SERVER_PATH;
++    strncpy(server_addr.sun_path, serverPath, sizeof(server_addr.sun_path) - 1);
+ 
+     int res;
+     do {

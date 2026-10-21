@@ -1,0 +1,16 @@
+DroidDeck G2 - Vortek Vulkan forwarding
+
+libvulkan_vortek.so (guest Vulkan ICD) and libvortekserver.so (Android-side
+server) are built from:
+
+  Vortek client          https://github.com/brunodev85/vortek
+                         commit b1730c5def9b575672e671aee11d79ae7adc63d1
+  vortekrenderer server  https://github.com/brunodev85/winlator-app
+                         commit 8077f374ef2d54127b088de9e8cd7b4af14d9c8b
+                         (app/src/main/cpp/vortekrenderer, app/src/main/cpp/winlator)
+
+Copyright (C) brunodev85, released under the GNU Lesser General Public License
+version 2.1 (see LGPL-2.1). The modifications and the new standalone server /
+X11 presentation sources are released under the same license; they are in the
+mali-g2/vortek directory (patches/, src/, build scripts) of
+https://github.com/Betaness/DroidDeck, branch mali-g2.

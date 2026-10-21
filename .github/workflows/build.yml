@@ -85,8 +85,35 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # [mali-g2] The Vortek client is a glibc aarch64 library: build it natively on an arm runner.
+  vortek:
+    name: Vortek client (mali-g2)
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build libvulkan_vortek.so
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake make gcc libxcb1-dev libxcb-shm0-dev libvulkan-dev >/dev/null
+          mali-g2/vortek/fetch.sh
+          JOBS=4 mali-g2/vortek/build-client.sh "$PWD/vortek-client"
+          install -m644 mali-g2/vortek/NOTICE mali-g2/vortek/LICENSE.LGPL-2.1 vortek-client/
+          ls -l vortek-client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vortek-client
+          path: vortek-client
+          if-no-files-found: error
+          retention-days: 14
+
   build:
-    needs: xbox
+    needs: [xbox, vortek]
     name: Build APK
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -539,6 +566,26 @@ jobs:
           rustup target add --toolchain 1.90.0 aarch64-unknown-linux-gnu
           RUSTUP_TOOLCHAIN=1.90.0 bash tools/comet/build.sh
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: vortek-client
+          path: vortek-client
+
+      - name: Vortek server and guest ICD (mali-g2)
+        run: |
+          set -euo pipefail
+          D=app/src/main/assets/linuxfs
+          install -Dm644 vortek-client/libvulkan_vortek.so "$D/usr/local/lib/droiddeck-vortek/libvulkan_vortek.so"
+          install -Dm644 vortek-client/vortek_icd.aarch64.json "$D/usr/local/lib/droiddeck-vortek/vortek_icd.aarch64.json"
+          install -Dm644 vortek-client/LICENSE.LGPL-2.1 "$D/usr/local/share/licenses/droiddeck-vortek/LGPL-2.1"
+          install -Dm644 vortek-client/NOTICE "$D/usr/local/share/licenses/droiddeck-vortek/NOTICE"
+          rm -rf vortek-client
+          mali-g2/vortek/fetch.sh
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}" JOBS=4 \
+            mali-g2/vortek/build-server.sh "$PWD/app/src/main/jniLibs/arm64-v8a/libvortekserver.so"
+          rm -rf mali-g2/vortek/work mali-g2/vortek/out
+          ls -l "$D/usr/local/lib/droiddeck-vortek" app/src/main/jniLibs/arm64-v8a/libvortekserver.so
+
       - name: Build the add-on packs
         run: bash tools/packs/build.sh app/build/packs
 
@@ -635,6 +682,13 @@ jobs:
           done
           grep -qi "CN=Android, OU=Android, O=Android" /tmp/sig.txt \
             || { echo "::error::apk is not signed with the AOSP testkey"; exit 1; }
+
+      - name: The APK carries Vortek (mali-g2)
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libvortekserver.so|assets/linuxfs/usr/local/lib/droiddeck-vortek/' \
+            | tee /dev/stderr | wc -l | grep -qx 3 || { echo "::error::Vortek files missing from the APK"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         id: apk-upload
