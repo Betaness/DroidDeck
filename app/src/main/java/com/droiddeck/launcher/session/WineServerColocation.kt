@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit
  * none, and the kernel widens a mask holding only prime cores.
  *
  * Whether it helps depends on the game and the scene, so fps is measured unpinned and pinned, and
- * the pin kept only when faster; measured again every [RECHECK_S] s, undone when the core saturates.
+ * the pin kept only when faster, and measured again every [RECHECK_NS] ns.
  */
 object WineServerColocation {
     private const val TAG = "WineColocate"
@@ -29,7 +29,6 @@ object WineServerColocation {
     private const val COOLDOWN_NS = 120_000_000_000L
     private const val MIN_SHARE = 0.5
     private const val KEEP_SHARE = 0.3
-    private const val SATURATED = 0.95
     private const val MIN_SWITCHES_PER_S = 1500.0
     private const val GAIN = 1.04
     private const val MIN_FPS = 5.0
@@ -125,7 +124,6 @@ object WineServerColocation {
                     continue
                 }
                 val elapsed = System.nanoTime() - tr.since
-                val load = scan.share(tr.game.tid) + scan.serverShare(tr.server)
                 when (tr.phase) {
                     Phase.BASE -> if (elapsed >= WINDOW_NS) {
                         tr.baseFps = tr.fps()
@@ -142,7 +140,7 @@ object WineServerColocation {
                         val fps = tr.fps()
                         val verdict = "${tr.game.name}/${tr.game.tid} with wineserver on core $core: " +
                             "${"%.1f".format(fps)} fps against ${"%.1f".format(tr.baseFps)} unpinned"
-                        if (fps >= tr.baseFps * GAIN && load < SATURATED) {
+                        if (fps >= tr.baseFps * GAIN) {
                             Log.i(TAG, "$verdict, kept")
                             tr.phase = Phase.PINNED
                             tr.checked = System.nanoTime()
@@ -152,16 +150,10 @@ object WineServerColocation {
                             tr.restart(Phase.COOLDOWN)
                         }
                     }
-                    Phase.PINNED -> when {
-                        load >= SATURATED -> {
-                            Log.i(TAG, "${tr.game.name}/${tr.game.tid} and wineserver saturate core $core, undone")
-                            unpin(tr, scan, core)
-                            tr.restart(Phase.COOLDOWN)
-                        }
-                        System.nanoTime() - tr.checked >= RECHECK_NS -> {
-                            unpin(tr, scan, core)
-                            tr.restart(Phase.BASE)
-                        }
+                    // A busy core is the point of the pin (the thread waits less), so only fps decides: measured again now and then.
+                    Phase.PINNED -> if (System.nanoTime() - tr.checked >= RECHECK_NS) {
+                        unpin(tr, scan, core)
+                        tr.restart(Phase.BASE)
                     }
                     Phase.COOLDOWN -> if (elapsed >= COOLDOWN_NS) tr.restart(Phase.BASE)
                 }
@@ -225,15 +217,11 @@ object WineServerColocation {
         private var lastTicks = HashMap<Int, Long>()
         private var lastSwitches = HashMap<Int, Long>()
         private var shares = HashMap<Int, Double>()
-        private var lastServerTicks = HashMap<Int, Long>()
-        private var serverShares = HashMap<Int, Double>()
         private val known = HashSet<Int>()
 
         fun share(tid: Int): Double = shares[tid] ?: 0.0
 
         fun alive(tid: Int): Boolean = tid in shares
-
-        fun serverShare(pid: Int): Double = serverShares[pid] ?: 0.0
 
         /** Threads the pinned one started inherited its one-core mask: give them every core (only ours, not masks the game set). */
         fun loosenChildren(pid: Int, pinned: Int, core: Int, recheck: Boolean = false) {
@@ -268,15 +256,6 @@ object WineServerColocation {
                 if (cmd.length > 3 && cmd[1] == ':' && cmd[2] == '\\' && cmd.endsWith(".exe", ignoreCase = true) &&
                     cmd.substringAfterLast('\\') !in WINE_SERVICES) games += pid
             }
-            val serverTicks = HashMap<Int, Long>()
-            val newServerShares = HashMap<Int, Double>()
-            for (pid in servers) {
-                val t = cpuTicks("/proc/$pid/stat") ?: continue
-                serverTicks[pid] = t
-                if (seconds > 0) newServerShares[pid] = (t - (lastServerTicks[pid] ?: t)) / hz / seconds
-            }
-            lastServerTicks = serverTicks
-            serverShares = newServerShares
             val ticks = HashMap<Int, Long>()
             val switches = HashMap<Int, Long>()
             val newShares = HashMap<Int, Double>()
