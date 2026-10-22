@@ -35,10 +35,6 @@ static int32_t g_shown_rect[4];
 static int g_shown;
 static int g_first_logged;
 static int g_accept = 1;
-static struct wl_event_source *g_stall_timer;
-
-/* A game that stops presenting (blocked on a dialog, hung) must not keep covering the X windows. */
-#define VP_STALL_MS 2000
 
 /* sc_layer only compares tokens, and its completion callback may run after the chain is gone,
  * so a token encodes chain and image instead of pointing at them. */
@@ -209,22 +205,12 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     g_shown = 1;
     g_shown_chain = m->chain;
     g_shown_rect[0] = m->x; g_shown_rect[1] = m->y; g_shown_rect[2] = m->w; g_shown_rect[3] = m->h;
-    if (g_stall_timer) wl_event_source_timer_update(g_stall_timer, VP_STALL_MS);
     g_stat_frames++;
     if (!g_first_logged) {
         g_first_logged = 1;
         droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer over the window at %d,%d %dx%d (X root %ux%u, scene %dx%d)",
                       c->w, c->h, m->x, m->y, m->w, m->h, m->root_w, m->root_h, g_scene_w, g_scene_h);
     }
-}
-
-static int on_stall(void *data) {
-    (void)data;
-    if (g_shown) {
-        droiddeck_log("vortek", "no zero-copy frame for %d ms: showing the X windows again", VP_STALL_MS);
-        hide();
-    }
-    return 0;
 }
 
 void vortek_present_set_accept(int accept) {
@@ -299,7 +285,6 @@ void vortek_present_init(struct wl_event_loop *loop) {
     g_loop = loop;
     g_listen_fd = fd;
     g_listen_src = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE, on_listen, NULL);
-    g_stall_timer = wl_event_loop_add_timer(loop, on_stall, NULL);
 }
 
 void vortek_present_scene_size(int w, int h) {
