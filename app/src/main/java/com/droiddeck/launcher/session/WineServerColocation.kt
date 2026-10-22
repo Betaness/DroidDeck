@@ -97,7 +97,7 @@ object WineServerColocation {
                 // Kept while it exists and stays busy: loading spikes on other threads do not take over.
                 if (current != null && (!scan.alive(current.tid) || scan.share(current.tid) < KEEP_SHARE)) {
                     // The thread is gone or another took over: let wineserver run anywhere again.
-                    if (server > 0 && phase in setOf(Phase.TRY, Phase.PINNED)) unpin(server)
+                    if (server > 0 && phase in setOf(Phase.TRY, Phase.PINNED)) unpin(server, process = true)
                     candidate = null
                     phase = Phase.IDLE
                 }
@@ -132,19 +132,19 @@ object WineServerColocation {
                             phase = Phase.PINNED; lastCheck = now
                         } else {
                             Log.i(TAG, "${c.name}/${c.tid} on core $core: %.1f fps against %.1f, undone".format(fps, baseFps))
-                            unpin(c.tid); unpin(server)
+                            unpin(c.tid); unpin(server, process = true)
                             phase = Phase.COOLDOWN; phaseStart = now
                         }
                     }
                     Phase.PINNED -> when {
                         share >= SATURATED -> {
                             Log.i(TAG, "${c.name}/${c.tid} saturates core $core, undone")
-                            unpin(c.tid); unpin(server)
+                            unpin(c.tid); unpin(server, process = true)
                             phase = Phase.COOLDOWN; phaseStart = now
                         }
                         now - lastCheck >= RECHECK_S -> {
                             // Measure the game unpinned again; the scene may have changed.
-                            unpin(c.tid); unpin(server)
+                            unpin(c.tid); unpin(server, process = true)
                             phase = Phase.BASE; phaseStart = now; frames0 = WaylandCompositor.gameFrameCount()
                         }
                     }
@@ -158,27 +158,27 @@ object WineServerColocation {
         } catch (t: Throwable) {
             Log.w(TAG, "stopped", t)
         } finally {
-            candidate?.let { if (phase == Phase.TRY || phase == Phase.PINNED) { unpin(it.tid); unpin(server) } }
+            candidate?.let { if (phase == Phase.TRY || phase == Phase.PINNED) { unpin(it.tid); unpin(server, process = true) } }
         }
     }
 
     private fun pin(tid: Int, server: Int, core: Int): Boolean =
-        taskset("$core", tid) && taskset("$core", server, allThreads = true) &&
+        taskset(1L shl core, tid) && taskset(1L shl core, server, allThreads = true) &&
             File("/proc/$tid/status").readLines().any { it.startsWith("Cpus_allowed_list:") && it.substringAfter(':').trim() == "$core" }
 
-    private fun unpin(tid: Int) {
-        taskset("0-${Runtime.getRuntime().availableProcessors() - 1}", tid, allThreads = true)
+    /** Every core again; [process] for wineserver, all of whose threads were pinned. */
+    private fun unpin(tid: Int, process: Boolean = false) {
+        taskset((1L shl Runtime.getRuntime().availableProcessors()) - 1, tid, allThreads = process)
     }
 
-    private fun taskset(cpus: String, id: Int, allThreads: Boolean = false): Boolean = try {
-        val args = mutableListOf("/system/bin/taskset")
-        if (allThreads) args += "-a"
-        args += listOf("-p", "-c", cpus, id.toString())
+    /** toybox taskset: a hex mask, no -c. */
+    private fun taskset(mask: Long, id: Int, allThreads: Boolean = false): Boolean = try {
+        val args = mutableListOf("/system/bin/taskset", if (allThreads) "-ap" else "-p", java.lang.Long.toHexString(mask), id.toString())
         val p = ProcessBuilder(args).redirectErrorStream(true).start()
         p.inputStream.readBytes()
         p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0
     } catch (e: Exception) {
-        Log.w(TAG, "taskset $cpus $id", e)
+        Log.w(TAG, "taskset ${java.lang.Long.toHexString(mask)} $id", e)
         false
     }
 
