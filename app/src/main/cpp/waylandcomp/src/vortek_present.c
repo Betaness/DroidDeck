@@ -29,6 +29,7 @@ static int g_listen_fd = -1;
 static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_conn_fd = -1;
 static int g_scene_w, g_scene_h;
+void droiddeck_count_game_frame(void);
 static unsigned g_stat_frames;
 static uint32_t g_shown_chain;
 static int32_t g_shown_rect[4];
@@ -206,6 +207,7 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     g_shown_chain = m->chain;
     g_shown_rect[0] = m->x; g_shown_rect[1] = m->y; g_shown_rect[2] = m->w; g_shown_rect[3] = m->h;
     g_stat_frames++;
+    droiddeck_count_game_frame();
     if (!g_first_logged) {
         g_first_logged = 1;
         droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer over the window at %d,%d %dx%d (X root %ux%u, scene %dx%d)",

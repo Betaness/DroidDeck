@@ -753,6 +753,9 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
 
 uint64_t droiddeck_game_frames(void) { return g_game_frames; }
 
+/* [mali-g2] A frame a game presented without a Wayland surface (Vortek's zero-copy layer). */
+void droiddeck_count_game_frame(void) { g_game_frames++; droiddeck_on_game_frame(); }
+
 struct dmabuf_buffer *droiddeck_dmabuf_from_resource(struct wl_resource *buffer) { return get_dmabuf(buffer); }
 int droiddeck_dmabuf_fd(const struct dmabuf_buffer *b) { return b && b->n_planes > 0 ? b->fd[0] : -1; }
 void droiddeck_dmabuf_size(const struct dmabuf_buffer *b, int *w, int *h) { *w = b->width; *h = b->height; }
