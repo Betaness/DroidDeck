@@ -40,6 +40,25 @@ static void* findInChain(const void* chain, VkStructureType type) {
     return NULL;
 }
 
+/* VORTEK_TRACE=1: log the queries an application makes before vkCreateDevice (bring-up aid). */
+#include <stdio.h>
+#include <stdarg.h>
+static int traceOn = -1;
+static void trace(const char* fmt, ...) {
+    if (traceOn < 0) { const char* e = getenv("VORTEK_TRACE"); traceOn = e && *e && *e != '0'; }
+    if (!traceOn) return;
+    va_list ap; va_start(ap, fmt);
+    fputs("vortek-trace: ", stderr); vfprintf(stderr, fmt, ap); fputc('\n', stderr);
+    va_end(ap);
+}
+static void traceChain(const char* what, const void* chain) {
+    if (traceOn == 0) return;
+    char buf[1024]; int n = 0; buf[0] = 0;
+    for (const VkBaseInStructure* s = chain; s && n < (int)sizeof(buf) - 16; s = s->pNext) n += snprintf(buf + n, sizeof(buf) - n, " %d", s->sType);
+    trace("%s pNext:%s", what, buf);
+}
+void droiddeck_trace_missing(const char* name) { trace("no entry point: %s", name); }
+
 static bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name) {
     uint32_t count = 0;
     if (vt_call_vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL) != VK_SUCCESS || !count) return false;
@@ -56,6 +75,7 @@ static bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name
 /* ---- feature / property queries ---- */
 
 static void dd_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures) {
+    traceChain("GetPhysicalDeviceFeatures2", pFeatures->pNext);
     vt_call_vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
     VkPhysicalDeviceMaintenance5FeaturesKHR* m5 = findInChain(pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
     VkPhysicalDeviceMaintenance6FeaturesKHR* m6 = findInChain(pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR);
@@ -64,7 +84,9 @@ static void dd_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkP
 }
 
 static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties) {
+    traceChain("GetPhysicalDeviceProperties2", pProperties->pNext);
     vt_call_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+    trace("  -> apiVersion %u.%u.%u type %d", VK_API_VERSION_MAJOR(pProperties->properties.apiVersion), VK_API_VERSION_MINOR(pProperties->properties.apiVersion), VK_API_VERSION_PATCH(pProperties->properties.apiVersion), pProperties->properties.deviceType);
     /* Conservative values; on Mali-G2 the driver reports 1,1,1,0,0,0 and 1,1,1. */
     VkPhysicalDeviceMaintenance5PropertiesKHR* p5 = findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR);
     if (p5) {
@@ -172,6 +194,45 @@ static void dd_vkCmdPushDescriptorSetWithTemplate2KHR(VkCommandBuffer cmd, const
     vt_call_vkCmdPushDescriptorSetWithTemplateKHR(cmd, info->descriptorUpdateTemplate, info->layout, info->set, info->pData);
 }
 
+/* ---- traced pass-throughs (only differ from Vortek's own entry points by logging) ---- */
+
+VkResult vt_call_vkEnumeratePhysicalDevices(VkInstance, uint32_t*, VkPhysicalDevice*);
+void vt_call_vkGetPhysicalDeviceProperties(VkPhysicalDevice, VkPhysicalDeviceProperties*);
+void vt_call_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties*);
+void vt_call_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties*);
+VkResult vt_call_vkCreateDevice(VkPhysicalDevice, const VkDeviceCreateInfo*, const VkAllocationCallbacks*, VkDevice*);
+
+static VkResult dd_vkEnumeratePhysicalDevices(VkInstance i, uint32_t* c, VkPhysicalDevice* p) {
+    VkResult r = vt_call_vkEnumeratePhysicalDevices(i, c, p);
+    trace("EnumeratePhysicalDevices -> %d count %u", r, c ? *c : 0);
+    return r;
+}
+static void dd_vkGetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalDeviceProperties* p) {
+    vt_call_vkGetPhysicalDeviceProperties(pd, p);
+    trace("GetPhysicalDeviceProperties -> api %u.%u type %d maxBoundDescriptorSets %u", VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion), p->deviceType, p->limits.maxBoundDescriptorSets);
+}
+static void dd_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice pd, uint32_t* c, VkQueueFamilyProperties* p) {
+    vt_call_vkGetPhysicalDeviceQueueFamilyProperties(pd, c, p);
+    if (p) for (uint32_t i = 0; i < *c; i++) trace("QueueFamily %u flags 0x%x count %u", i, p[i].queueFlags, p[i].queueCount);
+}
+static void dd_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat f, VkFormatProperties* p) {
+    vt_call_vkGetPhysicalDeviceFormatProperties(pd, f, p);
+    trace("FormatProperties %d -> opt 0x%x", f, p->optimalTilingFeatures);
+}
+static VkResult dd_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* c, VkExtensionProperties* p) {
+    VkResult r = vt_call_vkEnumerateDeviceExtensionProperties(pd, layer, c, p);
+    trace("EnumerateDeviceExtensionProperties(%s) -> %d count %u", layer ? layer : "-", r, c ? *c : 0);
+    if (p && r >= 0 && traceOn > 0) for (uint32_t i = 0; i < *c; i++) trace("  %s", p[i].extensionName);
+    return r;
+}
+static VkResult dd_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, const VkAllocationCallbacks* a, VkDevice* d) {
+    traceChain("CreateDevice", ci->pNext);
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) trace("  ext %s", ci->ppEnabledExtensionNames[i]);
+    VkResult r = vt_call_vkCreateDevice(pd, ci, a, d);
+    trace("CreateDevice -> %d", r);
+    return r;
+}
+
 /* ---- lookup, consulted before Vortek's own dispatch table ---- */
 
 static const struct { const char* name; void* func; } ddOverrides[] = {
@@ -182,6 +243,12 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkCreateGraphicsPipelines", dd_vkCreateGraphicsPipelines},
     {"vkCreateComputePipelines", dd_vkCreateComputePipelines},
     {"vkCreateBuffer", dd_vkCreateBuffer},
+    {"vkEnumeratePhysicalDevices", dd_vkEnumeratePhysicalDevices},
+    {"vkGetPhysicalDeviceProperties", dd_vkGetPhysicalDeviceProperties},
+    {"vkGetPhysicalDeviceQueueFamilyProperties", dd_vkGetPhysicalDeviceQueueFamilyProperties},
+    {"vkGetPhysicalDeviceFormatProperties", dd_vkGetPhysicalDeviceFormatProperties},
+    {"vkEnumerateDeviceExtensionProperties", dd_vkEnumerateDeviceExtensionProperties},
+    {"vkCreateDevice", dd_vkCreateDevice},
     {"vkCmdBindIndexBuffer2KHR", dd_vkCmdBindIndexBuffer2KHR},
     {"vkCmdBindIndexBuffer2", dd_vkCmdBindIndexBuffer2KHR},
     {"vkGetRenderingAreaGranularityKHR", dd_vkGetRenderingAreaGranularityKHR},

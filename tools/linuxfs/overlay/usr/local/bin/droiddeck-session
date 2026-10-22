@@ -292,10 +292,27 @@ if [ -z "${BL_INSIDE:-}" ]; then
     # [mali-g2] No gamescope: it needs a DRM device and dma-buf import, which Vortek does not offer.
     unset STEAM_MULTIPLE_XWAYLANDS STEAM_USE_MANGOAPP STEAM_MANGOAPP_PRESETS_SUPPORTED \
       STEAM_MANGOAPP_HORIZONTAL_SUPPORTED MANGOHUD_CONFIGFILE gamescope_cursor_composite BL_STRETCHED
-    # OpenGL stays on the CPU (llvmpipe): zink cannot run over Vortek. Vulkan goes through Vortek.
-    unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2
-    export GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1
     start_vortek_display || exit 66
+    # OpenGL: zink over Vortek when it starts (Mesa 26 needs the server's maintenance5 support),
+    # else the CPU (llvmpipe). BL_VORTEK_GL=zink|llvmpipe skips the probe.
+    _bl_gl=${BL_VORTEK_GL:-auto}
+    if [ "$_bl_gl" = auto ]; then
+      _bl_gl=llvmpipe
+      if command -v eglinfo >/dev/null 2>&1 &&
+         env -u LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink \
+           timeout 20 eglinfo -B -p surfaceless 2>/dev/null | grep -q 'renderer: zink'; then
+        _bl_gl=zink
+      fi
+    fi
+    if [ "$_bl_gl" = zink ]; then
+      unset LIBGL_ALWAYS_SOFTWARE
+      export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true BL_VORTEK_ZINK=1
+      echo "== vortek: OpenGL on the GPU (zink over Vortek)"
+    else
+      unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2 BL_VORTEK_ZINK
+      export GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1
+      echo "== vortek: OpenGL on the CPU (llvmpipe; zink did not start over Vortek)"
+    fi
   elif [ "$mode" = steam ]; then
     run_gamescope "${args[@]}" -- "$0" "$mode" "$@"
     exit $?
@@ -440,9 +457,14 @@ case $mode in
       fi
       steam_client=("$steam_root/steamrtarm64/steam")
     fi
-    # [mali-g2] Vortek: the client's web views draw in software unless BL_CEF_GPU=1.
-    if [ "${BL_GPU_MODE:-}" = vortek ] && [ "${BL_CEF_GPU:-0}" != 1 ]; then
-      steam_cef_gpu=0
+    # [mali-g2] Vortek: the client's web views use the GPU when OpenGL runs on zink (its compositor
+    # is OpenGL), else they draw in software. BL_CEF_GPU=0|1 overrides.
+    if [ "${BL_GPU_MODE:-}" = vortek ]; then
+      if [ "${BL_CEF_GPU:-}" = 1 ] || { [ "${BL_VORTEK_ZINK:-0}" = 1 ] && [ "${BL_CEF_GPU:-}" != 0 ]; }; then
+        steam_cef_gpu=1
+      else
+        steam_cef_gpu=0
+      fi
     fi
     _bl_proton_root=$steam_root
     if [ "$steam_x64" = 1 ]; then
