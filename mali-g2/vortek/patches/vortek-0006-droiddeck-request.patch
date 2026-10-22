@@ -1,0 +1,26 @@
+diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
+index 6b47efc..52dc5d7 100644
+--- a/src/vulkan_calls.c
++++ b/src/vulkan_calls.c
+@@ -27,6 +27,21 @@ static pthread_mutex_t vt_call_mutex = PTHREAD_MUTEX_INITIALIZER;
+     vt_free(&globalMemoryPool); \
+     pthread_mutex_unlock(&vt_call_mutex);
+ 
++#ifdef VORTEK_DROIDDECK
++/* [mali-g2] Sends a DroidDeck request (droiddeck_requests.h) and returns the server's VkResult. */
++int droiddeck_request(int requestCode, const void* payload, int size) {
++    VT_CALL_LOCK();
++    int bytesSent = vt_send(serverRing, requestCode, (void*)payload, size);
++    int result = VK_ERROR_DEVICE_LOST;
++    if (bytesSent == size) {
++        char* inputBuffer = NULL;
++        result = vt_recv(clientRing, &inputBuffer, NULL, &globalMemoryPool);
++    }
++    VT_CALL_UNLOCK();
++    return result;
++}
++#endif
++
+ static VkResult waitForPipelineCreation(int pipelineCount, VkPipeline* pPipelines) {
+     int numFds, fd;
+     char success = 0;

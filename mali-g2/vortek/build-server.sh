@@ -40,7 +40,7 @@ SRCS="$VR/src/vk_object.c $VR/src/request_handler.c $VR/src/vulkan_helper.c $VR/
  $VR/src/resource_memory.c $VR/src/texture_decoder.c $VR/src/shader_inspector.c
  $VR/src/async_pipeline_creator.c $VR/src/timeline_semaphore.c
  $WL/src/arrays.c $WL/src/ring_buffer.c
- $HERE/src/standalone_main.c $HERE/src/headless_swapchain.c"
+ $HERE/src/standalone_main.c $HERE/src/headless_swapchain.c $HERE/src/zero_copy.c"
 
 export CC CFLAGS OBJ
 # shellcheck disable=SC2086

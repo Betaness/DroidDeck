@@ -50,6 +50,8 @@ class VortekServerComponent(
         val env = ArrayList<String>()
         env.add("VORTEK_HAL_DRIVER=" + hal.path)
         env.add("VORTEK_PRESENT_LOG=0")
+        // The compositor listens there (waylandcomp/src/vortek_present.c) for zero-copy presents.
+        socket.parentFile?.parentFile?.let { env.add("VORTEK_PRESENT_SOCKET=" + File(it, "vortek-present").path) }
         env.addAll(extraEnv)
         val log = logFile?.let {
             runCatching { PrintWriter(FileWriter(it, true)) }.onFailure { e -> Log.w(TAG, "could not open $it", e) }.getOrNull()

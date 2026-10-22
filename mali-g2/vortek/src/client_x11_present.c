@@ -19,6 +19,11 @@
  *   VORTEK_X11_SHM=0     disable MIT-SHM (use PutImage)
  *   VORTEK_X11_STATS=N   print presented frames / fps every N seconds to stderr
  *
+ * [mali-g2] Zero-copy: when the server backs the swapchain with AHardwareBuffers and DroidDeck's
+ * compositor is reachable, a present that no other X window covers is handed to the server
+ * (REQUEST_CODE_DD_PRESENT_ZERO_COPY) with the window's root rectangle, and the compositor shows the
+ * image itself; nothing is copied. Otherwise the frame takes the X11 path below.
+ *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * Based on Vortek (C) brunodev85, LGPL-2.1.
  * This library is free software; you can redistribute it and/or modify it
@@ -35,6 +40,9 @@
 
 #include "vortek.h"
 #include "client_x11_present.h"
+#include "droiddeck_requests.h"
+
+extern int droiddeck_request(int requestCode, const void* payload, int size);
 
 #define SHM_BUFFER_COUNT 2
 
@@ -83,6 +91,11 @@ typedef struct X11Swapchain {
 
     uint64_t frames, statFrames;
     double statStart;
+
+    int zeroCopy;              /* 0: try, 1: in use, -1: unavailable for this swapchain */
+    xcb_window_t root, toplevel;
+    uint32_t occlusionCountdown;
+    bool occluded;
 } X11Swapchain;
 
 static struct {
@@ -531,6 +544,126 @@ static void putFrame(X11Swapchain* sc, uint8_t depth) {
     xcb_flush(conn);
 }
 
+static bool rectsOverlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+    return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+}
+
+/* True when a mapped top-level window above ours overlaps it: then the X11 path must draw the
+ * frame so that window stays visible. Checked every few frames; a query_tree is a round trip. */
+static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
+    xcb_connection_t* conn = sc->surface->conn;
+    if (!sc->toplevel) {
+        xcb_window_t win = sc->surface->window;
+        for (int depth = 0; depth < 16; depth++) {
+            xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, win), NULL);
+            if (!tree) return true;
+            xcb_window_t parent = tree->parent, root = tree->root;
+            free(tree);
+            sc->root = root;
+            if (parent == root || parent == XCB_WINDOW_NONE) break;
+            win = parent;
+        }
+        sc->toplevel = win;
+    }
+    xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, sc->root), NULL);
+    if (!tree) return true;
+    xcb_window_t* children = xcb_query_tree_children(tree);
+    int count = xcb_query_tree_children_length(tree), mine = -1;
+    for (int i = 0; i < count; i++) if (children[i] == sc->toplevel) mine = i;
+    bool occluded = mine < 0;
+    int above = mine >= 0 ? count - mine - 1 : 0;
+    if (above > 0) {
+        xcb_get_window_attributes_cookie_t attrs[above];
+        xcb_get_geometry_cookie_t geos[above];
+        for (int k = 0; k < above; k++) {
+            attrs[k] = xcb_get_window_attributes(conn, children[mine + 1 + k]);
+            geos[k] = xcb_get_geometry(conn, children[mine + 1 + k]);
+        }
+        for (int k = 0; k < above; k++) {
+            xcb_get_window_attributes_reply_t* a = xcb_get_window_attributes_reply(conn, attrs[k], NULL);
+            xcb_get_geometry_reply_t* g = xcb_get_geometry_reply(conn, geos[k], NULL);
+            if (a && g && a->map_state == XCB_MAP_STATE_VIEWABLE &&
+                rectsOverlap(x, y, w, h, g->x, g->y, g->width + 2 * g->border_width, g->height + 2 * g->border_width))
+                occluded = true;
+            free(a);
+            free(g);
+        }
+    }
+    free(tree);
+    return occluded;
+}
+
+/* Returns VK_ERROR_FEATURE_NOT_PRESENT when the frame must take the X11 path (semaphores untouched). */
+static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint32_t imageIndex,
+                                const VkSemaphore* waits, uint32_t waitCount, bool* suboptimal) {
+    if (sc->zeroCopy < 0 || waitCount > 16) return VK_ERROR_FEATURE_NOT_PRESENT;
+    xcb_connection_t* conn = sc->surface->conn;
+    xcb_get_geometry_cookie_t geoCookie = xcb_get_geometry(conn, sc->surface->window);
+    xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, geoCookie, NULL);
+    if (!geo) return VK_ERROR_SURFACE_LOST_KHR;
+    xcb_translate_coordinates_reply_t* pos =
+        xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, sc->surface->window, geo->root, 0, 0), NULL);
+    if (!pos) {
+        free(geo);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    int x = pos->dst_x, y = pos->dst_y, w = geo->width, h = geo->height;
+    *suboptimal = geo->width != sc->extent.width || geo->height != sc->extent.height;
+    free(pos);
+    free(geo);
+    if (w <= 0 || h <= 0) return VK_ERROR_FEATURE_NOT_PRESENT;
+
+    if (sc->occlusionCountdown == 0) {
+        sc->occluded = checkOccluded(sc, x, y, w, h);
+        sc->occlusionCountdown = 30;
+    }
+    sc->occlusionCountdown--;
+    if (sc->occluded) return VK_ERROR_FEATURE_NOT_PRESENT;
+
+    char payload[sizeof(DDPresentZeroCopy) + 16 * sizeof(uint64_t)];
+    DDPresentZeroCopy request = {0};
+    request.swapchainId = VkObject_fromHandle(swapchain)->id;
+    request.imageIndex = imageIndex;
+    request.x = x;
+    request.y = y;
+    request.w = w;
+    request.h = h;
+    request.waitCount = waitCount;
+    memcpy(payload, &request, sizeof(request));
+    for (uint32_t i = 0; i < waitCount; i++) {
+        uint64_t id = VkObject_fromHandle(waits[i])->id;
+        memcpy(payload + sizeof(request) + i * sizeof(uint64_t), &id, sizeof(id));
+    }
+    VkResult result = (VkResult)droiddeck_request(REQUEST_CODE_DD_PRESENT_ZERO_COPY, payload,
+                                                  (int)(sizeof(request) + waitCount * sizeof(uint64_t)));
+    if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+        if (sc->zeroCopy == 1) fprintf(stderr, "vortek-x11: zero-copy stopped, presenting through X11\n");
+        sc->zeroCopy = -1;
+    }
+    else if (result == VK_SUCCESS && sc->zeroCopy == 0) {
+        sc->zeroCopy = 1;
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u presented zero-copy by the compositor\n",
+                sc->surface->window, sc->extent.width, sc->extent.height);
+    }
+    return result;
+}
+
+static void countFrame(X11Swapchain* sc) {
+    sc->frames++;
+    sc->statFrames++;
+    int statEvery = envInt("VORTEK_X11_STATS", 0);
+    if (statEvery > 0) {
+        double now = nowSeconds();
+        if (sc->statStart == 0) sc->statStart = now;
+        if (now - sc->statStart >= statEvery) {
+            fprintf(stderr, "vortek-x11: %llu frames, %.1f fps%s\n", (unsigned long long)sc->frames,
+                    sc->statFrames / (now - sc->statStart), sc->zeroCopy == 1 && !sc->occluded ? " (zero-copy)" : "");
+            sc->statStart = now;
+            sc->statFrames = 0;
+        }
+    }
+}
+
 VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, VkResult* results) {
     VkResult overall = VK_SUCCESS;
     bool waitedSemaphores = false;
@@ -538,6 +671,23 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
     for (uint32_t i = 0; i < presentInfo->swapchainCount; i++) {
         VkResult result = VK_SUCCESS;
         X11Swapchain* sc = VkObject_fromHandle(presentInfo->pSwapchains[i])->tag;
+        if (sc && !waitedSemaphores && sc->zeroCopy >= 0) {
+            bool suboptimal = false;
+            VkResult zc = presentZeroCopy(sc, presentInfo->pSwapchains[i], presentInfo->pImageIndices[i],
+                                          presentInfo->pWaitSemaphores, presentInfo->waitSemaphoreCount, &suboptimal);
+            if (zc != VK_ERROR_FEATURE_NOT_PRESENT) {
+                if (zc == VK_SUCCESS) {
+                    waitedSemaphores = true;
+                    countFrame(sc);
+                    if (suboptimal) zc = VK_SUBOPTIMAL_KHR;
+                }
+                if (results) results[i] = zc;
+                if (zc < 0 || (overall == VK_SUCCESS && zc != VK_SUCCESS)) {
+                    if (overall >= 0) overall = zc;
+                }
+                continue;
+            }
+        }
         if (sc && !sc->ready && !sc->failed) {
             sc->ready = setupSwapchain(sc, queue);
             if (!sc->ready) {
@@ -586,17 +736,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
             }
             free(geometry);
 
-            sc->frames++;
-            sc->statFrames++;
-            int statEvery = envInt("VORTEK_X11_STATS", 0);
-            if (statEvery > 0) {
-                double now = nowSeconds();
-                if (now - sc->statStart >= statEvery) {
-                    fprintf(stderr, "vortek-x11: %llu frames, %.1f fps\n", (unsigned long long)sc->frames, sc->statFrames / (now - sc->statStart));
-                    sc->statStart = now;
-                    sc->statFrames = 0;
-                }
-            }
+            countFrame(sc);
         }
 
         if (results) results[i] = result;

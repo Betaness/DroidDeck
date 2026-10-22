@@ -3,6 +3,7 @@
 #include "ahb_swapchain.h"
 #include "droiddeck_color.h"
 #include "vk_present.h"
+#include "vortek_present.h"
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <android/rect.h>
@@ -178,6 +179,7 @@ struct layer {
 
 static struct layer g_layers[SC_LAYER_COUNT];
 static void apply_frame_rate(ASurfaceTransaction *tx, struct layer *l);
+static void hide_layer(struct layer *l);
 static void coverage_text(const struct layer *l, char *out, size_t n);
 static int g_layers_ready;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -197,6 +199,9 @@ static void layers_init(void) {
     g_layers[SC_LAYER_OVERLAY] = (struct layer){.name = "droiddeck_wayland_overlay", .z = 2, .pool_n = 3,
                                                 .cur_slot = -1, .votes_rate = 0, .fps_applied = -1.0f,
                                                 .hr_applied = -1.0f, .ds_applied = -1};
+    g_layers[SC_LAYER_VORTEK] = (struct layer){.name = "droiddeck_vortek_game", .z = 1, .pool_n = 0,
+                                               .cur_slot = -1, .votes_rate = 1, .fps_applied = -1.0f,
+                                               .hr_applied = -1.0f, .ds_applied = -1};
     for (int i = 0; i < SC_LAYER_COUNT; i++)
         for (int j = 0; j < POOL_MAX; j++) g_layers[i].slots[j].release_fd = -1;
 }
@@ -233,7 +238,8 @@ static void on_complete(void *context, ASurfaceTransactionStats *stats) {
     pthread_mutex_unlock(&g_lock);
     if (ctx->prev_token) {
         int fd = (stats && ctx->sc) ? api.prevReleaseFence(stats, ctx->sc) : -1;
-        ahb_swapchain_layer_released(ctx->prev_token, fd);
+        if (ctx->layer == SC_LAYER_VORTEK) vortek_present_released(ctx->prev_token, fd);
+        else ahb_swapchain_layer_released(ctx->prev_token, fd);
     }
     if (ctx->retire && ctx->sc) api.release(ctx->sc);
     free(ctx);
@@ -337,7 +343,8 @@ static void retire_sc(struct layer *l) {
         api.txApply(tx);
         api.txDelete(tx);
     } else {
-        if (l->cur_token) ahb_swapchain_layer_released(l->cur_token, -1);
+        if (l->cur_token && l == &g_layers[SC_LAYER_VORTEK]) vortek_present_released(l->cur_token, -1);
+        else if (l->cur_token) ahb_swapchain_layer_released(l->cur_token, -1);
         api.release(l->sc);
     }
     droiddeck_log("layer", "%s: SurfaceControl retired (window %p)", l->name, (void *)l->win);
@@ -793,6 +800,51 @@ int sc_layer_present_ahb(AHardwareBuffer *ahb, int w, int h, int acquire_fd, voi
 unavailable:
     if (acquire_fd >= 0) close(acquire_fd);
     return -1;
+}
+
+int sc_layer_present_vortek(AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
+                            int x, int y, int w, int h, int scene_w, int scene_h) {
+    struct layer *l = layer_of(SC_LAYER_VORTEK);
+    int r[8];
+    if (!ahb || !token || w <= 0 || h <= 0 || ensure_sc(l) != 0) goto unavailable;
+    int g = layer_geometry(scene_w, scene_h, scene_w, scene_h, r);
+    if (g <= 0) goto unavailable;
+    /* r[4..7] is the whole scene on screen; place the window's rectangle inside it. */
+    const double sx = (double)(r[6] - r[4]) / scene_w, sy = (double)(r[7] - r[5]) / scene_h;
+    const int dst[4] = {r[4] + (int)(x * sx + 0.5), r[5] + (int)(y * sy + 0.5),
+                        r[4] + (int)((x + w) * sx + 0.5), r[5] + (int)((y + h) * sy + 0.5)};
+    r[0] = 0; r[1] = 0; r[2] = buf_w; r[3] = buf_h;
+    memcpy(&r[4], dst, sizeof(dst));
+    ASurfaceTransaction *tx = api.txCreate();
+    if (!tx) goto unavailable;
+    ASurfaceControl *old = swap_sc_begin(l);
+    if (old) api.setZOrder(tx, l->sc, l->z);
+    api.setBuffer(tx, l->sc, ahb, acquire_fd);
+    api.setBufferTransparency(tx, l->sc, ASC_TRANSPARENCY_OPAQUE);
+    apply_geometry(tx, l, r);
+    apply_frame_rate(tx, l);
+    if (!l->shown) api.setVisibility(tx, l->sc, ASC_VISIBILITY_SHOW);
+    if (old) retire_ops(tx, old);
+    if (add_complete_on(tx, l, old ? old : l->sc, -1, l->cur_token == token ? NULL : l->cur_token, old ? 1 : 0) != 0) {
+        api.txDelete(tx);
+        if (old) api.release(old);
+        return -1;
+    }
+    api.txApply(tx);
+    api.txDelete(tx);
+    l->cur_token = token;
+    if (!l->shown) { l->shown = 1; droiddeck_log("layer", "%s: layer shown", l->name); }
+    vkp_signal_first_frame();
+    return 0;
+unavailable:
+    if (acquire_fd >= 0) close(acquire_fd);
+    return -1;
+}
+
+void sc_layer_hide_vortek(void) {
+    layers_init();
+    struct layer *l = &g_layers[SC_LAYER_VORTEK];
+    if (l->shown) hide_layer(l);
 }
 
 int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const struct droiddeck_color *color) {

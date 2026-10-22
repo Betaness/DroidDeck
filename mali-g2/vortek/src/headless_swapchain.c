@@ -13,14 +13,22 @@
  *   VORTEK_DUMP_PPM        if set, path of a PPM file receiving the presented frame
  *   VORTEK_DUMP_EVERY      dump every N-th present (default 1)
  *   VORTEK_PRESENT_LOG     log every N-th present (default 60, 0 = never)
+ *   VORTEK_AHB_SWAPCHAIN   back swapchain images with AHardwareBuffers the server allocates
+ *                          (default 1); with $VORTEK_PRESENT_SOCKET they are shown zero-copy
+ *                          by DroidDeck's compositor (zero_copy.c), VORTEK_ZERO_COPY=0 disables it
  *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * Based on Winlator's vortekrenderer (C) brunodev85, LGPL-2.1.
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
  */
+#include <android/hardware_buffer.h>
+#include <poll.h>
+#include <pthread.h>
 #include "xwindow_swapchain.h"
 #include "vulkan_helper.h"
+#include "zero_copy.h"
+#include "droiddeck_requests.h"
 
 typedef struct HeadlessSwapchain {
     XWindowSwapchain base; /* must be first: request_handler.c only sees this */
@@ -33,7 +41,89 @@ typedef struct HeadlessSwapchain {
     VkBuffer dumpBuffer;
     VkDeviceMemory dumpMemory;
     VkDeviceSize dumpSize;
+    AHardwareBuffer** hardwareBuffers;
+    /* zero-copy: who holds each image, guarded by zcLock */
+    uint32_t chainId;
+    bool zeroCopy;
+    bool shown;
+    uint8_t* owner;
+    int* releaseFd;
+    bool stealLogged;
 } HeadlessSwapchain;
+
+enum { OWNER_FREE = 0, OWNER_APP = 1, OWNER_COMPOSITOR = 2 };
+
+#define MAX_ZERO_COPY_CHAINS 64
+static pthread_mutex_t zcLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t zcCond = PTHREAD_COND_INITIALIZER;
+static HeadlessSwapchain* zcChains[MAX_ZERO_COPY_CHAINS];
+static uint32_t zcNextChain = 1;
+
+static void releaseImageLocked(HeadlessSwapchain* headless, uint32_t index, int fd) {
+    if (index >= (uint32_t)headless->base.imageCount) {
+        if (fd >= 0) close(fd);
+        return;
+    }
+    if (headless->releaseFd[index] >= 0) close(headless->releaseFd[index]);
+    headless->releaseFd[index] = fd;
+    if (headless->owner[index] == OWNER_COMPOSITOR) headless->owner[index] = OWNER_FREE;
+}
+
+static void onRelease(uint32_t chain, uint32_t index, int fd) {
+    pthread_mutex_lock(&zcLock);
+    for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) {
+        HeadlessSwapchain* headless = zcChains[i];
+        if (!headless) continue;
+        if (index == ZC_RELEASE_ALL) {
+            for (int j = 0; j < headless->base.imageCount; j++) releaseImageLocked(headless, j, -1);
+            headless->zeroCopy = false;
+            headless->shown = false;
+        }
+        else if (headless->chainId == chain) {
+            releaseImageLocked(headless, index, fd);
+            fd = -1;
+        }
+    }
+    pthread_cond_broadcast(&zcCond);
+    pthread_mutex_unlock(&zcLock);
+    if (fd >= 0) close(fd);
+}
+
+static void registerZeroCopy(HeadlessSwapchain* headless) {
+    XWindowSwapchain* swapchain = &headless->base;
+    if (swapchain->imageCount < 2) return;
+    for (int i = 0; i < swapchain->imageCount; i++) if (!headless->hardwareBuffers[i]) return;
+    if (!ZeroCopy_available()) return;
+    ZeroCopy_setReleaseHandler(onRelease);
+
+    headless->owner = calloc(swapchain->imageCount, sizeof(uint8_t));
+    headless->releaseFd = malloc(swapchain->imageCount * sizeof(int));
+    for (int i = 0; i < swapchain->imageCount; i++) headless->releaseFd[i] = -1;
+
+    pthread_mutex_lock(&zcLock);
+    int slot = -1;
+    for (int i = 0; i < MAX_ZERO_COPY_CHAINS && slot < 0; i++) if (!zcChains[i]) slot = i;
+    if (slot >= 0) {
+        headless->chainId = zcNextChain++;
+        zcChains[slot] = headless;
+    }
+    pthread_mutex_unlock(&zcLock);
+    if (slot < 0) return;
+
+    headless->zeroCopy = ZeroCopy_createChain(headless->chainId, swapchain->imageExtent.width, swapchain->imageExtent.height,
+                                              headless->hardwareBuffers, swapchain->imageCount);
+}
+
+static void unregisterZeroCopy(HeadlessSwapchain* headless) {
+    if (!headless->owner) return;
+    pthread_mutex_lock(&zcLock);
+    for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) if (zcChains[i] == headless) zcChains[i] = NULL;
+    pthread_mutex_unlock(&zcLock);
+    if (headless->chainId) ZeroCopy_destroyChain(headless->chainId);
+    for (int i = 0; i < headless->base.imageCount; i++) if (headless->releaseFd[i] >= 0) close(headless->releaseFd[i]);
+    MEMFREE(headless->owner);
+    MEMFREE(headless->releaseFd);
+}
 
 static int envInt(const char* name, int defaultValue) {
     const char* value = getenv(name);
@@ -51,7 +141,8 @@ void getWindowExtent(JMethods* jmethods, int windowId, VkExtent2D* extent) {
 }
 
 int getSurfaceMinImageCount() {
-    return 1;
+    /* Zero-copy keeps one image on screen; with fewer than two the app could never acquire. */
+    return envInt("VORTEK_AHB_SWAPCHAIN", 1) ? 2 : 1;
 }
 
 VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {
@@ -69,7 +160,80 @@ VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {
     return surfaceFormats;
 }
 
-static VkResult createImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
+static uint32_t ahbFormat(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB: return 5; /* HAL_PIXEL_FORMAT_BGRA_8888 */
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB: return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT;
+        default: return 0;
+    }
+}
+
+/* The image is created for the AHB and bound to it as dedicated imported memory, so the
+ * driver renders straight into a buffer the compositor can later scan out. */
+static VkResult createHardwareBufferImage(VkDevice device, XWindowSwapchain* swapchain, VkImageCreateInfo* imageInfo,
+                                          XWindowSwapchain_Image* swapchainImage, AHardwareBuffer** pHardwareBuffer) {
+    uint32_t format = ahbFormat(swapchain->imageFormat);
+    if (!format || !vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+    AHardwareBuffer_Desc desc = {0};
+    desc.width = swapchain->imageExtent.width;
+    desc.height = swapchain->imageExtent.height;
+    desc.layers = 1;
+    desc.format = format;
+    desc.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+    AHardwareBuffer* hardwareBuffer = NULL;
+    if (AHardwareBuffer_allocate(&desc, &hardwareBuffer) != 0 || !hardwareBuffer) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+    VkExternalMemoryImageCreateInfo externalInfo = {0};
+    externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    externalInfo.pNext = (void*)imageInfo->pNext;
+    VkImageCreateInfo info = *imageInfo;
+    info.pNext = &externalInfo;
+
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult result = vulkanWrapper.vkCreateImage(device, &info, NULL, &image);
+    if (result == VK_SUCCESS) {
+        VkAndroidHardwareBufferPropertiesANDROID properties = {0};
+        properties.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+        result = vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID(device, hardwareBuffer, &properties);
+        if (result == VK_SUCCESS) {
+            VkImportAndroidHardwareBufferInfoANDROID importInfo = {0};
+            importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+            importInfo.buffer = hardwareBuffer;
+            VkMemoryDedicatedAllocateInfo dedicatedInfo = {0};
+            dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+            dedicatedInfo.pNext = &importInfo;
+            dedicatedInfo.image = image;
+            VkMemoryAllocateInfo memoryInfo = {0};
+            memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            memoryInfo.pNext = &dedicatedInfo;
+            memoryInfo.allocationSize = properties.allocationSize;
+            memoryInfo.memoryTypeIndex = getMemoryTypeIndex(properties.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            result = vulkanWrapper.vkAllocateMemory(device, &memoryInfo, NULL, &memory);
+        }
+        if (result == VK_SUCCESS) result = vulkanWrapper.vkBindImageMemory(device, image, memory, 0);
+    }
+    if (result != VK_SUCCESS) {
+        if (memory) vulkanWrapper.vkFreeMemory(device, memory, NULL);
+        if (image) vulkanWrapper.vkDestroyImage(device, image, NULL);
+        AHardwareBuffer_release(hardwareBuffer);
+        return result;
+    }
+
+    swapchainImage->image = image;
+    swapchainImage->memory = memory;
+    *pHardwareBuffer = hardwareBuffer;
+    return VK_SUCCESS;
+}
+
+static VkResult createImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage, AHardwareBuffer** pHardwareBuffer) {
     VkImageCreateInfo imageInfo = {0};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -84,6 +248,12 @@ static VkResult createImage(VkDevice device, XWindowSwapchain* swapchain, XWindo
     imageInfo.usage = swapchain->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (envInt("VORTEK_AHB_SWAPCHAIN", 1)) {
+        VkResult result = createHardwareBufferImage(device, swapchain, &imageInfo, swapchainImage, pHardwareBuffer);
+        if (result == VK_SUCCESS) return result;
+        println("vortek-server: AHardwareBuffer swapchain image failed (%d), using a plain image", result);
+    }
 
     VkImage image;
     VkResult result = vulkanWrapper.vkCreateImage(device, &imageInfo, NULL, &image);
@@ -123,13 +293,14 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     swapchain->windowId = windowId;
     swapchain->imageCount = MAX(swapchainInfo->minImageCount, 1);
     swapchain->images = calloc(swapchain->imageCount, sizeof(XWindowSwapchain_Image));
+    headless->hardwareBuffers = calloc(swapchain->imageCount, sizeof(AHardwareBuffer*));
     swapchain->imageFormat = swapchainInfo->imageFormat;
     swapchain->imageUsage = swapchainInfo->imageUsage;
     memcpy(&swapchain->imageExtent, &swapchainInfo->imageExtent, sizeof(VkExtent2D));
     swapchain->jmethods = jmethods;
 
     for (int i = 0; i < swapchain->imageCount; i++) {
-        if (createImage(device, swapchain, &swapchain->images[i]) != VK_SUCCESS) {
+        if (createImage(device, swapchain, &swapchain->images[i], &headless->hardwareBuffers[i]) != VK_SUCCESS) {
             XWindowSwapchain_destroy(device, swapchain);
             return NULL;
         }
@@ -143,8 +314,10 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     poolInfo.queueFamilyIndex = graphicsQueueIndex;
     vulkanWrapper.vkCreateCommandPool(device, &poolInfo, NULL, &headless->commandPool);
 
-    println("vortek-server: headless swapchain %dx%d format=%d images=%d window=%d",
-            swapchain->imageExtent.width, swapchain->imageExtent.height, swapchain->imageFormat, swapchain->imageCount, windowId);
+    registerZeroCopy(headless);
+    println("vortek-server: headless swapchain %dx%d format=%d images=%d window=%d%s",
+            swapchain->imageExtent.width, swapchain->imageExtent.height, swapchain->imageFormat, swapchain->imageCount, windowId,
+            headless->zeroCopy ? " (zero-copy)" : headless->hardwareBuffers[0] ? " (AHardwareBuffer)" : "");
     return swapchain;
 }
 
@@ -153,11 +326,14 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
 
     if (swapchain->queue) vulkanWrapper.vkQueueWaitIdle(swapchain->queue);
+    unregisterZeroCopy(headless);
 
     for (int i = 0; i < swapchain->imageCount; i++) {
         if (swapchain->images[i].image) vulkanWrapper.vkDestroyImage(device, swapchain->images[i].image, NULL);
         if (swapchain->images[i].memory) vulkanWrapper.vkFreeMemory(device, swapchain->images[i].memory, NULL);
+        if (headless->hardwareBuffers && headless->hardwareBuffers[i]) AHardwareBuffer_release(headless->hardwareBuffers[i]);
     }
+    MEMFREE(headless->hardwareBuffers);
 
     if (headless->dumpBuffer) vulkanWrapper.vkDestroyBuffer(device, headless->dumpBuffer, NULL);
     if (headless->dumpMemory) vulkanWrapper.vkFreeMemory(device, headless->dumpMemory, NULL);
@@ -168,9 +344,44 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     free(headless);
 }
 
+/* Zero-copy: an image the compositor still shows cannot be handed out. Waits for a free one and
+ * for its release fence; never fails, since a negative or timeout result would read as an index. */
+static uint32_t acquireZeroCopy(HeadlessSwapchain* headless) {
+    XWindowSwapchain* swapchain = &headless->base;
+    pthread_mutex_lock(&zcLock);
+    int found = -1;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    while (found < 0) {
+        for (int k = 0; k < swapchain->imageCount && found < 0; k++) {
+            int i = (headless->nextImage + k) % swapchain->imageCount;
+            if (headless->owner[i] == OWNER_FREE) found = i;
+        }
+        if (found >= 0 || !headless->zeroCopy) break;
+        if (pthread_cond_timedwait(&zcCond, &zcLock, &deadline) != 0) break;
+    }
+    if (found < 0) {
+        found = headless->nextImage;
+        if (!headless->stealLogged) println("vortek-server: zero-copy swapchain %u: no image released in 2 s, reusing one", headless->chainId);
+        headless->stealLogged = true;
+    }
+    int fd = headless->releaseFd[found];
+    headless->releaseFd[found] = -1;
+    headless->owner[found] = OWNER_APP;
+    pthread_mutex_unlock(&zcLock);
+    if (fd >= 0) {
+        struct pollfd p = {fd, POLLIN, 0};
+        poll(&p, 1, 2000);
+        close(fd);
+    }
+    return found;
+}
+
 VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     (void)timeout;
+    uint32_t index = headless->owner ? acquireZeroCopy(headless) : headless->nextImage;
 
     if (signalSemaphore || fence) {
         VkSubmitInfo submitInfo = {0};
@@ -184,9 +395,69 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
         if (result == VK_ERROR_DEVICE_LOST) return result;
     }
 
-    headless->lastAcquired = headless->nextImage;
-    headless->nextImage = (headless->nextImage + 1) % swapchain->imageCount;
+    headless->lastAcquired = index;
+    headless->nextImage = (index + 1) % swapchain->imageCount;
     *imageIndex = headless->lastAcquired;
+    return VK_SUCCESS;
+}
+
+/* The app's present: wait for its rendering on the GPU, export that as a sync fence and give the
+ * image to the compositor. VK_ERROR_FEATURE_NOT_PRESENT leaves the semaphores untouched so the
+ * client can present through X11 instead. */
+VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t index, const VkSemaphore* waitSemaphores,
+                                          uint32_t waitCount, int32_t x, int32_t y, int32_t w, int32_t h) {
+    HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
+    if (!headless || !headless->owner || !headless->zeroCopy || index >= (uint32_t)swapchain->imageCount ||
+        !vulkanWrapper.vkGetFenceFd)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+
+    VkExportFenceCreateInfo exportInfo = {0};
+    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO;
+    exportInfo.handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+    VkFenceCreateInfo fenceInfo = {0};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.pNext = &exportInfo;
+    VkFence fence = VK_NULL_HANDLE;
+    if (vulkanWrapper.vkCreateFence(headless->device, &fenceInfo, NULL, &fence) != VK_SUCCESS) return VK_ERROR_FEATURE_NOT_PRESENT;
+
+    VkPipelineStageFlags stages[waitCount > 0 ? waitCount : 1];
+    for (uint32_t i = 0; i < waitCount; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = stages;
+    VkResult result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, fence);
+    if (result != VK_SUCCESS) {
+        vulkanWrapper.vkDestroyFence(headless->device, fence, NULL);
+        return result;
+    }
+
+    int fd = -1;
+    VkFenceGetFdInfoKHR fdInfo = {0};
+    fdInfo.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR;
+    fdInfo.fence = fence;
+    fdInfo.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+    if (vulkanWrapper.vkGetFenceFd(headless->device, &fdInfo, &fd) != VK_SUCCESS) {
+        vulkanWrapper.vkWaitForFences(headless->device, 1, &fence, VK_TRUE, 1000000000ull);
+        fd = -1;
+    }
+    vulkanWrapper.vkDestroyFence(headless->device, fence, NULL);
+
+    pthread_mutex_lock(&zcLock);
+    headless->owner[index] = OWNER_COMPOSITOR;
+    pthread_mutex_unlock(&zcLock);
+    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, fd)) {
+        headless->shown = true;
+    }
+    else {
+        /* The semaphores are consumed: report success and drop this frame, later ones use X11. */
+        pthread_mutex_lock(&zcLock);
+        headless->owner[index] = OWNER_FREE;
+        headless->zeroCopy = false;
+        pthread_cond_broadcast(&zcCond);
+        pthread_mutex_unlock(&zcLock);
+    }
     return VK_SUCCESS;
 }
 
@@ -328,6 +599,19 @@ void XWindowSwapchain_presentImage(XWindowSwapchain* swapchain) {
     if (!swapchain) return;
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     headless->presentCount++;
+    if (headless->owner) {
+        /* An image the app still holds was presented through X11: free it, and take the layer down. */
+        bool hide = false;
+        pthread_mutex_lock(&zcLock);
+        if (headless->owner[headless->lastAcquired] == OWNER_APP) {
+            headless->owner[headless->lastAcquired] = OWNER_FREE;
+            hide = headless->shown;
+            headless->shown = false;
+            pthread_cond_broadcast(&zcCond);
+        }
+        pthread_mutex_unlock(&zcLock);
+        if (hide) ZeroCopy_hide(headless->chainId);
+    }
 
     int logEvery = envInt("VORTEK_PRESENT_LOG", 60);
     if (logEvery > 0 && (headless->presentCount == 1 || headless->presentCount % logEvery == 0))
@@ -337,3 +621,27 @@ void XWindowSwapchain_presentImage(XWindowSwapchain* swapchain) {
     int dumpEvery = MAX(envInt("VORTEK_DUMP_EVERY", 1), 1);
     if (dumpPath && *dumpPath && headless->presentCount % dumpEvery == 0) dumpImage(headless, dumpPath);
 }
+
+/* REQUEST_CODE_DD_PRESENT_ZERO_COPY, dispatched by the patched getHandleRequestFunc. */
+void droiddeck_handlePresentZeroCopy(VkContext* context) {
+    VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
+    DDPresentZeroCopy request;
+    if (context->inputBufferSize >= (int)sizeof(request)) {
+        memcpy(&request, context->inputBuffer, sizeof(request));
+        uint32_t count = request.waitCount;
+        if (count <= 16 && context->inputBufferSize >= (int)(sizeof(request) + count * sizeof(uint64_t))) {
+            VkSemaphore semaphores[16];
+            for (uint32_t i = 0; i < count; i++) {
+                uint64_t id;
+                memcpy(&id, context->inputBuffer + sizeof(request) + i * sizeof(uint64_t), sizeof(id));
+                semaphores[i] = VkObject_fromId(id);
+            }
+            XWindowSwapchain* swapchain = VkObject_fromId(request.swapchainId);
+            result = XWindowSwapchain_presentZeroCopy(swapchain, request.imageIndex, semaphores, count,
+                                                      request.x, request.y, request.w, request.h);
+            if (result == VK_ERROR_DEVICE_LOST) context->status = result;
+        }
+    }
+    vt_send(context->clientRing, result, NULL, 0);
+}
+
