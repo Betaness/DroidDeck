@@ -24,7 +24,7 @@ Mali 设备（例如 Mali-G2 / v15，Android 17）也能在 DroidDeck 的 Linux 
 | 文件 | 作用 |
 |---|---|
 | `fetch.sh` | 拉取上游到 `work/` 并应用 `patches/` |
-| `patches/` | 对上游的修改：socket 路径可配置、X11 呈现钩子、去掉 JNI 的独立服务端钩子、Mali 上 `vkWaitForFences` 的修复、`VK_EXT_graphics_pipeline_library` 的线上结构（特性/属性、库创建信息、库句柄转换，`vortek-0008`/`winlator-0010`；服务端在链接出的管线还在时推迟销毁它用到的库，绕开 Mali 的问题；测试 `tests/gpl_test.c`） |
+| `patches/` | 对上游的修改：socket 路径可配置、X11 呈现钩子、去掉 JNI 的独立服务端钩子、Mali 上 `vkWaitForFences` 的修复、`VK_EXT_graphics_pipeline_library` 的线上结构（特性/属性、库创建信息、库句柄转换，`vortek-0008`/`winlator-0010`；服务端在链接出的管线还在时推迟销毁它用到的库，绕开 Mali 的问题；测试 `tests/gpl_test.c`）；`winlator-0011`：`ResourceMemory_allocate` 每种内存路径（opaque_fd / dmabuf / ahb / ahb 回退 / plain / native image）第一次分配时打日志，外部内存能力查询改用合法的 buffer usage 并打一次日志；实验开关 `VORTEK_NATIVE_IMAGES=1` 让专用于 OPTIMAL 图像的内存走普通 `vkAllocateMemory`（不可映射，`vkMapMemory` 返回 `VK_ERROR_MEMORY_MAP_FAILED`；带 `VkImportMemoryFdInfoKHR` 或 `VkExportMemoryAllocateInfo` 的分配仍走外部内存路径，pNext 只转发 dedicated/allocate flags/opaque capture address 的副本），测试 `tests/dedicated_image_test.c`；`src/headless_swapchain.c` 的 `VORTEK_MIN_IMAGES`（1..6）覆盖交换链 minImageCount） |
 | `src/standalone_main.c` | 服务端入口（代替 JNI 的 `main.c` 和 Java 的 `VortekRendererComponent`）：监听 socket、每个连接一个线程、经 `sphal` 加载厂商 HAL |
 | `src/headless_swapchain.c` | 代替依赖 Winlator X server 的 `xwindow_swapchain.c` |
 | `src/client_x11_present.c/.h` | 客户端的软件 X11 呈现（MIT-SHM / PutImage） |

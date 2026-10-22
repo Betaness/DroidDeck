@@ -16,6 +16,8 @@
  *   VORTEK_AHB_SWAPCHAIN   back swapchain images with AHardwareBuffers the server allocates
  *                          (default 1); with $VORTEK_PRESENT_SOCKET they are shown zero-copy
  *                          by DroidDeck's compositor (zero_copy.c), VORTEK_ZERO_COPY=0 disables it
+ *   VORTEK_MIN_IMAGES      surface minImageCount reported to clients, clamped to 1..6
+ *                          (default 2 with VORTEK_AHB_SWAPCHAIN, else 1)
  *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * Based on Winlator's vortekrenderer (C) brunodev85, LGPL-2.1.
@@ -174,8 +176,21 @@ void getWindowExtent(JMethods* jmethods, int windowId, VkExtent2D* extent) {
 }
 
 int getSurfaceMinImageCount() {
-    /* Zero-copy keeps one image on screen; with fewer than two the app could never acquire. */
-    return envInt("VORTEK_AHB_SWAPCHAIN", 1) ? 2 : 1;
+    /* Zero-copy keeps one image on screen; with fewer than two the app could never acquire.
+     * VORTEK_MIN_IMAGES=N overrides it (clamped to 1..6), read once. */
+    static int minImages = 0;
+    if (!minImages) {
+        int value = envInt("VORTEK_AHB_SWAPCHAIN", 1) ? 2 : 1;
+        const char* override = getenv("VORTEK_MIN_IMAGES");
+        if (override && *override) {
+            value = atoi(override);
+            if (value < 1) value = 1;
+            if (value > 6) value = 6;
+            fprintf(stderr, "vortek-server: VORTEK_MIN_IMAGES: swapchain minImageCount %d\n", value);
+        }
+        minImages = value;
+    }
+    return minImages;
 }
 
 VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {

@@ -237,6 +237,10 @@ static void loadOptions(void) {
     if ((value = getenv("VORTEK_MAX_DEVICE_MEMORY")) && *value) options.maxDeviceMemory = (short)atoi(value);
     if ((value = getenv("VORTEK_IMAGE_CACHE_SIZE")) && *value) options.imageCacheSize = (short)atoi(value);
     if ((value = getenv("VORTEK_RESOURCE_MEMORY_TYPE")) && *value) options.resourceMemoryType = (uint8_t)atoi(value);
+    /* Experimental: memory dedicated to an optimal-tiling image is allocated with plain
+     * vkAllocateMemory (client pNext kept, not mappable) instead of an external-memory path. */
+    if ((value = getenv("VORTEK_NATIVE_IMAGES")) && *value) options.nativeImages = atoi(value) != 0;
+    if (options.nativeImages) fprintf(stderr, "vortek-server: VORTEK_NATIVE_IMAGES=1 (experimental)\n");
     if ((value = getenv("VORTEK_EXPOSED_DEVICE_EXTENSIONS")) && *value && strcmp(value, "all") != 0) {
         options.exposedDeviceExtensions = calloc(1, sizeof(ArrayList));
         char* list = strdup(value);
@@ -329,7 +333,9 @@ static void usage(const char* argv0) {
             "  VORTEK_LIBVULKAN   use this Vulkan loader library instead of the HAL module\n"
             "  VORTEK_VK_MAX_VERSION, VORTEK_MAX_DEVICE_MEMORY (MiB), VORTEK_IMAGE_CACHE_SIZE,\n"
             "  VORTEK_RESOURCE_MEMORY_TYPE, VORTEK_EXPOSED_DEVICE_EXTENSIONS (a|b|c)\n"
-            "  VORTEK_HEADLESS_SIZE (WxH), VORTEK_DUMP_PPM (path of last presented frame)\n",
+            "  VORTEK_NATIVE_IMAGES=1 (dedicated optimal-image memory without external memory)\n"
+            "  VORTEK_HEADLESS_SIZE (WxH), VORTEK_DUMP_PPM (path of last presented frame)\n"
+            "  VORTEK_MIN_IMAGES (swapchain minImageCount, 1..6)\n",
             argv0);
 }
 
