@@ -62,6 +62,21 @@ static void traceChain(const char* what, const void* chain) {
 static __thread int quietLookups;
 void droiddeck_trace_missing(const char* name) { if (!quietLookups) trace("no entry point: %s", name); }
 
+/* VORTEK_TRACE=2 also logs every request sent to the server, with the sending thread: the last
+ * request of a thread that hangs is the one the server did not answer (codes: request_codes.h). */
+#include <sys/syscall.h>
+#include <unistd.h>
+static int traceLevel = -1;
+void droiddeck_trace_cmd(const char* name) {
+    if (traceLevel < 0) { const char* e = getenv("VORTEK_TRACE"); traceLevel = e ? atoi(e) : 0; }
+    if (traceLevel >= 3) fprintf(stderr, "vortek-trace: cmd %s\n", name);
+}
+void droiddeck_trace_request(int requestCode, int size) {
+    if (traceLevel < 0) { const char* e = getenv("VORTEK_TRACE"); traceLevel = e ? atoi(e) : 0; }
+    if (traceLevel < 2) return;
+    fprintf(stderr, "vortek-trace: [%ld] request %d (%d bytes)\n", (long)syscall(SYS_gettid), requestCode & 0xffff, size);
+}
+
 static bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name) {
     uint32_t count = 0;
     bool found = false;
@@ -113,6 +128,27 @@ static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, V
 /* ---- 64-bit flag structs folded into the legacy fields ---- */
 
 static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* pipelines) {
+    for (uint32_t i = 0; traceOn > 0 && i < count; i++) {
+        const VkGraphicsPipelineCreateInfo* g = &infos[i];
+        traceChain("CreateGraphicsPipelines", g->pNext);
+        trace("  flags 0x%x stages %u layout %p renderPass %p", g->flags, g->stageCount, (void*)g->layout, (void*)g->renderPass);
+        for (uint32_t s = 0; s < g->stageCount; s++) traceChain("  stage", g->pStages[s].pNext);
+        if (g->pVertexInputState) {
+            const VkPipelineVertexInputStateCreateInfo* v = g->pVertexInputState;
+            traceChain("  vertexInput", v->pNext);
+            for (uint32_t b = 0; b < v->vertexBindingDescriptionCount; b++) trace("    binding %u stride %u rate %d", v->pVertexBindingDescriptions[b].binding, v->pVertexBindingDescriptions[b].stride, v->pVertexBindingDescriptions[b].inputRate);
+            for (uint32_t a = 0; a < v->vertexAttributeDescriptionCount; a++) trace("    attr loc %u binding %u format %d offset %u", v->pVertexAttributeDescriptions[a].location, v->pVertexAttributeDescriptions[a].binding, v->pVertexAttributeDescriptions[a].format, v->pVertexAttributeDescriptions[a].offset);
+        } else trace("  vertexInput NULL");
+        if (g->pInputAssemblyState) trace("  topology %d restart %d", g->pInputAssemblyState->topology, g->pInputAssemblyState->primitiveRestartEnable);
+        if (g->pRasterizationState) { traceChain("  raster", g->pRasterizationState->pNext); trace("    cull %d front %d poly %d depthClamp %d discard %d lineWidth %f", g->pRasterizationState->cullMode, g->pRasterizationState->frontFace, g->pRasterizationState->polygonMode, g->pRasterizationState->depthClampEnable, g->pRasterizationState->rasterizerDiscardEnable, g->pRasterizationState->lineWidth); }
+        if (g->pMultisampleState) trace("  samples %d", g->pMultisampleState->rasterizationSamples);
+        if (g->pColorBlendState) trace("  blend attachments %u logicOp %d", g->pColorBlendState->attachmentCount, g->pColorBlendState->logicOpEnable);
+        if (g->pDepthStencilState) trace("  depth test %d write %d", g->pDepthStencilState->depthTestEnable, g->pDepthStencilState->depthWriteEnable);
+        if (g->pViewportState) trace("  viewports %u scissors %u", g->pViewportState->viewportCount, g->pViewportState->scissorCount);
+        if (g->pDynamicState) { char b[512]; int n = 0; b[0] = 0; for (uint32_t d = 0; d < g->pDynamicState->dynamicStateCount && n < 480; d++) n += snprintf(b + n, sizeof(b) - n, " %d", g->pDynamicState->pDynamicStates[d]); trace("  dynamic:%s", b); }
+        const VkPipelineRenderingCreateInfo* r = findInChain(g->pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
+        if (r) trace("  rendering colors %u fmt0 %d depth %d stencil %d viewMask %u", r->colorAttachmentCount, r->colorAttachmentCount ? r->pColorAttachmentFormats[0] : 0, r->depthAttachmentFormat, r->stencilAttachmentFormat, r->viewMask);
+    }
     VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
     if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memcpy(copy, infos, count * sizeof(*copy));
@@ -240,6 +276,35 @@ static VkResult dd_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo*
     return r;
 }
 
+VkResult vt_call_vkQueueSubmit(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
+VkResult vt_call_vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*, VkSemaphore*);
+
+static VkResult dd_vkCreateSemaphore(VkDevice d, const VkSemaphoreCreateInfo* ci, const VkAllocationCallbacks* a, VkSemaphore* s) {
+    VkResult r = vt_call_vkCreateSemaphore(d, ci, a, s);
+    const VkSemaphoreTypeCreateInfo* t = findInChain(ci->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
+    trace("CreateSemaphore %p %s initial %llu -> %d", (void*)*s, t && t->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE ? "timeline" : "binary",
+          t ? (unsigned long long)t->initialValue : 0ull, r);
+    return r;
+}
+
+static VkResult dd_vkQueueSubmit(VkQueue q, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    if (traceOn > 0) {
+        for (uint32_t i = 0; i < count; i++) {
+            const VkSubmitInfo* s = &submits[i];
+            const VkTimelineSemaphoreSubmitInfo* t = findInChain(s->pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+            traceChain("QueueSubmit", s->pNext);
+            trace("  submit %u: %u cmdbufs fence %p", i, s->commandBufferCount, (void*)fence);
+            for (uint32_t w = 0; w < s->waitSemaphoreCount; w++)
+                trace("    wait %p stage 0x%x value %llu", (void*)s->pWaitSemaphores[w], s->pWaitDstStageMask[w],
+                      t && w < t->waitSemaphoreValueCount && t->pWaitSemaphoreValues ? (unsigned long long)t->pWaitSemaphoreValues[w] : 0ull);
+            for (uint32_t g = 0; g < s->signalSemaphoreCount; g++)
+                trace("    signal %p value %llu", (void*)s->pSignalSemaphores[g],
+                      t && g < t->signalSemaphoreValueCount && t->pSignalSemaphoreValues ? (unsigned long long)t->pSignalSemaphoreValues[g] : 0ull);
+        }
+    }
+    return vt_call_vkQueueSubmit(q, count, submits, fence);
+}
+
 /* ---- lookup, consulted before Vortek's own dispatch table ---- */
 
 static const struct { const char* name; void* func; } ddOverrides[] = {
@@ -256,6 +321,8 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkGetPhysicalDeviceFormatProperties", dd_vkGetPhysicalDeviceFormatProperties},
     {"vkEnumerateDeviceExtensionProperties", dd_vkEnumerateDeviceExtensionProperties},
     {"vkCreateDevice", dd_vkCreateDevice},
+    {"vkCreateSemaphore", dd_vkCreateSemaphore},
+    {"vkQueueSubmit", dd_vkQueueSubmit},
     {"vkCmdBindIndexBuffer2KHR", dd_vkCmdBindIndexBuffer2KHR},
     {"vkCmdBindIndexBuffer2", dd_vkCmdBindIndexBuffer2KHR},
     {"vkGetRenderingAreaGranularityKHR", dd_vkGetRenderingAreaGranularityKHR},

@@ -1,0 +1,38 @@
+diff --git a/include/vortek.h b/include/vortek.h
+index 3855d01..71b8fb6 100644
+--- a/include/vortek.h
++++ b/include/vortek.h
+@@ -19,9 +19,17 @@
+ #define VK_NO_PROTOTYPES 1
+ #endif
+ 
++#if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
++extern void droiddeck_trace_cmd(const char* name);
++#define VT_TRACE_CMD(code, name) droiddeck_trace_cmd(name)
++#else
++#define VT_TRACE_CMD(code, name)
++#endif
++
+ #define VT_CMD_ENQUEUE(cmdName, requestCode, batch, ...) \
+     do { \
+         int bufferSize = vt_sizeof_##cmdName(__VA_ARGS__); \
++        VT_TRACE_CMD(requestCode, #cmdName); \
+         ENSURE_ARRAY_CAPACITY(batch->size + bufferSize + HEADER_SIZE, batch->capacity, batch->buffer, 1); \
+         char* chunk = batch->buffer + batch->size; \
+         *(int*)(chunk + 0) = requestCode; \
+@@ -211,8 +219,15 @@ static inline void vt_free(MemoryPool* memoryPool) {
+     }
+ }
+ 
++#if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
++extern void droiddeck_trace_request(int requestCode, int size);
++#endif
++
+ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int size) {
+ #ifndef VT_SERVER
++#ifdef VORTEK_DROIDDECK
++    droiddeck_trace_request(requestCode, size);
++#endif
+     if (size >= SERVER_RING_BUFFER_SIZE) {
+         const uint16_t requestId = maxClientRequestId++;
+         char header[HEADER_SIZE];

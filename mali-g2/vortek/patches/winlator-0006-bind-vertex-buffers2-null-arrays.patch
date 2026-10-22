@@ -1,0 +1,79 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index a3d741b..b22d147 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -2827,9 +2827,16 @@ void vt_handle_vkCmdBindTransformFeedbackBuffersEXT(VkContext* context) {
+     VkBuffer buffers[bindingCount];
+     VkDeviceSize offsets[bindingCount];
+     VkDeviceSize sizes[bindingCount];
++#ifdef VORTEK_STANDALONE
++    for (uint32_t i = 0; i < bindingCount; i++) sizes[i] = UINT64_MAX - 1; /* [mali-g2] optional pSizes, see vkCmdBindVertexBuffers2 */
++#endif
+     vt_unserialize_vkCmdBindTransformFeedbackBuffersEXT(VK_NULL_HANDLE, NULL, NULL, buffers, offsets, sizes, context->inputBuffer, &context->memoryPool);
+ 
++#ifdef VORTEK_STANDALONE
++    vulkanWrapper.vkCmdBindTransformFeedbackBuffers(commandBuffer, firstBinding, bindingCount, buffers, offsets, bindingCount > 0 && sizes[0] != UINT64_MAX - 1 ? sizes : NULL);
++#else
+     vulkanWrapper.vkCmdBindTransformFeedbackBuffers(commandBuffer, firstBinding, bindingCount, buffers, offsets, sizes);
++#endif
+ }
+ 
+ void vt_handle_vkCmdBeginTransformFeedbackEXT(VkContext* context) {
+@@ -2842,9 +2849,17 @@ void vt_handle_vkCmdBeginTransformFeedbackEXT(VkContext* context) {
+ 
+     VkBuffer counterBuffers[counterBufferCount];
+     VkDeviceSize counterBufferOffsets[counterBufferCount];
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] pCounterBuffers and pCounterBufferOffsets are optional, see vkCmdBindVertexBuffers2 */
++    for (uint32_t i = 0; i < counterBufferCount; i++) { counterBuffers[i] = VK_NULL_HANDLE; counterBufferOffsets[i] = UINT64_MAX; }
++#endif
+     vt_unserialize_vkCmdBeginTransformFeedbackEXT(VK_NULL_HANDLE, NULL, NULL, counterBuffers, counterBufferOffsets, context->inputBuffer, &context->memoryPool);
+ 
++#ifdef VORTEK_STANDALONE
++    vulkanWrapper.vkCmdBeginTransformFeedback(commandBuffer, firstCounterBuffer, counterBufferCount, counterBuffers, counterBufferCount > 0 && counterBufferOffsets[0] != UINT64_MAX ? counterBufferOffsets : NULL);
++#else
+     vulkanWrapper.vkCmdBeginTransformFeedback(commandBuffer, firstCounterBuffer, counterBufferCount, counterBuffers, counterBufferOffsets);
++#endif
+ }
+ 
+ void vt_handle_vkCmdEndTransformFeedbackEXT(VkContext* context) {
+@@ -2857,9 +2872,17 @@ void vt_handle_vkCmdEndTransformFeedbackEXT(VkContext* context) {
+ 
+     VkBuffer counterBuffers[counterBufferCount];
+     VkDeviceSize counterBufferOffsets[counterBufferCount];
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] pCounterBuffers and pCounterBufferOffsets are optional, see vkCmdBindVertexBuffers2 */
++    for (uint32_t i = 0; i < counterBufferCount; i++) { counterBuffers[i] = VK_NULL_HANDLE; counterBufferOffsets[i] = UINT64_MAX; }
++#endif
+     vt_unserialize_vkCmdEndTransformFeedbackEXT(VK_NULL_HANDLE, NULL, NULL, counterBuffers, counterBufferOffsets, context->inputBuffer, &context->memoryPool);
+ 
++#ifdef VORTEK_STANDALONE
++    vulkanWrapper.vkCmdEndTransformFeedback(commandBuffer, firstCounterBuffer, counterBufferCount, counterBuffers, counterBufferCount > 0 && counterBufferOffsets[0] != UINT64_MAX ? counterBufferOffsets : NULL);
++#else
+     vulkanWrapper.vkCmdEndTransformFeedback(commandBuffer, firstCounterBuffer, counterBufferCount, counterBuffers, counterBufferOffsets);
++#endif
+ }
+ 
+ void vt_handle_vkCmdBeginQueryIndexedEXT(VkContext* context) {
+@@ -3017,9 +3040,21 @@ void vt_handle_vkCmdBindVertexBuffers2(VkContext* context) {
+     VkDeviceSize offsets[bindingCount];
+     VkDeviceSize sizes[bindingCount];
+     VkDeviceSize strides[bindingCount];
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] pSizes and pStrides are optional. The unserializer leaves the arrays untouched
++     * when the client sent NULL, so the driver got uninitialized sizes and strides (zink in
++     * Mesa 26 passes NULL for both: GPU fault, VK_ERROR_DEVICE_LOST). Pass NULL through. */
++    for (uint32_t i = 0; i < bindingCount; i++) { sizes[i] = UINT64_MAX - 1; strides[i] = UINT64_MAX; } /* VK_WHOLE_SIZE is UINT64_MAX */
++#endif
+     vt_unserialize_vkCmdBindVertexBuffers2(VK_NULL_HANDLE, NULL, NULL, buffers, offsets, sizes, strides, context->inputBuffer, &context->memoryPool);
+ 
++#ifdef VORTEK_STANDALONE
++    bool haveSizes = bindingCount > 0 && sizes[0] != UINT64_MAX - 1;
++    bool haveStrides = bindingCount > 0 && strides[0] != UINT64_MAX;
++    vulkanWrapper.vkCmdBindVertexBuffers2(commandBuffer, firstBinding, bindingCount, buffers, offsets, haveSizes ? sizes : NULL, haveStrides ? strides : NULL);
++#else
+     vulkanWrapper.vkCmdBindVertexBuffers2(commandBuffer, firstBinding, bindingCount, buffers, offsets, sizes, strides);
++#endif
+ }
+ 
+ void vt_handle_vkCmdSetDepthTestEnable(VkContext* context) {
