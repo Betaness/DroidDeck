@@ -27,8 +27,18 @@ class VortekServerComponent(
 ) : SessionPart() {
     @Volatile private var pid = -1
 
+    @Volatile private var stopping = false
+    @Volatile private var generation = 0
+    private val crashes = ArrayDeque<Long>()
+
     override fun start() {
         stop()
+        stopping = false
+        synchronized(crashes) { crashes.clear() }
+        launch()
+    }
+
+    private fun launch() {
         val binary = binary(app())
         val hal = halDriver()
         if (!binary.isFile || hal == null) {
@@ -44,12 +54,14 @@ class VortekServerComponent(
         val log = logFile?.let {
             runCatching { PrintWriter(FileWriter(it, true)) }.onFailure { e -> Log.w(TAG, "could not open $it", e) }.getOrNull()
         }
+        val mine = ++generation
         log?.apply { println("== vortek-server starting: ${binary.path} ${socket.path} (HAL ${hal.path})"); flush() }
         val command = listOf(binary.absolutePath, socket.absolutePath)
             .joinToString(" ") { it.replace("\\", "\\\\").replace(" ", "\\ ") }
         pid = HostProcess.start(command, env.toTypedArray(), app().filesDir, { status ->
             Log.i(TAG, "vortek-server exited: $status")
             log?.let { synchronized(it) { it.println("== vortek-server exited: $status"); it.flush() } }
+            if (mine == generation) restartAfterCrash()
         }) { line ->
             Log.i(TAG, line)
             log?.let { synchronized(it) { it.println(line); it.flush() } }
@@ -57,7 +69,30 @@ class VortekServerComponent(
         Log.i(TAG, "started pid=$pid socket=$socket hal=$hal")
     }
 
+    // Every guest Vulkan client loses its device when the server dies; processes started after a
+    // restart (Steam relaunches its web helper) get a working one again.
+    private fun restartAfterCrash() {
+        if (stopping) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val recent = synchronized(crashes) {
+            crashes.addLast(now)
+            while (crashes.isNotEmpty() && now - crashes.first() > RESTART_WINDOW_MS) crashes.removeFirst()
+            crashes.size
+        }
+        if (recent > MAX_RESTARTS) {
+            Log.w(TAG, "vortek-server crashed $recent times within ${RESTART_WINDOW_MS / 1000} s; not restarting")
+            return
+        }
+        val crashed = generation
+        Thread({
+            Thread.sleep(500)
+            if (!stopping && crashed == generation) launch()
+        }, "vortek-restart").start()
+    }
+
     override fun stop() {
+        stopping = true
+        generation++
         if (pid > 1) android.os.Process.killProcess(pid)
         pid = -1
     }
@@ -71,6 +106,8 @@ class VortekServerComponent(
         const val GUEST_DIR = "/usr/local/lib/droiddeck-vortek"
         const val GUEST_ICD = "$GUEST_DIR/vortek_icd.aarch64.json"
         private const val HAL_DIR = "/vendor/lib64/hw"
+        private const val MAX_RESTARTS = 5
+        private const val RESTART_WINDOW_MS = 60_000L
 
         fun binary(context: Context): File = File(context.applicationInfo.nativeLibraryDir, BINARY)
 
