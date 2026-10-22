@@ -43,7 +43,7 @@ index 71b8fb6..5f8e9c4 100755
 +#endif
 +
 +/* [mali-g2] Command streaming: once a command buffer's batch reaches vt_cmdChunkSize bytes
-+ * (VORTEK_CMD_CHUNK, default 32 KiB, 0 disables), the commands recorded so far are sent as a
++ * (VORTEK_CMD_CHUNK, off by default, e.g. 32k), the commands recorded so far are sent as a
 + * REQUEST_CODE_DD_CMD_CHUNK and the server replays them while the application keeps recording.
 + * vkCmd* functions run without the call lock; vt_sendCommandChunk takes it for the send only. */
 +#if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
@@ -149,7 +149,7 @@ index 0453806..3aeefd3 100644
 +
 +/* [mali-g2] Command streaming (VT_CMD_STREAM in vortek.h). VORTEK_CMD_CHUNK=<bytes> (k/m suffixes
 + * allowed) sets the threshold; 0 sends every command buffer only at vkEndCommandBuffer. */
-+int vt_cmdChunkSize = 32768;
++int vt_cmdChunkSize = 0;
 +
 +__attribute__((constructor)) static void vt_initCmdChunkSize(void) {
 +    const char* value = getenv("VORTEK_CMD_CHUNK");
