@@ -57,18 +57,23 @@ static void traceChain(const char* what, const void* chain) {
     for (const VkBaseInStructure* s = chain; s && n < (int)sizeof(buf) - 16; s = s->pNext) n += snprintf(buf + n, sizeof(buf) - n, " %d", s->sType);
     trace("%s pNext:%s", what, buf);
 }
-void droiddeck_trace_missing(const char* name) { trace("no entry point: %s", name); }
+/* The extension filter (vortek-0003) resolves every command of every advertised extension;
+ * those lookups are not the application's, so they are not logged. */
+static __thread int quietLookups;
+void droiddeck_trace_missing(const char* name) { if (!quietLookups) trace("no entry point: %s", name); }
 
 static bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name) {
     uint32_t count = 0;
-    if (vt_call_vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL) != VK_SUCCESS || !count) return false;
-    VkExtensionProperties* props = calloc(count, sizeof(*props));
-    if (!props) return false;
     bool found = false;
-    if (vt_call_vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, props) >= 0) {
-        for (uint32_t i = 0; i < count && !found; i++) found = strcmp(props[i].extensionName, name) == 0;
+    quietLookups++;
+    if (vt_call_vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL) == VK_SUCCESS && count) {
+        VkExtensionProperties* props = calloc(count, sizeof(*props));
+        if (props && vt_call_vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, props) >= 0) {
+            for (uint32_t i = 0; i < count && !found; i++) found = strcmp(props[i].extensionName, name) == 0;
+        }
+        free(props);
     }
-    free(props);
+    quietLookups--;
     return found;
 }
 
@@ -220,7 +225,9 @@ static void dd_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat
     trace("FormatProperties %d -> opt 0x%x", f, p->optimalTilingFeatures);
 }
 static VkResult dd_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* c, VkExtensionProperties* p) {
+    quietLookups++;
     VkResult r = vt_call_vkEnumerateDeviceExtensionProperties(pd, layer, c, p);
+    quietLookups--;
     trace("EnumerateDeviceExtensionProperties(%s) -> %d count %u", layer ? layer : "-", r, c ? *c : 0);
     if (p && r >= 0 && traceOn > 0) for (uint32_t i = 0; i < *c; i++) trace("  %s", p[i].extensionName);
     return r;

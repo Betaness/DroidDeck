@@ -295,13 +295,23 @@ if [ -z "${BL_INSIDE:-}" ]; then
     start_vortek_display || exit 66
     # OpenGL: zink over Vortek when it starts (Mesa 26 needs the server's maintenance5 support),
     # else the CPU (llvmpipe). BL_VORTEK_GL=zink|llvmpipe skips the probe.
-    _bl_gl=${BL_VORTEK_GL:-auto}
+    _bl_gl=${BL_VORTEK_GL:-auto} _bl_gl_why="BL_VORTEK_GL=${BL_VORTEK_GL:-}"
     if [ "$_bl_gl" = auto ]; then
-      _bl_gl=llvmpipe
-      if command -v eglinfo >/dev/null 2>&1 &&
-         env -u LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink \
-           timeout 20 eglinfo -B -p surfaceless 2>/dev/null | grep -q 'renderer: zink'; then
+      # Probe the path Steam's own window takes (GLX on this X server), else surfaceless EGL.
+      _bl_gl=llvmpipe _bl_gl_why="no glxinfo or eglinfo to probe zink with"
+      _bl_probe=(env -u LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_KOPPER_DRI2=true timeout 20)
+      if command -v glxinfo >/dev/null 2>&1; then
+        _bl_out=$("${_bl_probe[@]}" glxinfo -B 2>&1)
+      elif command -v eglinfo >/dev/null 2>&1; then
+        _bl_out=$("${_bl_probe[@]}" eglinfo -B -p surfaceless 2>&1)
+      else
+        _bl_out=
+      fi
+      if printf '%s\n' "$_bl_out" | grep -Eq 'renderer( string)?: zink'; then
         _bl_gl=zink
+      elif [ -n "$_bl_out" ]; then
+        _bl_gl_why="zink did not start over Vortek"
+        printf '%s\n' "$_bl_out" | grep -vE 'drirc|DRI3 not available|^ *$' | tail -n 8 | sed 's/^/   zink probe: /'
       fi
     fi
     if [ "$_bl_gl" = zink ]; then
@@ -311,7 +321,7 @@ if [ -z "${BL_INSIDE:-}" ]; then
     else
       unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2 BL_VORTEK_ZINK
       export GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1
-      echo "== vortek: OpenGL on the CPU (llvmpipe; zink did not start over Vortek)"
+      echo "== vortek: OpenGL on the CPU (llvmpipe: $_bl_gl_why)"
     fi
   elif [ "$mode" = steam ]; then
     run_gamescope "${args[@]}" -- "$0" "$mode" "$@"
@@ -457,8 +467,9 @@ case $mode in
       fi
       steam_client=("$steam_root/steamrtarm64/steam")
     fi
-    # [mali-g2] Vortek: the client's web views use the GPU when OpenGL runs on zink (its compositor
-    # is OpenGL), else they draw in software. BL_CEF_GPU=0|1 overrides.
+    # [mali-g2] Vortek: the client's web views use the GPU when OpenGL runs on zink, else they draw in
+    # software. They use ANGLE on OpenGL (zink), not ANGLE on Vulkan: the web helper's own compositor
+    # is OpenGL and cannot share textures with a Vulkan ANGLE. BL_CEF_GPU=0|1 overrides.
     if [ "${BL_GPU_MODE:-}" = vortek ]; then
       if [ "${BL_CEF_GPU:-}" = 1 ] || { [ "${BL_VORTEK_ZINK:-0}" = 1 ] && [ "${BL_CEF_GPU:-}" != 0 ]; }; then
         steam_cef_gpu=1
@@ -868,6 +879,7 @@ BUSCONF
     _bl_ui=(-gamepadui)
     [ "${BL_STEAM_UI:-}" = desktop ] && _bl_ui=()
     _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=vulkan)
+    [ "${BL_GPU_MODE:-}" = vortek ] && _bl_cef=(-cef-force-gpu -cef-use-gl=angle -cef-use-angle=gl)
     [ "${steam_cef_gpu:-1}" = 1 ] || _bl_cef=(-cef-disable-gpu)
     [ "${BL_GPU_MODE:-}" = vortek ] && [ "${steam_cef_gpu:-1}" = 0 ] && _bl_cef+=(-cef-disable-gpu-compositing)
     if [ "${BL_DESKTOP:-}" = 1 ] && [ "${BL_STEAM_UI:-}" = desktop ]; then
