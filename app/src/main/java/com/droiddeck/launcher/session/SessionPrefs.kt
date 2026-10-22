@@ -378,7 +378,7 @@ object SessionPrefs {
     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
 
     /** Whether a Windows game's busiest thread may share a core with its wineserver (WineServerColocation). */
-    fun wineColocate(context: Context): Boolean = prefs(context).getBoolean("wineColocate", true)
+    fun wineColocate(context: Context): Boolean = prefs(context).getBoolean("wineColocate", false)
 
     fun prootNoSeccomp(context: Context): Boolean = prefs(context).getBoolean("prootNoSeccomp", false)
 
