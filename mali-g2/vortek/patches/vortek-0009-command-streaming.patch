@@ -1,0 +1,190 @@
+diff --git a/include/ring_buffer.h b/include/ring_buffer.h
+index fb78ad8..eee0d5f 100644
+--- a/include/ring_buffer.h
++++ b/include/ring_buffer.h
+@@ -33,6 +33,7 @@ extern uint32_t RingBuffer_size(RingBuffer* ring);
+ extern uint32_t RingBuffer_freeSpace(RingBuffer* ring);
+ extern bool RingBuffer_read(RingBuffer* ring, void* data, uint32_t size);
+ extern bool RingBuffer_write(RingBuffer* ring, const void *data, uint32_t size);
++extern bool RingBuffer_write2(RingBuffer* ring, const void* a, uint32_t aSize, const void* b, uint32_t bSize);
+ extern uint32_t RingBuffer_getSHMemSize(uint32_t bufferSize);
+ extern void RingBuffer_free(RingBuffer* ring);
+ extern bool RingBuffer_waitForRead(RingBuffer* ring, uint32_t size);
+diff --git a/include/vortek.h b/include/vortek.h
+index 71b8fb6..5f8e9c4 100755
+--- a/include/vortek.h
++++ b/include/vortek.h
+@@ -30,15 +30,43 @@ extern void droiddeck_trace_cmd(const char* name);
+     do { \
+         int bufferSize = vt_sizeof_##cmdName(__VA_ARGS__); \
+         VT_TRACE_CMD(requestCode, #cmdName); \
+-        ENSURE_ARRAY_CAPACITY(batch->size + bufferSize + HEADER_SIZE, batch->capacity, batch->buffer, 1); \
++        VT_CMD_RESERVE(batch, bufferSize + HEADER_SIZE); \
+         char* chunk = batch->buffer + batch->size; \
+         *(int*)(chunk + 0) = requestCode; \
+         *(int*)(chunk + 4) = bufferSize; \
+         vt_serialize_##cmdName(__VA_ARGS__, chunk + HEADER_SIZE); \
+         batch->size += bufferSize + HEADER_SIZE; \
++        VT_CMD_STREAM(batch); \
+     } \
+     while (0)
+ 
++/* [mali-g2] Grow a batch geometrically: ENSURE_ARRAY_CAPACITY with an element size of 1 grows to
++ * exactly the requested size, i.e. a realloc (an mremap for large batches) for every command. */
++#if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
++#define VT_CMD_RESERVE(batch, extra) \
++    do { \
++        int needed = (batch)->size + (extra); \
++        if (needed > (batch)->capacity) ENSURE_ARRAY_CAPACITY(needed + (needed >> 1) + 4096, (batch)->capacity, (batch)->buffer, 1); \
++    } \
++    while (0)
++#else
++#define VT_CMD_RESERVE(batch, extra) ENSURE_ARRAY_CAPACITY((batch)->size + (extra), (batch)->capacity, (batch)->buffer, 1)
++#endif
++
++/* [mali-g2] Command streaming: once a command buffer's batch reaches vt_cmdChunkSize bytes
++ * (VORTEK_CMD_CHUNK, default 32 KiB, 0 disables), the commands recorded so far are sent as a
++ * REQUEST_CODE_DD_CMD_CHUNK and the server replays them while the application keeps recording.
++ * vkCmd* functions run without the call lock; vt_sendCommandChunk takes it for the send only. */
++#if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
++#define VT_CMD_STREAM(batch) \
++    do { \
++        if (vt_cmdChunkSize > 0 && (batch)->size >= vt_cmdChunkSize) vt_sendCommandChunk(batch); \
++    } \
++    while (0)
++#else
++#define VT_CMD_STREAM(batch) do {} while (0)
++#endif
++
+ #ifdef VT_SERVER
+ #define VT_SERIALIZE_CMD(cmdName, ...) \
+     int bufferSize = vt_sizeof_##cmdName(__VA_ARGS__); \
+@@ -142,6 +170,11 @@ typedef struct CommandBatch {
+     int size;
+ } CommandBatch;
+ 
++#ifdef VORTEK_DROIDDECK
++extern int vt_cmdChunkSize;
++extern void vt_sendCommandChunk(CommandBatch* batch);
++#endif
++
+ extern bool vortekInitOnce();
+ extern int serverFd;
+ extern uint16_t maxClientRequestId;
+@@ -253,6 +286,11 @@ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int siz
+     *(int*)(header + 0) = requestCode;
+     *(int*)(header + 4) = size;
+ 
++#if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
++    /* [mali-g2] header and payload published together: one wake of a sleeping server per request */
++    if (!RingBuffer_write2(ring, header, HEADER_SIZE, data, size > 0 ? size : 0)) return 0;
++    return size;
++#else
+     bool result = RingBuffer_write(ring, header, HEADER_SIZE);
+     if (!result) return 0;
+ 
+@@ -262,6 +300,7 @@ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int siz
+     }
+ 
+     return size;
++#endif
+ }
+ 
+ static inline int vt_recv(RingBuffer* ring, char** inputBuffer, int* bufferSize, MemoryPool* memoryPool) {
+diff --git a/src/ring_buffer.c b/src/ring_buffer.c
+index 93a568f..b751c9c 100644
+--- a/src/ring_buffer.c
++++ b/src/ring_buffer.c
+@@ -176,6 +176,41 @@ bool RingBuffer_write(RingBuffer* ring, const void* data, uint32_t size) {
+     return true;
+ }
+ 
++/* [mali-g2] Writes two pieces (a request header and its payload) and publishes them with one tail
++ * store, so a sleeping reader is woken once per request: with separate writes the reader wakes for
++ * the header, spins SPIN_NS for the payload and, if the writer's wake syscall took longer than
++ * that, sleeps again and needs a second wake. That was measured under a proot whose kompat filter
++ * traps futex (about 38 us per wake); DroidDeck's guest proot does not trap futex (proot patch
++ * 0011), where a wake costs a few us and this mostly saves one syscall per request. */
++bool RingBuffer_write2(RingBuffer* ring, const void* a, uint32_t aSize, const void* b, uint32_t bSize) {
++    if (aSize + bSize > ring->bufferSize || aSize + bSize < aSize) {
++        return RingBuffer_write(ring, a, aSize) && (bSize == 0 || RingBuffer_write(ring, b, bSize));
++    }
++
++    if (!RingBuffer_waitForWrite(ring, aSize + bSize)) return false;
++    uint32_t tail = RingBuffer_getTail(ring);
++    const void* pieces[2] = {a, b};
++    uint32_t sizes[2] = {aSize, bSize};
++
++    for (int i = 0; i < 2; i++) {
++        uint32_t offset = tail & (ring->bufferSize - 1);
++        uint32_t size = sizes[i];
++        if (size == 0) continue;
++        if ((offset + size) <= ring->bufferSize) {
++            memcpy(ring->buffer + offset, pieces[i], size);
++        }
++        else {
++            uint32_t start = ring->bufferSize - offset;
++            memcpy(ring->buffer + offset, pieces[i], start);
++            memcpy(ring->buffer, (const char*)pieces[i] + start, size - start);
++        }
++        tail += size;
++    }
++
++    RingBuffer_setTail(ring, tail);
++    return true;
++}
++
+ uint32_t RingBuffer_getSHMemSize(uint32_t bufferSize) {
+     STRUCT_OFFSETS();
+ 
+diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
+index 0453806..3aeefd3 100644
+--- a/src/vulkan_calls.c
++++ b/src/vulkan_calls.c
+@@ -28,6 +28,46 @@ static pthread_mutex_t vt_call_mutex = PTHREAD_MUTEX_INITIALIZER;
+     pthread_mutex_unlock(&vt_call_mutex);
+ 
+ #ifdef VORTEK_DROIDDECK
++#include "droiddeck_requests.h"
++
++/* [mali-g2] Command streaming (VT_CMD_STREAM in vortek.h). VORTEK_CMD_CHUNK=<bytes> (k/m suffixes
++ * allowed) sets the threshold; 0 sends every command buffer only at vkEndCommandBuffer. */
++int vt_cmdChunkSize = 32768;
++
++__attribute__((constructor)) static void vt_initCmdChunkSize(void) {
++    const char* value = getenv("VORTEK_CMD_CHUNK");
++    if (!value || !*value) return;
++    /* parsed by hand: strtol would bind to glibc 2.38's __isoc23_strtol */
++    long size = 0;
++    const char* end = value;
++    while (*end >= '0' && *end <= '9' && size < (1L << 30)) size = size * 10 + (*end++ - '0');
++    if (*end == 'k' || *end == 'K') size *= 1024;
++    else if (*end == 'm' || *end == 'M') size *= 1024 * 1024;
++    /* a chunk must fit the server ring (larger requests take the socket path) */
++    if (size > SERVER_RING_BUFFER_SIZE / 4) size = SERVER_RING_BUFFER_SIZE / 4;
++    vt_cmdChunkSize = (int)size;
++}
++
++/* Sends the commands recorded so far (command buffer id, then the commands, the layout of
++ * END_COMMAND_BUFFER) and empties the batch, keeping the id. Called from VT_CMD_ENQUEUE, i.e. from
++ * vkCmd* functions, which never hold the call lock. No reply: like END, the server replays the
++ * chunk in request order. Everything in the batch is serialized by value, so nothing in it points
++ * into application memory.
++ * Recording never used to wait for the call lock, and another thread may hold it for a while (a
++ * vkAcquireNextImageKHR or vkQueueWaitIdle waiting in the server), so the lock is only tried: when
++ * it is busy the commands stay in the batch and the next vkCmd* tries again. Past 1 MiB the send
++ * waits for the lock, which keeps chunks well inside the server ring. */
++void vt_sendCommandChunk(CommandBatch* batch) {
++    if (batch->size <= VK_HANDLE_BYTE_COUNT) return;
++    if (batch->size < SERVER_RING_BUFFER_SIZE / 4) {
++        if (pthread_mutex_trylock(&vt_call_mutex) != 0) return;
++    }
++    else VT_CALL_LOCK();
++    vt_send(serverRing, REQUEST_CODE_DD_CMD_CHUNK, batch->buffer, batch->size);
++    VT_CALL_UNLOCK();
++    batch->size = VK_HANDLE_BYTE_COUNT;
++}
++
+ /* [mali-g2] Sends a DroidDeck request (droiddeck_requests.h) and returns the server's VkResult. */
+ int droiddeck_request(int requestCode, const void* payload, int size) {
+     VT_CALL_LOCK();

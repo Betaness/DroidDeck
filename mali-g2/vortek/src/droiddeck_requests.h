@@ -23,4 +23,11 @@ typedef struct DDPresentZeroCopy {
     uint32_t waitCount;
 } DDPresentZeroCopy;
 
+/* Payload: the layout of REQUEST_CODE_VK_END_COMMAND_BUFFER (uint64 command buffer id, then the
+ * recorded commands, each an 8-byte header {requestCode, size} and its serialized arguments). The
+ * server replays the commands into the command buffer without ending it. No reply. The client sends
+ * one whenever a command buffer's batch reaches VORTEK_CMD_CHUNK bytes (default 32 KiB, 0 = never),
+ * so the server records into the driver while the application is still recording. */
+#define REQUEST_CODE_DD_CMD_CHUNK 91
+
 #endif
