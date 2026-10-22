@@ -293,6 +293,11 @@ if [ -z "${BL_INSIDE:-}" ]; then
     unset STEAM_MULTIPLE_XWAYLANDS STEAM_USE_MANGOAPP STEAM_MANGOAPP_PRESETS_SUPPORTED \
       STEAM_MANGOAPP_HORIZONTAL_SUPPORTED MANGOHUD_CONFIGFILE gamescope_cursor_composite BL_STRETCHED
     start_vortek_display || exit 66
+    # Without gamescope the Steam menus would open under a running game: this puts them on top,
+    # answers Steam's Resume (_NET_ACTIVE_WINDOW) and publishes the focus atoms gamescope would.
+    if [ "$mode" = steam ] && [ -x /usr/local/bin/droiddeck-vortek-focus ]; then
+      /usr/local/bin/droiddeck-vortek-focus 2>&1 &
+    fi
     # OpenGL: zink over Vortek when it starts (Mesa 26 needs the server's maintenance5 support),
     # else the CPU (llvmpipe). BL_VORTEK_GL=zink|llvmpipe skips the probe.
     _bl_gl=${BL_VORTEK_GL:-auto} _bl_gl_why="BL_VORTEK_GL=${BL_VORTEK_GL:-}"
