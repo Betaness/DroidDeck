@@ -587,6 +587,23 @@ jobs:
           rm -rf mali-g2/vortek/work mali-g2/vortek/out
           ls -l "$D/usr/local/lib/droiddeck-vortek" app/src/main/jniLibs/arm64-v8a/libvortekserver.so
 
+      - name: MaliBridge server and guest ICD (mali-g2, BL_VK_BRIDGE=malibridge)
+        run: |
+          set -euo pipefail
+          D=app/src/main/assets/linuxfs
+          V=v0.5.2
+          curl -fsSL -o mb.apk "https://github.com/ASEbrahim/MaliBridge/releases/download/$V/DroidDeck-MaliBridge-$V.apk"
+          echo "82c22f8681d0ee8b0b21f189bbfe5d260ba31a87cca8f38965700faa6c125b47  mb.apk" | sha256sum -c
+          mkdir mb && unzip -q mb.apk lib/arm64-v8a/libvkbridge_server.so \
+            assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so \
+            assets/linuxfs/usr/local/share/vkbridge/droidbridge_icd.json -d mb
+          install -Dm755 mb/lib/arm64-v8a/libvkbridge_server.so app/src/main/jniLibs/arm64-v8a/libvkbridge_server.so
+          install -Dm644 mb/assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so "$D/usr/local/lib/vkbridge/libvulkan_droidbridge.so"
+          install -Dm644 mb/assets/linuxfs/usr/local/share/vkbridge/droidbridge_icd.json "$D/usr/local/share/vkbridge/droidbridge_icd.json"
+          printf 'MaliBridge %s (GPL-3.0), https://github.com/ASEbrahim/MaliBridge/releases/tag/%s\nSource: https://github.com/ASEbrahim/MaliBridge/tree/%s\n' "$V" "$V" "$V" \
+            | install -Dm644 /dev/stdin "$D/usr/local/share/licenses/malibridge/NOTICE"
+          rm -rf mb mb.apk
+
       - name: Build the add-on packs
         run: bash tools/packs/build.sh app/build/packs
 

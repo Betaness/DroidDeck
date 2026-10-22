@@ -60,6 +60,7 @@ class SessionService : Service() {
     private val components = java.util.concurrent.CopyOnWriteArrayList<SessionPart>()
     @Volatile private var vortekMode = false
     @Volatile private var vortekEnv: List<String> = emptyList()
+    @Volatile private var maliBridge = false
     private var deckBinds: List<String> = emptyList()
     private var inputSysfs: InputSysfsComponent? = null
     private val stopLock = Any()
@@ -397,7 +398,12 @@ class SessionService : Service() {
         val fastPathAt = guest.size
 
         val pulse = startAudio(guest, sessionDir)
-        if (vortekMode) {
+        if (vortekMode && maliBridge) {
+            val bridge = MaliBridgeComponent(File(runtimeDir, "vkbridge/S"), File(sessionDir, "vkbridge.log"),
+                vortekEnv.filter { it.startsWith("VKBRIDGE_") })
+            bridge.attach(this)
+            components.add(bridge)
+        } else if (vortekMode) {
             val vortek = VortekServerComponent(File(runtimeDir, "vortek/V0"), File(sessionDir, "vortek.log"), vortekEnv)
             vortek.attach(this)
             components.add(vortek)
@@ -654,7 +660,18 @@ class SessionService : Service() {
             // slowed games that throw a lot (Lua in Richman 10) to a crawl. Errors and fixmes still show.
             if (userEnv.none { it.startsWith("WINEDEBUG=") }) guest.add("WINEDEBUG=+timestamp,+pid,+tid,+threadname,+loaddll")
             vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
-            Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
+            // BL_VK_BRIDGE=malibridge: the same session with MaliBridge instead of Vortek (for A/B runs).
+            maliBridge = MaliBridgeComponent.SWITCH in userEnv && MaliBridgeComponent.available(this)
+            if (maliBridge) {
+                val icd = MaliBridgeComponent.GUEST_ICD
+                guest.removeAll { it.startsWith(LinuxVulkanDriver.ENV + "=") || it.startsWith("VK_ICD_FILENAMES=") || it.startsWith("VK_DRIVER_FILES=") }
+                guest.addAll(listOf(LinuxVulkanDriver.ENV + "=" + icd, "VK_ICD_FILENAMES=$icd", "VK_DRIVER_FILES=$icd",
+                    "VKBRIDGE_SOCKET=" + MaliBridgeComponent.GUEST_SOCKET))
+                vortekEnv = userEnv.filter { it.startsWith("VKBRIDGE_") }
+                Log.i(TAG, "gpu: MaliBridge instead of Vortek (BL_VK_BRIDGE)")
+            } else {
+                Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
+            }
         }
         val tuOverride = tuDebugOverride()
         val tuDriver = sysmemDriver(linuxDriverId)
@@ -1802,7 +1819,7 @@ class SessionService : Service() {
         private const val EXTRA_AUXILIARY_PID = "auxiliaryPid"
         private val STRAGGLERS = listOf("droiddeck-session", "gamescope", "Xwayland", "steamrtarm64",
             "steamwebhelper", "linuxfs/opt/android-host/proot", "/libproot.so", "pulseaudio/libpulseaudio.so",
-            "/" + VortekServerComponent.BINARY)
+            "/" + VortekServerComponent.BINARY, "/" + MaliBridgeComponent.BINARY)
         private const val GRACE_MS = 1200L
         private const val STEAM_PICKUP_MS = 1500L
         private const val STEAM_EXIT_MS = 10_000L

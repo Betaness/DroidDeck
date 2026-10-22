@@ -138,11 +138,14 @@ object SessionFiles {
         // [mali-g2] Vortek's guest ICD (mali-g2/vortek), used with VortekServerComponent on Mali.
         val vortek = (listOf("libvulkan_vortek.so", "vortek_icd.aarch64.json").map { "usr/local/lib/droiddeck-vortek/$it" } +
             listOf("LGPL-2.1", "NOTICE").map { "usr/local/share/licenses/droiddeck-vortek/$it" }).map { it to it }
+        // [mali-g2] MaliBridge's guest ICD, for BL_VK_BRIDGE=malibridge (MaliBridgeComponent).
+        val maliBridge = listOf("usr/local/lib/vkbridge/libvulkan_droidbridge.so", "usr/local/share/vkbridge/droidbridge_icd.json",
+            "usr/local/share/licenses/malibridge/NOTICE").map { it to it }
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads + vortek).filter { (asset, _) ->
+        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads + vortek + maliBridge).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }
