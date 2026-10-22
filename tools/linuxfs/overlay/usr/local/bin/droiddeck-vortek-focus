@@ -9,7 +9,9 @@ menu is open the Steam window is raised; when it closes, the app that was on top
 Steam's Resume and its launch path ask for the game window through _NET_ACTIVE_WINDOW, which it
 only sends when a window manager publishes _NET_SUPPORTING_WM_CHECK and _NET_CLIENT_LIST. This helper
 publishes those (it does not take SubstructureRedirect, so windows still map and configure
-themselves) and raises the window asked for.
+themselves) and raises the window asked for. Having seen a window manager, the client asks it for
+fullscreen (_NET_WM_STATE) and waits: without an answer its window stayed 1280x800 and drew
+nothing. So fullscreen requests are honoured too, with the root window's size.
 The focus properties gamescope publishes (GAMESCOPE_FOCUSABLE_APPS and _WINDOWS, GAMESCOPE_FOCUSED_APP,
 _APP_GFX and _WINDOW) follow the window on top, so the client and the session know a game is in front.
 """
@@ -53,6 +55,7 @@ class X:
         x.XCreateWindow.argtypes = [D, W, c.c_int, c.c_int, c.c_uint, c.c_uint, c.c_uint, c.c_int, c.c_uint,
                                     c.c_void_p, c.c_ulong, c.c_void_p]
         x.XCreateWindow.restype = W
+        x.XMoveResizeWindow.argtypes = [D, W, c.c_int, c.c_int, c.c_uint, c.c_uint]
         self.handler = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p)(lambda d, e: 0)
         x.XSetErrorHandler(c.cast(self.handler, c.c_void_p))
         self.dpy = x.XOpenDisplay(None)
@@ -138,6 +141,27 @@ def main():
                                                              '_NET_CLIENT_LIST_STACKING')], kind=XA_ATOM)
     x.x.XSelectInput(x.dpy, x.root, SUBSTRUCTURE_NOTIFY)
     active_atom = x.atom('_NET_ACTIVE_WINDOW')
+    state_atom = x.atom('_NET_WM_STATE')
+    fullscreen_atom = x.atom('_NET_WM_STATE_FULLSCREEN')
+    root_attrs = attrs(x.root)
+    saved = {}  # window -> (x, y, width, height) before fullscreen
+
+    def set_fullscreen(w, on):
+        a = attrs(w)
+        if not a:
+            return
+        states = [s for s in x.cardinals(w, '_NET_WM_STATE') if s != fullscreen_atom]
+        if on:
+            saved.setdefault(w, (a.x, a.y, a.width, a.height))
+            geometry = (0, 0, root_attrs.width, root_attrs.height)
+            states.append(fullscreen_atom)
+        else:
+            geometry = saved.pop(w, None)
+        x.set_cardinals('_NET_WM_STATE', states, w, XA_ATOM)
+        if geometry and geometry != (a.x, a.y, a.width, a.height):
+            x.x.XMoveResizeWindow(x.dpy, w, *geometry)
+            print('droiddeck-vortek-focus: window 0x%x %s, %dx%d' % (w, 'fullscreen' if on else 'restored',
+                                                                     geometry[2], geometry[3]), flush=True)
     event = (c.c_ulong * 24)()
     fd = x.x.XConnectionNumber(x.dpy)
 
@@ -151,7 +175,15 @@ def main():
         # _NET_ACTIVE_WINDOW requests, from Steam (Resume, launches) or from games.
         while x.x.XPending(x.dpy):
             x.x.XNextEvent(x.dpy, event)
-            if c.cast(event, c.POINTER(c.c_int))[0] == CLIENT_MESSAGE and event[5] == active_atom:
+            kind = c.cast(event, c.POINTER(c.c_int))[0]
+            if kind == CLIENT_MESSAGE and event[5] == state_atom and fullscreen_atom in (event[8], event[9]):
+                # data: action (0 remove, 1 add, 2 toggle), first and second property.
+                w = event[4]
+                action = event[7]
+                on = action == 1 or (action == 2 and fullscreen_atom not in x.cardinals(w, '_NET_WM_STATE'))
+                set_fullscreen(w, on)
+                continue
+            if kind == CLIENT_MESSAGE and event[5] == active_atom:
                 w = event[4]
                 a = attrs(w)
                 # Steam asking for its own window while a menu is open is the menu logic's business.
@@ -169,6 +201,11 @@ def main():
             a = attrs(w)
             if not a or a.map_state != 2 or a.override_redirect or (a.width <= 1 and a.height <= 1):
                 continue
+            if w not in tags and w not in watched and w not in saved:
+                # First sight of this window: a client may set the state itself before mapping.
+                if fullscreen_atom in x.cardinals(w, '_NET_WM_STATE') and \
+                        (a.x, a.y, a.width, a.height) != (0, 0, root_attrs.width, root_attrs.height):
+                    set_fullscreen(w, True)
             if w not in tags:
                 app = x.cardinals(w, 'STEAM_GAME')
                 pid = x.cardinals(w, '_NET_WM_PID')
@@ -190,6 +227,8 @@ def main():
             del tags[w]
         for w in set(watched) - {e[0] for e in stack}:
             del watched[w]
+        for w in set(saved) - {e[0] for e in stack}:
+            del saved[w]
         steam = next((w for w, app, _ in stack if app == STEAM_APP), 0)
         steam_index = next((i for i, (w, _, _) in enumerate(stack) if w == steam), -1)
 
