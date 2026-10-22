@@ -120,20 +120,16 @@ object GameThreadHints {
         }
     }
 
-    /** android.os.WorkDuration (API 35) through reflection: its public no-argument constructor and setters. */
-    private class WorkDurationApi(val cls: Class<*>, val report: java.lang.reflect.Method, val setters: List<java.lang.reflect.Method>)
-
-    private val workDuration: WorkDurationApi? by lazy {
+    private val workDuration: java.lang.reflect.Constructor<*>? by lazy {
         if (Build.VERSION.SDK_INT < 35) null else runCatching {
-            val cls = Class.forName("android.os.WorkDuration")
-            val long = Long::class.javaPrimitiveType
-            WorkDurationApi(
-                cls,
-                PerformanceHintManager.Session::class.java.getMethod("reportActualWorkDuration", cls),
-                listOf("setWorkPeriodStartTimestampNanos", "setActualTotalDurationNanos", "setActualCpuDurationNanos",
-                    "setActualGpuDurationNanos").map { cls.getMethod(it, long) },
-            )
+            Class.forName("android.os.WorkDuration").getConstructor(
+                Long::class.javaPrimitiveType, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType)
         }.getOrNull()
+    }
+    private val reportWork: java.lang.reflect.Method? by lazy {
+        workDuration?.let { c -> runCatching {
+            PerformanceHintManager.Session::class.java.getMethod("reportActualWorkDuration", c.declaringClass)
+        }.getOrNull() }
     }
 
     /**
@@ -142,16 +138,14 @@ object GameThreadHints {
      * of 1248), and frames come faster when it clocks up. The reports carry no real timing.
      */
     private fun report(session: PerformanceHintManager.Session) {
-        val behind = TARGET_NS * 3 / 2
-        workDuration?.let { api ->
-            val sent = runCatching {
-                val work = api.cls.getConstructor().newInstance()
-                listOf(System.nanoTime() - behind, behind, behind, behind).forEachIndexed { i, v -> api.setters[i].invoke(work, v) }
-                api.report.invoke(session, work)
-            }.isSuccess
-            if (sent) return
+        val c = workDuration
+        val m = reportWork
+        if (c != null && m != null) {
+            val now = System.nanoTime()
+            val behind = TARGET_NS * 3 / 2
+            if (runCatching { m.invoke(session, c.newInstance(now - behind, behind, behind, behind)) }.isSuccess) return
         }
-        session.reportActualWorkDuration(behind)
+        session.reportActualWorkDuration(TARGET_NS * 3 / 2)
     }
 
     /** A new session over [tids] in place of [session]; null for none. The set changes seldom, so no setThreads. */
