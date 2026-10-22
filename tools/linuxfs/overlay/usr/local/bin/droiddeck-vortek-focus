@@ -138,13 +138,15 @@ def main():
         return a if x.x.XGetWindowAttributes(x.dpy, w, c.byref(a)) else None
 
     def menu_open(steam):
-        """A mapped child of the Steam window other than its full-size content."""
+        """A mapped child of the Steam window that is one of its side panels: the Steam menu and the
+        Quick Access panel run the window's full height and are narrower than it. Notification
+        toasts are children too, but short; raising the whole client for one hid the game."""
         top = attrs(steam)
         if not top:
             return False
         for child in x.children(steam):
             a = attrs(child)
-            if a and a.map_state == 2 and (a.width, a.height) != (top.width, top.height):
+            if a and a.map_state == 2 and a.width < top.width and a.height >= top.height * 9 // 10:
                 return True
         return False
 
