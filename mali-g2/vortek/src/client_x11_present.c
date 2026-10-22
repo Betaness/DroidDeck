@@ -93,9 +93,14 @@ typedef struct X11Swapchain {
     double statStart;
 
     int zeroCopy;              /* 0: try, 1: in use, -1: unavailable for this swapchain */
-    xcb_window_t root, toplevel;
+    xcb_window_t root;
     uint32_t rootW, rootH;
     bool occluded;
+    /* the window's ancestors up to the root and their origins in root coordinates */
+    int chainLength;
+    xcb_window_t chain[16];
+    int16_t chainX[16], chainY[16];
+    uint32_t chainAge;
 } X11Swapchain;
 
 static struct {
@@ -550,68 +555,110 @@ static bool rectsOverlap(int ax, int ay, int aw, int ah, int bx, int by, int bw,
 
 /* True when a mapped top-level window above ours overlaps it: then the X11 path must draw the
  * frame so that window stays visible. Checked every few frames; a query_tree is a round trip. */
-static void findToplevel(X11Swapchain* sc) {
+/* chain[0] is the window, chain[i + 1] the parent of chain[i]; the last entry is a child of the root. */
+static bool findAncestors(X11Swapchain* sc) {
     xcb_connection_t* conn = sc->surface->conn;
     xcb_window_t win = sc->surface->window;
-    for (int depth = 0; depth < 16; depth++) {
+    sc->chainLength = 0;
+    while (sc->chainLength < 16) {
         xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, win), NULL);
-        if (!tree) break;
-        xcb_window_t parent = tree->parent, root = tree->root;
+        if (!tree) return false;
+        xcb_window_t parent = tree->parent;
+        sc->root = tree->root;
         free(tree);
-        sc->root = root;
-        if (parent == root || parent == XCB_WINDOW_NONE) break;
+        sc->chain[sc->chainLength++] = win;
+        if (parent == sc->root || parent == XCB_WINDOW_NONE) break;
         win = parent;
     }
-    sc->toplevel = win;
+    for (int i = 0; i < sc->chainLength; i++) {
+        xcb_window_t parent = i + 1 < sc->chainLength ? sc->chain[i + 1] : sc->root;
+        xcb_translate_coordinates_reply_t* pos =
+            xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, parent, sc->root, 0, 0), NULL);
+        if (!pos) return false;
+        sc->chainX[i] = pos->dst_x;   /* origin of chain[i]'s parent */
+        sc->chainY[i] = pos->dst_y;
+        free(pos);
+    }
+    sc->chainAge = 0;
+    return true;
 }
 
-static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* lost) {
+/* At every level from the window up to its top-level window, a mapped sibling stacked above it
+ * that overlaps the window hides part of it (Steam's menus are such siblings inside its own
+ * top-level window), and so does a mapped child of the window. Two round trips per frame. */
+static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* stale) {
     xcb_connection_t* conn = sc->surface->conn;
-    *lost = false;
-    xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, sc->root), NULL);
-    if (!tree) return true;
-    xcb_window_t* children = xcb_query_tree_children(tree);
-    int count = xcb_query_tree_children_length(tree), mine = -1;
-    for (int i = 0; i < count; i++) if (children[i] == sc->toplevel) mine = i;
-    if (mine < 0) {
-        free(tree);
-        *lost = true;
-        return true;
+    int levels = sc->chainLength;
+    xcb_query_tree_cookie_t trees[17];
+    for (int i = 0; i < levels; i++) trees[i] = xcb_query_tree(conn, i + 1 < levels ? sc->chain[i + 1] : sc->root);
+    trees[levels] = xcb_query_tree(conn, sc->chain[0]);
+    xcb_query_tree_reply_t* replies[17];
+    bool ok = true;
+    for (int i = 0; i <= levels; i++) {
+        replies[i] = xcb_query_tree_reply(conn, trees[i], NULL);
+        if (!replies[i]) ok = false;
     }
-    bool occluded = false;
-    int above = count - mine - 1;
-    if (above > 0) {
-        xcb_get_window_attributes_cookie_t attrs[above];
-        xcb_get_geometry_cookie_t geos[above];
-        for (int k = 0; k < above; k++) {
-            attrs[k] = xcb_get_window_attributes(conn, children[mine + 1 + k]);
-            geos[k] = xcb_get_geometry(conn, children[mine + 1 + k]);
+    *stale = false;
+    int total = 0;
+    xcb_window_t candidates[256];
+    int16_t originX[256], originY[256];
+    for (int i = 0; ok && i < levels; i++) {
+        xcb_window_t* children = xcb_query_tree_children(replies[i]);
+        int count = xcb_query_tree_children_length(replies[i]), mine = -1;
+        for (int k = 0; k < count; k++) if (children[k] == sc->chain[i]) mine = k;
+        if (mine < 0) { *stale = true; break; }
+        for (int k = mine + 1; k < count && total < 256; k++) {
+            candidates[total] = children[k];
+            originX[total] = sc->chainX[i];
+            originY[total] = sc->chainY[i];
+            total++;
         }
-        for (int k = 0; k < above; k++) {
+    }
+    if (ok && !*stale) {
+        xcb_window_t* children = xcb_query_tree_children(replies[levels]);
+        int count = xcb_query_tree_children_length(replies[levels]);
+        for (int k = 0; k < count && total < 256; k++) {
+            candidates[total] = children[k];
+            originX[total] = (int16_t)x;
+            originY[total] = (int16_t)y;
+            total++;
+        }
+    }
+    for (int i = 0; i <= levels; i++) free(replies[i]);
+    if (!ok || *stale) return true;
+
+    bool occluded = false;
+    if (total > 0) {
+        xcb_get_window_attributes_cookie_t attrs[total];
+        xcb_get_geometry_cookie_t geos[total];
+        for (int k = 0; k < total; k++) {
+            attrs[k] = xcb_get_window_attributes(conn, candidates[k]);
+            geos[k] = xcb_get_geometry(conn, candidates[k]);
+        }
+        for (int k = 0; k < total; k++) {
             xcb_get_window_attributes_reply_t* a = xcb_get_window_attributes_reply(conn, attrs[k], NULL);
             xcb_get_geometry_reply_t* g = xcb_get_geometry_reply(conn, geos[k], NULL);
             if (a && g && a->map_state == XCB_MAP_STATE_VIEWABLE &&
-                rectsOverlap(x, y, w, h, g->x, g->y, g->width + 2 * g->border_width, g->height + 2 * g->border_width))
+                rectsOverlap(x, y, w, h, originX[k] + g->x, originY[k] + g->y,
+                             g->width + 2 * g->border_width, g->height + 2 * g->border_width))
                 occluded = true;
             free(a);
             free(g);
         }
     }
-    free(tree);
     return occluded;
 }
 
-/* True when a mapped top-level window above ours overlaps it: then the X11 path must draw the
- * frame so that window stays visible. Checked on every zero-copy present (a query_tree, plus one
- * attribute and geometry request per window above ours). */
 static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
-    if (!sc->toplevel) findToplevel(sc);
-    bool lost;
-    bool occluded = checkOccludedOnce(sc, x, y, w, h, &lost);
-    if (lost) {
-        /* Reparented since: find the top-level window again. */
-        findToplevel(sc);
-        occluded = checkOccludedOnce(sc, x, y, w, h, &lost);
+    /* Parents rarely move or change; refresh their list now and then and when it went stale. */
+    if (sc->chainLength == 0 || ++sc->chainAge > 120) {
+        if (!findAncestors(sc)) return true;
+    }
+    bool stale;
+    bool occluded = checkOccludedOnce(sc, x, y, w, h, &stale);
+    if (stale) {
+        if (!findAncestors(sc)) return true;
+        occluded = checkOccludedOnce(sc, x, y, w, h, &stale);
     }
     return occluded;
 }
