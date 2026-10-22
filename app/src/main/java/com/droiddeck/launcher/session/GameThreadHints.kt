@@ -126,7 +126,10 @@ object GameThreadHints {
         if (tids.isEmpty()) return null
         return try {
             hm.createHintSession(tids.toIntArray(), TARGET_NS)?.also {
-                if (Build.VERSION.SDK_INT >= 35) it.setPreferPowerEfficiency(false)
+                // API 35; the app compiles against an older SDK.
+                if (Build.VERSION.SDK_INT >= 35) runCatching {
+                    it.javaClass.getMethod("setPreferPowerEfficiency", Boolean::class.javaPrimitiveType).invoke(it, false)
+                }
             }
         } catch (t: RuntimeException) {
             Log.w(TAG, "createHintSession", t)
