@@ -38,6 +38,7 @@ import kotlin.math.abs
  * seconds and is then let go.
  */
 object GameThreadHints {
+    private val HINTED_SOCS = setOf("CQ8725S", "O3")
     private const val TAG = "GameThreadHints"
     private const val TARGET_NS = 10_000_000L
     private const val REPORT_MS = 50L
@@ -59,8 +60,8 @@ object GameThreadHints {
     @Synchronized
     fun start(context: Context): String {
         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
-        // Measured on the Odin 3 (CQ8725S) only; another HAL may boost differently, or not at all.
-        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "CQ8725S") return "game thread hints: Odin 3 only"
+        // Measured on the Odin 3 (CQ8725S) and Xiaomi's Xring O3; another HAL may boost differently, or not at all.
+        if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL !in HINTED_SOCS) return "game thread hints: not on this SoC"
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
         val pm = context.getSystemService(PowerManager::class.java)
@@ -124,7 +125,9 @@ object GameThreadHints {
         session?.close()
         if (tids.isEmpty()) return null
         return try {
-            hm.createHintSession(tids.toIntArray(), TARGET_NS)
+            hm.createHintSession(tids.toIntArray(), TARGET_NS)?.also {
+                if (Build.VERSION.SDK_INT >= 35) it.setPreferPowerEfficiency(false)
+            }
         } catch (t: RuntimeException) {
             Log.w(TAG, "createHintSession", t)
             null
