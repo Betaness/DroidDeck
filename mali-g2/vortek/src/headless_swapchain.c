@@ -50,6 +50,7 @@ typedef struct HeadlessSwapchain {
     int* releaseFd;
     bool stealLogged;
     void* ownerContext;   /* the VkContext that presented it, to clean up when that client is gone */
+    bool announced;       /* CHAIN_CREATE sent */
 } HeadlessSwapchain;
 
 enum { OWNER_FREE = 0, OWNER_APP = 1, OWNER_COMPOSITOR = 2 };
@@ -111,15 +112,39 @@ static void registerZeroCopy(HeadlessSwapchain* headless) {
     pthread_mutex_lock(&zcLock);
     int slot = -1;
     for (int i = 0; i < MAX_ZERO_COPY_CHAINS && slot < 0; i++) if (!zcChains[i]) slot = i;
+    if (slot < 0) {
+        /* Full of swapchains that never presented zero-copy, some from clients that died without
+         * destroying them: the oldest such entry gives up its place (and zero-copy). */
+        uint32_t oldest = UINT32_MAX;
+        for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) {
+            if (!zcChains[i]->announced && zcChains[i]->chainId < oldest) {
+                oldest = zcChains[i]->chainId;
+                slot = i;
+            }
+        }
+        if (slot >= 0) {
+            zcChains[slot]->zeroCopy = false;
+            zcChains[slot] = NULL;
+        }
+    }
     if (slot >= 0) {
         headless->chainId = zcNextChain++;
         zcChains[slot] = headless;
     }
     pthread_mutex_unlock(&zcLock);
     if (slot < 0) return;
+    /* Registered with the compositor on its first zero-copy present: the Steam client keeps many
+     * small windows (menus, toasts) with swapchains that are rarely or never shown. */
+    headless->zeroCopy = true;
+}
 
-    headless->zeroCopy = ZeroCopy_createChain(headless->chainId, swapchain->imageExtent.width, swapchain->imageExtent.height,
-                                              headless->hardwareBuffers, swapchain->imageCount);
+static bool announceChain(HeadlessSwapchain* headless) {
+    if (headless->announced) return true;
+    XWindowSwapchain* swapchain = &headless->base;
+    headless->announced = ZeroCopy_createChain(headless->chainId, swapchain->imageExtent.width, swapchain->imageExtent.height,
+                                               headless->hardwareBuffers, swapchain->imageCount);
+    if (!headless->announced) headless->zeroCopy = false;
+    return headless->announced;
 }
 
 static void unregisterZeroCopy(HeadlessSwapchain* headless) {
@@ -127,7 +152,7 @@ static void unregisterZeroCopy(HeadlessSwapchain* headless) {
     pthread_mutex_lock(&zcLock);
     for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) if (zcChains[i] == headless) zcChains[i] = NULL;
     pthread_mutex_unlock(&zcLock);
-    if (headless->chainId) ZeroCopy_destroyChain(headless->chainId);
+    if (headless->announced) ZeroCopy_destroyChain(headless->chainId);
     for (int i = 0; i < headless->base.imageCount; i++) if (headless->releaseFd[i] >= 0) close(headless->releaseFd[i]);
     MEMFREE(headless->owner);
     MEMFREE(headless->releaseFd);
@@ -420,6 +445,7 @@ VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t 
         !vulkanWrapper.vkGetFenceFd)
         return VK_ERROR_FEATURE_NOT_PRESENT;
     if (!ZeroCopy_accepting()) return VK_NOT_READY;
+    if (!announceChain(headless)) return VK_ERROR_FEATURE_NOT_PRESENT;
     headless->ownerContext = context;
 
     VkExportFenceCreateInfo exportInfo = {0};

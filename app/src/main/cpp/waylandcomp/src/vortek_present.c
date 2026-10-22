@@ -13,7 +13,7 @@
 #include "sc_layer.h"
 #include "droiddeck_ext.h"
 
-#define VP_MAX_CHAINS 8
+#define VP_MAX_CHAINS 32
 #define VP_MAX_IMAGES 8
 
 struct vp_chain {
