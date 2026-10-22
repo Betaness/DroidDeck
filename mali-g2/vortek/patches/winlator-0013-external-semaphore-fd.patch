@@ -1,0 +1,55 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 0959ab3..f34c46e 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -173,6 +173,26 @@ void vt_handle_vkCreateDevice(VkContext* context) {
+                      globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions));
+ 
+ #ifdef VORTEK_STANDALONE
++    /* [mali-g2] The zero-copy swapchain imports the compositor's release fences into acquire
++     * semaphores (headless_swapchain.c), where the driver has sync fd semaphores. */
++    {
++        uint32_t count = 0;
++        vulkanWrapper.vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, NULL);
++        VkExtensionProperties* available = vt_alloc(&context->memoryPool, (count ? count : 1) * sizeof(VkExtensionProperties));
++        if (vulkanWrapper.vkEnumerateDeviceExtensionProperties(physicalDevice, NULL, &count, available) < 0) count = 0;
++        const char* semaphoreExtensions[2];
++        uint32_t semaphoreExtensionCount = 0;
++        for (uint32_t i = 0; i < count; i++) {
++            if (strcmp(available[i].extensionName, "VK_KHR_external_semaphore") == 0 ||
++                strcmp(available[i].extensionName, "VK_KHR_external_semaphore_fd") == 0) {
++                if (semaphoreExtensionCount < 2) semaphoreExtensions[semaphoreExtensionCount++] = available[i].extensionName;
++            }
++        }
++        if (semaphoreExtensionCount)
++            injectExtensions(context, (char***)&createInfo.ppEnabledExtensionNames, &createInfo.enabledExtensionCount,
++                             semaphoreExtensions, semaphoreExtensionCount, NULL, 0);
++    }
++
+     /* [mali-g2] The serializer has no maintenance5/6 feature structs, so the client's
+      * request for them is lost on the wire: turn them on whenever the extension is. */
+     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+@@ -623,6 +643,23 @@ void vt_handle_vkWaitForFences(VkContext* context) {
+ 
+             result = vulkanWrapper.vkGetFenceFd(device, &getFdInfo, &fds[i]);
+ #ifdef VORTEK_STANDALONE
++            /* [mali-g2] Exporting a sync fd resets the fence (a temporarily imported payload falls
++             * back to the permanent one), so after the client's wait vkGetFenceStatus would report
++             * VK_NOT_READY and a second wait would never end. Unsignalled fences reach this point
++             * mostly from acquires (headless_swapchain.c imports the compositor's release fence):
++             * import a copy of the exported fd back as a temporary payload; the fence signals with
++             * it, and vkResetFences restores the permanent payload as usual. */
++            if (result == VK_SUCCESS && fds[i] >= 0) {
++                PFN_vkImportFenceFdKHR importFenceFd = (PFN_vkImportFenceFdKHR)vulkanWrapper.vkGetDeviceProcAddr(device, "vkImportFenceFdKHR");
++                int copy = importFenceFd ? dup(fds[i]) : -1;
++                VkImportFenceFdInfoKHR importInfo = {VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR, NULL, fences[i], VK_FENCE_IMPORT_TEMPORARY_BIT, VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT, copy};
++                VkResult imported = copy >= 0 ? importFenceFd(device, &importInfo) : VK_ERROR_INITIALIZATION_FAILED;
++                if (imported != VK_SUCCESS) {
++                    static int logged;
++                    if (copy >= 0) close(copy);
++                    if (!logged) { logged = 1; println("vortek: vkWaitForFences: could not restore a fence after exporting its sync fd (%d); it reads as unsignalled until reset", imported); }
++                }
++            }
+             /* no pending signal operation yet: wait here instead */
+             if (result != VK_SUCCESS || fds[i] < 0) {
+                 VkResult status = vulkanWrapper.vkWaitForFences(device, 1, &fences[i], VK_TRUE, timeout);

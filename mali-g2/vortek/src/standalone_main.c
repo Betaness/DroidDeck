@@ -335,7 +335,8 @@ static void usage(const char* argv0) {
             "  VORTEK_RESOURCE_MEMORY_TYPE, VORTEK_EXPOSED_DEVICE_EXTENSIONS (a|b|c)\n"
             "  VORTEK_NATIVE_IMAGES=1 (dedicated optimal-image memory without external memory)\n"
             "  VORTEK_HEADLESS_SIZE (WxH), VORTEK_DUMP_PPM (path of last presented frame)\n"
-            "  VORTEK_MIN_IMAGES (swapchain minImageCount, 1..6)\n",
+            "  VORTEK_MIN_IMAGES (swapchain minImageCount, 1..6)\n"
+            "  VORTEK_RELEASE_WAIT=import|batch|cpu (zero-copy acquire: how the release fence is waited for)\n",
             argv0);
 }
 

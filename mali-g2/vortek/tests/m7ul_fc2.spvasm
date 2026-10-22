@@ -1,0 +1,51 @@
+; m7ul_test.c: a compute shader that uses VK_KHR_shader_float_controls2 (spirv-as --target-env vulkan1.3).
+; SPV_KHR_float_controls2: FPFastMathDefault None for 32-bit floats (strict IEEE).
+; out[i] = in[i] - in[i]; out[i + 4] = in[i] * 0.0  (one invocation per i, 4 invocations)
+               OpCapability Shader
+               OpCapability FloatControls2
+               OpExtension "SPV_KHR_float_controls2"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %bufIn %bufOut
+               OpExecutionModeId %main FPFastMathDefault %float %uint_0
+               OpExecutionMode %main LocalSize 4 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpDecorate %Buf Block
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %bufIn DescriptorSet 0
+               OpDecorate %bufIn Binding 0
+               OpDecorate %bufIn NonWritable
+               OpDecorate %bufOut DescriptorSet 0
+               OpDecorate %bufOut Binding 1
+       %void = OpTypeVoid
+     %voidfn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+     %uint_0 = OpConstant %uint 0
+     %uint_4 = OpConstant %uint 4
+    %float_0 = OpConstant %float 0
+     %v3uint = OpTypeVector %uint 3
+  %p_in_v3u = OpTypePointer Input %v3uint
+   %p_in_u  = OpTypePointer Input %uint
+        %gid = OpVariable %p_in_v3u Input
+        %arr = OpTypeRuntimeArray %float
+        %Buf = OpTypeStruct %arr
+      %p_Buf = OpTypePointer StorageBuffer %Buf
+    %p_float = OpTypePointer StorageBuffer %float
+      %bufIn = OpVariable %p_Buf StorageBuffer
+     %bufOut = OpVariable %p_Buf StorageBuffer
+       %main = OpFunction %void None %voidfn
+      %entry = OpLabel
+       %pgx  = OpAccessChain %p_in_u %gid %uint_0
+          %i = OpLoad %uint %pgx
+        %pin = OpAccessChain %p_float %bufIn %uint_0 %i
+          %x = OpLoad %float %pin
+        %sub = OpFSub %float %x %x
+        %mul = OpFMul %float %x %float_0
+       %pout = OpAccessChain %p_float %bufOut %uint_0 %i
+               OpStore %pout %sub
+         %i4 = OpIAdd %uint %i %uint_4
+      %pout4 = OpAccessChain %p_float %bufOut %uint_0 %i4
+               OpStore %pout4 %mul
+               OpReturn
+               OpFunctionEnd

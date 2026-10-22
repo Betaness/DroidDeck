@@ -13,6 +13,8 @@
  * VK_EXT_graphics_pipeline_library goes over the wire (patches/vortek-0008, winlator-0010:
  * features, properties, library create infos, library handles); this file only drops the
  * state that the spec ignores for the library subsets a create call does not provide.
+ * VK_KHR_maintenance7, VK_KHR_unified_image_layouts and VK_KHR_shader_float_controls2 (no
+ * commands) also go over the wire (vortek-0010, winlator-0014): nothing to emulate here.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.

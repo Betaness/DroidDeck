@@ -17,7 +17,10 @@
  *                          (default 1); with $VORTEK_PRESENT_SOCKET they are shown zero-copy
  *                          by DroidDeck's compositor (zero_copy.c), VORTEK_ZERO_COPY=0 disables it
  *   VORTEK_MIN_IMAGES      surface minImageCount reported to clients, clamped to 1..6
- *                          (default 2 with VORTEK_AHB_SWAPCHAIN, else 1)
+ *                          (default 3 with VORTEK_AHB_SWAPCHAIN, else 1)
+ *   VORTEK_RELEASE_WAIT    how acquire waits for the compositor's release fence: "import" (default:
+ *                          into the acquire semaphore/fence), "batch" (a GPU batch waiting on it),
+ *                          "cpu" (poll() before returning, the old behaviour); each falls back to the next
  *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * Based on Winlator's vortekrenderer (C) brunodev85, LGPL-2.1.
@@ -27,10 +30,20 @@
 #include <android/hardware_buffer.h>
 #include <poll.h>
 #include <pthread.h>
+#include <time.h>
 #include "xwindow_swapchain.h"
 #include "vulkan_helper.h"
 #include "zero_copy.h"
 #include "droiddeck_requests.h"
+
+/* An empty batch that waits for a release fence on the GPU and signals the app's semaphore. */
+typedef struct AcquireWait {
+    VkSemaphore semaphore;
+    VkFence fence;
+    bool pending;
+} AcquireWait;
+
+#define ACQUIRE_WAITS 8
 
 typedef struct HeadlessSwapchain {
     XWindowSwapchain base; /* must be first: request_handler.c only sees this */
@@ -53,6 +66,16 @@ typedef struct HeadlessSwapchain {
     bool stealLogged;
     void* ownerContext;   /* the VkContext that presented it, to clean up when that client is gone */
     bool announced;       /* CHAIN_CREATE sent */
+    /* release fences go to the GPU: imported into the acquire semaphore/fence, or waited by a batch */
+    PFN_vkImportSemaphoreFdKHR importSemaphoreFd;
+    PFN_vkImportFenceFdKHR importFenceFd;
+    bool semaphoreImportRefused;
+    bool fenceImportRefused;
+    AcquireWait acquireWaits[ACQUIRE_WAITS];
+    uint32_t nextAcquireWait;
+    double lastPresentTime;
+    double frameInterval;
+    bool slowAcquireLogged;
 } HeadlessSwapchain;
 
 enum { OWNER_FREE = 0, OWNER_APP = 1, OWNER_COMPOSITOR = 2 };
@@ -176,11 +199,12 @@ void getWindowExtent(JMethods* jmethods, int windowId, VkExtent2D* extent) {
 }
 
 int getSurfaceMinImageCount() {
-    /* Zero-copy keeps one image on screen; with fewer than two the app could never acquire.
-     * VORTEK_MIN_IMAGES=N overrides it (clamped to 1..6), read once. */
+    /* Zero-copy keeps one image on screen; with fewer than two the app could never acquire, with two
+     * it renders into the image the compositor just released. VORTEK_MIN_IMAGES=N overrides it
+     * (clamped to 1..6), read once. */
     static int minImages = 0;
     if (!minImages) {
-        int value = envInt("VORTEK_AHB_SWAPCHAIN", 1) ? 2 : 1;
+        int value = envInt("VORTEK_AHB_SWAPCHAIN", 1) ? 3 : 1;
         const char* override = getenv("VORTEK_MIN_IMAGES");
         if (override && *override) {
             value = atoi(override);
@@ -363,6 +387,10 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     vulkanWrapper.vkCreateCommandPool(device, &poolInfo, NULL, &headless->commandPool);
 
     registerZeroCopy(headless);
+    if (headless->zeroCopy) {
+        headless->importSemaphoreFd = (PFN_vkImportSemaphoreFdKHR)vulkanWrapper.vkGetDeviceProcAddr(device, "vkImportSemaphoreFdKHR");
+        headless->importFenceFd = (PFN_vkImportFenceFdKHR)vulkanWrapper.vkGetDeviceProcAddr(device, "vkImportFenceFdKHR");
+    }
     println("vortek-server: headless swapchain %dx%d format=%d images=%d window=%d%s",
             swapchain->imageExtent.width, swapchain->imageExtent.height, swapchain->imageFormat, swapchain->imageCount, windowId,
             headless->zeroCopy ? " (zero-copy)" : headless->hardwareBuffers[0] ? " (AHardwareBuffer)" : "");
@@ -375,6 +403,10 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
 
     if (swapchain->queue) vulkanWrapper.vkQueueWaitIdle(swapchain->queue);
     unregisterZeroCopy(headless);
+    for (int i = 0; i < ACQUIRE_WAITS; i++) {
+        if (headless->acquireWaits[i].semaphore) vulkanWrapper.vkDestroySemaphore(device, headless->acquireWaits[i].semaphore, NULL);
+        if (headless->acquireWaits[i].fence) vulkanWrapper.vkDestroyFence(device, headless->acquireWaits[i].fence, NULL);
+    }
 
     for (int i = 0; i < swapchain->imageCount; i++) {
         if (swapchain->images[i].image) vulkanWrapper.vkDestroyImage(device, swapchain->images[i].image, NULL);
@@ -392,44 +424,245 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     free(headless);
 }
 
-/* Zero-copy: an image the compositor still shows cannot be handed out. Waits for a free one and
- * for its release fence; never fails, since a negative or timeout result would read as an index. */
-static uint32_t acquireZeroCopy(HeadlessSwapchain* headless) {
+static double nowSeconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Zero-copy: an image the compositor still shows cannot be handed out (like BufferQueue's dequeue).
+ * Waits for a free one and hands its release fence to the caller (-1: nothing to wait for); never
+ * fails, since a negative or timeout result would read as an index. */
+static uint32_t acquireZeroCopy(HeadlessSwapchain* headless, int* releaseFd) {
     XWindowSwapchain* swapchain = &headless->base;
-    pthread_mutex_lock(&zcLock);
-    int found = -1;
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 2;
+    double waitStart = 0;
+    int found = -1;
+    pthread_mutex_lock(&zcLock);
     while (found < 0) {
         for (int k = 0; k < swapchain->imageCount && found < 0; k++) {
             int i = (headless->nextImage + k) % swapchain->imageCount;
             if (headless->owner[i] == OWNER_FREE) found = i;
         }
         if (found >= 0 || !headless->zeroCopy) break;
+        if (!waitStart) waitStart = nowSeconds();
         if (pthread_cond_timedwait(&zcCond, &zcLock, &deadline) != 0) break;
     }
-    if (found < 0) {
-        found = headless->nextImage;
-        if (!headless->stealLogged) println("vortek-server: zero-copy swapchain %u: no image released in 2 s, reusing one", headless->chainId);
-        headless->stealLogged = true;
-    }
-    int fd = headless->releaseFd[found];
+    bool stolen = found < 0;
+    if (stolen) found = headless->nextImage;
+    *releaseFd = headless->releaseFd[found];
     headless->releaseFd[found] = -1;
     headless->owner[found] = OWNER_APP;
     pthread_mutex_unlock(&zcLock);
-    if (fd >= 0) {
-        struct pollfd p = {fd, POLLIN, 0};
-        poll(&p, 1, 2000);
-        close(fd);
+
+    if (stolen) {
+        if (!headless->stealLogged) println("vortek-server: zero-copy swapchain %u: no image released in 2 s, reusing one", headless->chainId);
+        headless->stealLogged = true;
+    }
+    else if (waitStart && !headless->slowAcquireLogged && headless->presentCount > (uint64_t)swapchain->imageCount * 2) {
+        double waited = nowSeconds() - waitStart;
+        double frame = headless->frameInterval > 0 ? headless->frameInterval : 1.0 / 60;
+        if (waited > frame) {
+            println("vortek-server: zero-copy swapchain %u (%d images): acquire waited %.1f ms for the compositor to release an image "
+                    "(frame %.1f ms), logged once", headless->chainId, swapchain->imageCount, waited * 1000, frame * 1000);
+            headless->slowAcquireLogged = true;
+        }
     }
     return found;
+}
+
+enum {
+    RELEASE_SEMAPHORE_IMPORT = 1,
+    RELEASE_FENCE_IMPORT = 2,
+    RELEASE_GPU_WAIT = 4,
+    RELEASE_CPU_WAIT = 8,
+    RELEASE_WAIT_IMPORT_FAILED = 16,
+    RELEASE_SEMAPHORE_IMPORT_FAILED = 32,
+    RELEASE_FENCE_IMPORT_FAILED = 64,
+};
+
+static void logReleasePath(int path, const char* message, VkResult result) {
+    static int logged;
+    if (__atomic_fetch_or(&logged, path, __ATOMIC_RELAXED) & path) return;
+    if (result != VK_SUCCESS) println("vortek-server: zero-copy acquire: %s (%d)", message, result);
+    else println("vortek-server: zero-copy acquire: %s", message);
+}
+
+/* Sync fd imports transfer the fd only on success and must be temporary. */
+static VkResult importSemaphore(HeadlessSwapchain* headless, VkSemaphore semaphore, int fd) {
+    int copy = dup(fd);
+    if (copy < 0) return VK_ERROR_TOO_MANY_OBJECTS;
+    VkImportSemaphoreFdInfoKHR info = {0};
+    info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+    info.semaphore = semaphore;
+    info.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    info.fd = copy;
+    VkResult result = headless->importSemaphoreFd(headless->device, &info);
+    if (result != VK_SUCCESS) close(copy);
+    return result;
+}
+
+static VkResult importFence(HeadlessSwapchain* headless, VkFence fence, int fd) {
+    int copy = dup(fd);
+    if (copy < 0) return VK_ERROR_TOO_MANY_OBJECTS;
+    VkImportFenceFdInfoKHR info = {0};
+    info.sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR;
+    info.fence = fence;
+    info.flags = VK_FENCE_IMPORT_TEMPORARY_BIT;
+    info.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+    info.fd = copy;
+    VkResult result = headless->importFenceFd(headless->device, &info);
+    if (result != VK_SUCCESS) close(copy);
+    return result;
+}
+
+/* A batch that waits for the release fence (imported into a semaphore of ours) and signals the
+ * app's semaphore; the app's fence follows in an empty submission, which signals once everything
+ * submitted before it has completed. Our semaphore can be imported into again once its batch ran. */
+static bool waitOnGpu(HeadlessSwapchain* headless, int fd, VkSemaphore signalSemaphore, VkFence fence, VkResult* result) {
+    if (!headless->importSemaphoreFd) return false;
+    VkDevice device = headless->device;
+    AcquireWait* wait = NULL;
+    for (int k = 0; k < ACQUIRE_WAITS && !wait; k++) {
+        AcquireWait* candidate = &headless->acquireWaits[(headless->nextAcquireWait + k) % ACQUIRE_WAITS];
+        if (!candidate->pending || vulkanWrapper.vkGetFenceStatus(device, candidate->fence) == VK_SUCCESS) wait = candidate;
+    }
+    if (!wait) {
+        wait = &headless->acquireWaits[headless->nextAcquireWait];
+        if (vulkanWrapper.vkWaitForFences(device, 1, &wait->fence, VK_TRUE, 2000000000ull) != VK_SUCCESS) return false;
+    }
+    headless->nextAcquireWait = (uint32_t)(wait - headless->acquireWaits + 1) % ACQUIRE_WAITS;
+
+    if (!wait->semaphore) {
+        VkSemaphoreCreateInfo semaphoreInfo = {0};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        VkFenceCreateInfo fenceInfo = {0};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vulkanWrapper.vkCreateSemaphore(device, &semaphoreInfo, NULL, &wait->semaphore) != VK_SUCCESS) wait->semaphore = VK_NULL_HANDLE;
+        if (vulkanWrapper.vkCreateFence(device, &fenceInfo, NULL, &wait->fence) != VK_SUCCESS) wait->fence = VK_NULL_HANDLE;
+        if (!wait->semaphore || !wait->fence) {
+            if (wait->semaphore) vulkanWrapper.vkDestroySemaphore(device, wait->semaphore, NULL);
+            if (wait->fence) vulkanWrapper.vkDestroyFence(device, wait->fence, NULL);
+            wait->semaphore = VK_NULL_HANDLE;
+            wait->fence = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    if (wait->pending) {
+        vulkanWrapper.vkResetFences(device, 1, &wait->fence);
+        wait->pending = false;
+    }
+
+    VkResult imported = importSemaphore(headless, wait->semaphore, fd);
+    if (imported != VK_SUCCESS) {
+        logReleasePath(RELEASE_WAIT_IMPORT_FAILED, "the driver refused a release fence for our wait semaphore", imported);
+        headless->importSemaphoreFd = NULL;
+        return false;
+    }
+
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &wait->semaphore;
+    submitInfo.pWaitDstStageMask = &stage;
+    if (signalSemaphore) {
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &signalSemaphore;
+    }
+    VkResult submitted = vulkanWrapper.vkQueueSubmit(headless->base.queue, 1, &submitInfo, wait->fence);
+    if (submitted != VK_SUCCESS) {
+        /* the imported payload is still in the semaphore */
+        vulkanWrapper.vkDestroySemaphore(device, wait->semaphore, NULL);
+        vulkanWrapper.vkDestroyFence(device, wait->fence, NULL);
+        wait->semaphore = VK_NULL_HANDLE;
+        wait->fence = VK_NULL_HANDLE;
+        if (submitted == VK_ERROR_DEVICE_LOST) *result = submitted;
+        return false;
+    }
+    wait->pending = true;
+    if (fence) {
+        submitted = vulkanWrapper.vkQueueSubmit(headless->base.queue, 0, NULL, fence);
+        if (submitted != VK_SUCCESS) *result = submitted;
+    }
+    return true;
+}
+
+enum { RELEASE_WAIT_IMPORT, RELEASE_WAIT_BATCH, RELEASE_WAIT_CPU };
+
+static int releaseWaitMode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* value = getenv("VORTEK_RELEASE_WAIT");
+        int parsed = RELEASE_WAIT_IMPORT;
+        if (value && strcmp(value, "batch") == 0) parsed = RELEASE_WAIT_BATCH;
+        else if (value && strcmp(value, "cpu") == 0) parsed = RELEASE_WAIT_CPU;
+        if (value && *value) println("vortek-server: VORTEK_RELEASE_WAIT=%s", value);
+        mode = parsed;
+    }
+    return mode;
+}
+
+/* The compositor's release fence of the acquired image goes to the GPU instead of being waited for
+ * here: this runs while the client holds its call lock, so a CPU wait stalls every Vulkan call of
+ * the app. Clears *signalSemaphore / *fence once they are taken care of. */
+static VkResult waitForRelease(HeadlessSwapchain* headless, int fd, VkSemaphore* signalSemaphore, VkFence* fence) {
+    struct pollfd p = {fd, POLLIN, 0};
+    if (poll(&p, 1, 0) == 1) return VK_SUCCESS;
+    int mode = releaseWaitMode();
+
+    if (mode == RELEASE_WAIT_IMPORT && *signalSemaphore && headless->importSemaphoreFd && !headless->semaphoreImportRefused) {
+        VkResult result = importSemaphore(headless, *signalSemaphore, fd);
+        if (result == VK_SUCCESS) {
+            *signalSemaphore = VK_NULL_HANDLE;
+            logReleasePath(RELEASE_SEMAPHORE_IMPORT, "release fences imported into the acquire semaphore", VK_SUCCESS);
+        }
+        else {
+            headless->semaphoreImportRefused = true;
+            logReleasePath(RELEASE_SEMAPHORE_IMPORT_FAILED, "the driver refused a release fence for the app's acquire semaphore", result);
+        }
+    }
+    if (mode == RELEASE_WAIT_IMPORT && *fence && headless->importFenceFd && !headless->fenceImportRefused) {
+        VkResult result = importFence(headless, *fence, fd);
+        if (result == VK_SUCCESS) {
+            *fence = VK_NULL_HANDLE;
+            logReleasePath(RELEASE_FENCE_IMPORT, "release fences imported into the acquire fence", VK_SUCCESS);
+        }
+        else {
+            headless->fenceImportRefused = true;
+            logReleasePath(RELEASE_FENCE_IMPORT_FAILED, "the driver refused a release fence for the app's acquire fence", result);
+        }
+    }
+    if (!*signalSemaphore && !*fence) return VK_SUCCESS;
+
+    VkResult result = VK_SUCCESS;
+    if (mode != RELEASE_WAIT_CPU && waitOnGpu(headless, fd, *signalSemaphore, *fence, &result)) {
+        *signalSemaphore = VK_NULL_HANDLE;
+        *fence = VK_NULL_HANDLE;
+        logReleasePath(RELEASE_GPU_WAIT, "release fences waited for by a GPU batch", VK_SUCCESS);
+        return result;
+    }
+    if (result == VK_ERROR_DEVICE_LOST) return result;
+
+    logReleasePath(RELEASE_CPU_WAIT, "release fences waited for on the CPU", VK_SUCCESS);
+    poll(&p, 1, 2000);
+    return VK_SUCCESS;
 }
 
 VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     (void)timeout;
-    uint32_t index = headless->owner ? acquireZeroCopy(headless) : headless->nextImage;
+    int releaseFd = -1;
+    uint32_t index = headless->owner ? acquireZeroCopy(headless, &releaseFd) : headless->nextImage;
+
+    if (releaseFd >= 0) {
+        VkResult result = waitForRelease(headless, releaseFd, &signalSemaphore, &fence);
+        close(releaseFd);
+        if (result == VK_ERROR_DEVICE_LOST) return result;
+    }
 
     if (signalSemaphore || fence) {
         VkSubmitInfo submitInfo = {0};
@@ -462,6 +695,12 @@ VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t 
     if (!ZeroCopy_accepting()) return VK_NOT_READY;
     if (!announceChain(headless)) return VK_ERROR_FEATURE_NOT_PRESENT;
     headless->ownerContext = context;
+    double presentTime = nowSeconds();
+    if (headless->lastPresentTime > 0) {
+        double interval = presentTime - headless->lastPresentTime;
+        headless->frameInterval = headless->frameInterval > 0 ? headless->frameInterval * 0.9 + interval * 0.1 : interval;
+    }
+    headless->lastPresentTime = presentTime;
 
     VkExportFenceCreateInfo exportInfo = {0};
     exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO;
