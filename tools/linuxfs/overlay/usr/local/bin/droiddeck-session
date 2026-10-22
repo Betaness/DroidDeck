@@ -129,9 +129,9 @@ start_vortek_display() {
   local -a xw_args
   for i in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
   if [ -S "$sock" ]; then
-    echo "== vortek: server socket $sock ready, ICD ${VK_DRIVER_FILES:-none}"
+    echo "== vortek: server socket $sock ready, ICD ${VK_DRIVER_FILES:-none}${VKBRIDGE_SOCKET:+ (MaliBridge)}"
   else
-    echo "== vortek: NO server socket at $sock - Vulkan will fail (see vortek.log)"
+    echo "== vortek: NO server socket at $sock - Vulkan will fail (see ${VKBRIDGE_SOCKET:+vkbridge.log}${VKBRIDGE_SOCKET:-vortek.log})"
   fi
   if ! command -v Xwayland >/dev/null 2>&1; then
     echo "DD_VORTEK_NO_XWAYLAND: this runtime has no Xwayland, so nothing can be displayed"

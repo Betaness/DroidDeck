@@ -661,12 +661,16 @@ class SessionService : Service() {
             if (userEnv.none { it.startsWith("WINEDEBUG=") }) guest.add("WINEDEBUG=+timestamp,+pid,+tid,+threadname,+loaddll")
             vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
             // BL_VK_BRIDGE=malibridge: the same session with MaliBridge instead of Vortek (for A/B runs).
-            maliBridge = MaliBridgeComponent.SWITCH in userEnv && MaliBridgeComponent.available(this)
+            val bridgeWanted = userEnv.lastOrNull { it.startsWith("BL_VK_BRIDGE=") } == MaliBridgeComponent.SWITCH
+            maliBridge = bridgeWanted && MaliBridgeComponent.available(this)
+            if (bridgeWanted && !maliBridge) Log.w(TAG, "BL_VK_BRIDGE=malibridge ignored: no ${MaliBridgeComponent.binary(this)}")
             if (maliBridge) {
                 val icd = MaliBridgeComponent.GUEST_ICD
-                guest.removeAll { it.startsWith(LinuxVulkanDriver.ENV + "=") || it.startsWith("VK_ICD_FILENAMES=") || it.startsWith("VK_DRIVER_FILES=") }
+                guest.removeAll { it.startsWith(LinuxVulkanDriver.ENV + "=") || it.startsWith("VK_ICD_FILENAMES=") ||
+                    it.startsWith("VK_DRIVER_FILES=") || it.startsWith("VORTEK_SERVER_PATH=") }
+                // droiddeck-session waits for VORTEK_SERVER_PATH before the display starts: the bridge's socket here.
                 guest.addAll(listOf(LinuxVulkanDriver.ENV + "=" + icd, "VK_ICD_FILENAMES=$icd", "VK_DRIVER_FILES=$icd",
-                    "VKBRIDGE_SOCKET=" + MaliBridgeComponent.GUEST_SOCKET))
+                    "VKBRIDGE_SOCKET=" + MaliBridgeComponent.GUEST_SOCKET, "VORTEK_SERVER_PATH=" + MaliBridgeComponent.GUEST_SOCKET))
                 vortekEnv = userEnv.filter { it.startsWith("VKBRIDGE_") }
                 Log.i(TAG, "gpu: MaliBridge instead of Vortek (BL_VK_BRIDGE)")
             } else {

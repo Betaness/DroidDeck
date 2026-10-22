@@ -140,7 +140,7 @@ object SessionFiles {
             listOf("LGPL-2.1", "NOTICE").map { "usr/local/share/licenses/droiddeck-vortek/$it" }).map { it to it }
         // [mali-g2] MaliBridge's guest ICD, for BL_VK_BRIDGE=malibridge (MaliBridgeComponent).
         val maliBridge = listOf("usr/local/lib/vkbridge/libvulkan_droidbridge.so", "usr/local/share/vkbridge/droidbridge_icd.json",
-            "usr/local/share/licenses/malibridge/NOTICE").map { it to it }
+            "usr/local/share/licenses/malibridge/NOTICE", "usr/local/share/licenses/malibridge/GPL-3").map { it to it }
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",

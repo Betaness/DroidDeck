@@ -602,6 +602,7 @@ jobs:
           install -Dm644 mb/assets/linuxfs/usr/local/share/vkbridge/droidbridge_icd.json "$D/usr/local/share/vkbridge/droidbridge_icd.json"
           printf 'MaliBridge %s (GPL-3.0), https://github.com/ASEbrahim/MaliBridge/releases/tag/%s\nSource: https://github.com/ASEbrahim/MaliBridge/tree/%s\n' "$V" "$V" "$V" \
             | install -Dm644 /dev/stdin "$D/usr/local/share/licenses/malibridge/NOTICE"
+          install -Dm644 LICENSE "$D/usr/local/share/licenses/malibridge/GPL-3"
           rm -rf mb mb.apk
 
       - name: Build the add-on packs
