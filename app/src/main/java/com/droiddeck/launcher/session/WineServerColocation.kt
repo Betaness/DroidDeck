@@ -10,39 +10,35 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * Puts a Windows game's busiest thread and its wineserver on one CPU core, when that makes the game faster.
+ * Puts a Windows game's busiest thread and its wineserver on one small core, when that makes the game faster.
  *
- * Some games make thousands of wineserver requests a second from their main thread: Escape from
- * Duckov (Unity) creates and closes an anonymous semaphore about 4000 times a second, each a round
- * trip to wineserver. With the two on different cores every request costs two cross-core wake-ups
- * (about 27 us of sleeping and waiting to run again), and the scheduler, seeing a thread that sleeps
- * 8000 times a second, keeps it on the small cores anyway. On one core they hand over without
- * either: Duckov went from 47 to 56 fps on the Xring O3, on any single small core; a single
- * middle core was slower than none, and the kernel will not let a thread onto the prime cores alone.
+ * Some games make thousands of wineserver requests a second from one thread: Escape from Duckov's
+ * main thread creates and closes an anonymous semaphore ~4000 times a second (Proton runs esync here:
+ * futex_waitv is blocked by Android's seccomp policy). Across cores each round trip costs two
+ * wake-ups, and the scheduler keeps a thread that sleeps that often on the small cores anyway. On
+ * one small core Duckov ran 56 fps instead of 47 on the Xring O3; one middle core was slower than
+ * none, and the kernel widens a mask holding only prime cores.
  *
- * Whether it helps depends on the game and the scene, so it is tried rather than assumed: the
- * frame rate is measured unpinned, then pinned, and the pin kept only when it is faster; it is
- * measured again every [RECHECK_S] seconds, and undone at once if the thread saturates the core.
- * Frames come from the compositor (WaylandCompositor.gameFrameCount), so a game without frames is
- * left alone. Affinity is set with toybox taskset: the guest's processes run under this app's UID.
+ * Whether it helps depends on the game and the scene, so fps is measured unpinned and pinned, and
+ * the pin kept only when faster; measured again every [RECHECK_S] s, undone when the core saturates.
  */
 object WineServerColocation {
     private const val TAG = "WineColocate"
-    private const val WINDOW_S = 5
-    private const val RECHECK_S = 90
-    private const val COOLDOWN_S = 120
+    private const val WINDOW_NS = 5_000_000_000L
+    private const val RECHECK_NS = 90_000_000_000L
+    private const val COOLDOWN_NS = 120_000_000_000L
     private const val MIN_SHARE = 0.5
     private const val KEEP_SHARE = 0.3
-    private const val SATURATED = 0.97
+    private const val SATURATED = 0.95
     private const val MIN_SWITCHES_PER_S = 1500.0
     private const val GAIN = 1.04
     private const val MIN_FPS = 5.0
-    /** Wine's own processes, which are never the game. */
+    private const val STALLS = 15
     private val WINE_SERVICES = setOf("services.exe", "winedevice.exe", "plugplay.exe", "svchost.exe", "explorer.exe",
         "rpcss.exe", "steam.exe", "tabtip.exe", "conhost.exe", "start.exe", "wineboot.exe", "UnityCrashHandler64.exe",
         "UnityCrashHandler32.exe", "CrashReportClient.exe")
 
-    private var worker: Thread? = null
+    @Volatile private var worker: Thread? = null
 
     @Synchronized
     fun start(context: Context): String {
@@ -59,134 +55,168 @@ object WineServerColocation {
         worker = null
     }
 
-    /**
-     * The core to share: the fastest-clocked core outside the highest-capacity cluster (the kernel
-     * widens a mask holding only prime cores), the highest-numbered of equals, away from cpu0's interrupts.
-     */
+    /** The highest-numbered core of the lowest-capacity cluster: cpu0 takes most interrupts. */
     internal fun pickCore(): Int? {
         val cpus = (0 until Runtime.getRuntime().availableProcessors()).mapNotNull { cpu ->
-            val capacity = readLong("/sys/devices/system/cpu/cpu$cpu/cpu_capacity")
-            val maxFreq = readLong("/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_max_freq")
-            if (capacity == null || maxFreq == null) null else Triple(cpu, capacity, maxFreq)
+            readLong("/sys/devices/system/cpu/cpu$cpu/cpu_capacity")?.let { cpu to it }
         }
         if (cpus.size < 2) return null
-        val top = cpus.maxOf { it.second }
-        return cpus.filter { it.second < top }
-            .maxWithOrNull(compareBy<Triple<Int, Long, Long>> { it.third }.thenBy { it.first })?.first
+        val low = cpus.minOf { it.second }
+        if (cpus.all { it.second == low }) return null
+        return cpus.filter { it.second == low }.maxOf { it.first }
     }
 
     private class Candidate(val pid: Int, val tid: Int, val name: String)
 
-    private enum class Phase { IDLE, BASE, TRY, PINNED, COOLDOWN }
+    private enum class Phase { BASE, TRY, PINNED, COOLDOWN }
+
+    private class Trial(val game: Candidate, val server: Int) {
+        var phase = Phase.BASE
+        var since = System.nanoTime()
+        var frames0 = WaylandCompositor.gameFrameCount()
+        var baseFps = 0.0
+        var checked = 0L
+        var stalls = 0
+        var pinned = false
+
+        fun restart(phase: Phase) {
+            this.phase = phase
+            since = System.nanoTime()
+            frames0 = WaylandCompositor.gameFrameCount()
+        }
+
+        fun fps(): Double = (WaylandCompositor.gameFrameCount() - frames0) / ((System.nanoTime() - since) / 1e9)
+    }
 
     private fun run(core: Int) {
         val scan = Scanner()
-        var candidate: Candidate? = null
-        var server = -1
-        var phase = Phase.IDLE
-        var phaseStart = 0L
-        var frames0 = 0L
-        var baseFps = 0.0
-        var lastCheck = 0L
+        var trial: Trial? = null
+        var lastCount = WaylandCompositor.gameFrameCount()
         try {
-            while (!Thread.currentThread().isInterrupted) {
+            while (!Thread.currentThread().isInterrupted && worker === Thread.currentThread()) {
                 TimeUnit.SECONDS.sleep(1)
-                val now = System.nanoTime() / 1_000_000_000
                 val found = scan.sample()
-                val current = candidate
-                // Kept while it exists and stays busy: loading spikes on other threads do not take over.
-                if (current != null && (!scan.alive(current.tid) || scan.share(current.tid) < KEEP_SHARE)) {
-                    // The thread is gone or another took over: let wineserver run anywhere again.
-                    if (server > 0 && phase in setOf(Phase.TRY, Phase.PINNED)) unpin(server, process = true)
-                    candidate = null
-                    phase = Phase.IDLE
+                val t = trial
+                if (t != null && (!scan.alive(t.game.tid) || scan.share(t.game.tid) < KEEP_SHARE)) {
+                    if (t.pinned) unpin(t, scan, core)
+                    trial = null
                 }
-                if (candidate == null) {
-                    if (found == null) continue
-                    candidate = found.first
-                    server = found.second
-                    phase = Phase.BASE
-                    phaseStart = now
-                    frames0 = WaylandCompositor.gameFrameCount()
-                    Log.i(TAG, "candidate ${found.first.name}/${found.first.tid}, wineserver $server: measuring")
+                if (trial == null) {
+                    if (found != null) {
+                        trial = Trial(found.first, found.second)
+                        Log.i(TAG, "candidate ${found.first.name}/${found.first.tid}, wineserver ${found.second}: measuring")
+                    }
+                    lastCount = WaylandCompositor.gameFrameCount()
                     continue
                 }
-                val c = candidate ?: continue
-                val share = scan.share(c.tid)
-                when (phase) {
-                    Phase.BASE -> if (now - phaseStart >= WINDOW_S) {
-                        baseFps = (WaylandCompositor.gameFrameCount() - frames0).toDouble() / (now - phaseStart)
-                        if (baseFps < MIN_FPS) {
-                            phase = Phase.COOLDOWN; phaseStart = now
-                        } else if (pin(c.tid, server, core)) {
-                            phase = Phase.TRY; phaseStart = now; frames0 = WaylandCompositor.gameFrameCount()
-                        } else {
-                            Log.i(TAG, "could not pin ${c.name}/${c.tid} to core $core")
-                            phase = Phase.COOLDOWN; phaseStart = now
+                val tr = trial ?: continue
+                val count = WaylandCompositor.gameFrameCount()
+                val stalled = count - lastCount < MIN_FPS
+                lastCount = count
+                if (tr.pinned) scan.loosenChildren(tr.game.pid, tr.game.tid, core)
+                if (stalled && (tr.phase == Phase.BASE || tr.phase == Phase.TRY)) {
+                    // A second without frames says nothing about the pin; a pin under which frames keep stopping is dropped.
+                    if (tr.phase == Phase.TRY && ++tr.stalls > STALLS) {
+                        unpin(tr, scan, core)
+                        tr.restart(Phase.COOLDOWN)
+                    } else {
+                        tr.restart(tr.phase)
+                    }
+                    continue
+                }
+                val elapsed = System.nanoTime() - tr.since
+                val load = scan.share(tr.game.tid) + scan.serverShare(tr.server)
+                when (tr.phase) {
+                    Phase.BASE -> if (elapsed >= WINDOW_NS) {
+                        tr.baseFps = tr.fps()
+                        when {
+                            tr.baseFps < MIN_FPS -> tr.restart(Phase.COOLDOWN)
+                            pin(tr, core) -> { tr.stalls = 0; tr.restart(Phase.TRY) }
+                            else -> {
+                                Log.i(TAG, "could not pin ${tr.game.name}/${tr.game.tid} to core $core")
+                                tr.restart(Phase.COOLDOWN)
+                            }
                         }
                     }
-                    Phase.TRY -> if (now - phaseStart >= WINDOW_S) {
-                        val fps = (WaylandCompositor.gameFrameCount() - frames0).toDouble() / (now - phaseStart)
-                        if (fps >= baseFps * GAIN && share < SATURATED) {
-                            Log.i(TAG, "${c.name}/${c.tid} and wineserver on core $core: %.1f fps against %.1f, kept".format(fps, baseFps))
-                            phase = Phase.PINNED; lastCheck = now
+                    Phase.TRY -> if (elapsed >= WINDOW_NS) {
+                        val fps = tr.fps()
+                        val verdict = "${tr.game.name}/${tr.game.tid} with wineserver on core $core: " +
+                            "${"%.1f".format(fps)} fps against ${"%.1f".format(tr.baseFps)} unpinned"
+                        if (fps >= tr.baseFps * GAIN && load < SATURATED) {
+                            Log.i(TAG, "$verdict, kept")
+                            tr.phase = Phase.PINNED
+                            tr.checked = System.nanoTime()
                         } else {
-                            Log.i(TAG, "${c.name}/${c.tid} on core $core: %.1f fps against %.1f, undone".format(fps, baseFps))
-                            unpin(c.tid); unpin(server, process = true)
-                            phase = Phase.COOLDOWN; phaseStart = now
+                            Log.i(TAG, "$verdict, undone")
+                            unpin(tr, scan, core)
+                            tr.restart(Phase.COOLDOWN)
                         }
                     }
                     Phase.PINNED -> when {
-                        share >= SATURATED -> {
-                            Log.i(TAG, "${c.name}/${c.tid} saturates core $core, undone")
-                            unpin(c.tid); unpin(server, process = true)
-                            phase = Phase.COOLDOWN; phaseStart = now
+                        load >= SATURATED -> {
+                            Log.i(TAG, "${tr.game.name}/${tr.game.tid} and wineserver saturate core $core, undone")
+                            unpin(tr, scan, core)
+                            tr.restart(Phase.COOLDOWN)
                         }
-                        now - lastCheck >= RECHECK_S -> {
-                            // Measure the game unpinned again; the scene may have changed.
-                            unpin(c.tid); unpin(server, process = true)
-                            phase = Phase.BASE; phaseStart = now; frames0 = WaylandCompositor.gameFrameCount()
+                        System.nanoTime() - tr.checked >= RECHECK_NS -> {
+                            unpin(tr, scan, core)
+                            tr.restart(Phase.BASE)
                         }
                     }
-                    Phase.COOLDOWN -> if (now - phaseStart >= COOLDOWN_S) {
-                        phase = Phase.BASE; phaseStart = now; frames0 = WaylandCompositor.gameFrameCount()
-                    }
-                    Phase.IDLE -> {}
+                    Phase.COOLDOWN -> if (elapsed >= COOLDOWN_NS) tr.restart(Phase.BASE)
                 }
             }
         } catch (_: InterruptedException) {
         } catch (t: Throwable) {
             Log.w(TAG, "stopped", t)
         } finally {
-            candidate?.let { if (phase == Phase.TRY || phase == Phase.PINNED) { unpin(it.tid); unpin(server, process = true) } }
+            trial?.let { if (it.pinned) unpin(it, scan, core) }
         }
     }
 
-    private fun pin(tid: Int, server: Int, core: Int): Boolean =
-        taskset(1L shl core, tid) && taskset(1L shl core, server, allThreads = true) &&
-            File("/proc/$tid/status").readLines().any { it.startsWith("Cpus_allowed_list:") && it.substringAfter(':').trim() == "$core" }
-
-    /** Every core again; [process] for wineserver, all of whose threads were pinned. */
-    private fun unpin(tid: Int, process: Boolean = false) {
-        taskset((1L shl Runtime.getRuntime().availableProcessors()) - 1, tid, allThreads = process)
+    private fun pin(t: Trial, core: Int): Boolean {
+        t.pinned = true
+        val ok = taskset(1L shl core, t.game.tid) && taskset(1L shl core, t.server, allThreads = true) &&
+            runCatching {
+                File("/proc/${t.game.tid}/status").readLines()
+                    .any { it.startsWith("Cpus_allowed_list:") && it.substringAfter(':').trim() == "$core" }
+            }.getOrDefault(false)
+        if (!ok) unpin(t)
+        return ok
     }
 
-    /** toybox taskset: a hex mask, no -c. */
-    private fun taskset(mask: Long, id: Int, allThreads: Boolean = false): Boolean = try {
-        val args = mutableListOf("/system/bin/taskset", if (allThreads) "-ap" else "-p", java.lang.Long.toHexString(mask), id.toString())
-        val p = ProcessBuilder(args).redirectErrorStream(true).start()
-        p.inputStream.readBytes()
-        p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0
-    } catch (e: Exception) {
-        Log.w(TAG, "taskset ${java.lang.Long.toHexString(mask)} $id", e)
-        false
+    private fun unpin(t: Trial, scan: Scanner? = null, core: Int = -1) {
+        val all = (1L shl Runtime.getRuntime().availableProcessors()) - 1
+        taskset(all, t.game.tid)
+        taskset(all, t.server, allThreads = true)
+        if (scan != null && core >= 0) scan.loosenChildren(t.game.pid, t.game.tid, core, recheck = true)
+        t.pinned = false
+    }
+
+    /** toybox taskset: a hex mask; -a for every thread of the process. */
+    private fun taskset(mask: Long, id: Int, allThreads: Boolean = false): Boolean {
+        val args = listOf("/system/bin/taskset", if (allThreads) "-ap" else "-p", java.lang.Long.toHexString(mask), id.toString())
+        var p: java.lang.Process? = null
+        return try {
+            p = ProcessBuilder(args).redirectErrorStream(true).start()
+            p.inputStream.readBytes()
+            p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "taskset ${java.lang.Long.toHexString(mask)} $id", e)
+            false
+        } finally {
+            p?.destroy()
+        }
     }
 
     private fun readLong(path: String): Long? = try { File(path).readText().trim().toLong() } catch (_: Exception) { null }
 
     /**
-     * Once a second: the busiest thread of a Windows game process (by CPU share and voluntary context
-     * switches, the sign of round trips) and its wineserver's pid. /proc shows this app's UID only.
+     * Once a second, over this UID's processes (all /proc shows an app): the busiest thread of a
+     * Windows game process with many voluntary switches (round trips), and its wineserver.
      */
     private class Scanner {
         private val self = Process.myPid()
@@ -195,10 +225,32 @@ object WineServerColocation {
         private var lastTicks = HashMap<Int, Long>()
         private var lastSwitches = HashMap<Int, Long>()
         private var shares = HashMap<Int, Double>()
+        private var lastServerTicks = HashMap<Int, Long>()
+        private var serverShares = HashMap<Int, Double>()
+        private val known = HashSet<Int>()
 
         fun share(tid: Int): Double = shares[tid] ?: 0.0
 
         fun alive(tid: Int): Boolean = tid in shares
+
+        fun serverShare(pid: Int): Double = serverShares[pid] ?: 0.0
+
+        /** Threads the pinned one started inherited its one-core mask: give them every core (only ours, not masks the game set). */
+        fun loosenChildren(pid: Int, pinned: Int, core: Int, recheck: Boolean = false) {
+            val all = (1L shl Runtime.getRuntime().availableProcessors()) - 1
+            File("/proc/$pid/task").list()?.forEach { entry ->
+                val tid = entry.toIntOrNull() ?: return@forEach
+                if (tid == pinned || !known.add(tid) && !recheck) return@forEach
+                val mask = runCatching {
+                    File("/proc/$pid/task/$tid/status").readLines().firstOrNull { it.startsWith("Cpus_allowed:") }
+                        ?.substringAfter(':')?.trim()?.toLong(16)
+                }.getOrNull()
+                if (mask == 1L shl core) {
+                    ProcessBuilder("/system/bin/taskset", "-p", java.lang.Long.toHexString(all), tid.toString())
+                        .redirectErrorStream(true).start().apply { inputStream.readBytes(); waitFor(5, TimeUnit.SECONDS); destroy() }
+                }
+            }
+        }
 
         fun sample(): Pair<Candidate, Int>? {
             val now = System.nanoTime()
@@ -212,10 +264,19 @@ object WineServerColocation {
                 val comm = read("/proc/$pid/comm") ?: return@forEach
                 if (comm == "wineserver") { servers += pid; return@forEach }
                 val cmd = read("/proc/$pid/cmdline")?.substringBefore('\u0000') ?: return@forEach
-                // Wine shows Windows processes by their Windows path: S:\...\Game.exe.
+                // Wine shows a Windows process by its Windows path: S:\...\Game.exe.
                 if (cmd.length > 3 && cmd[1] == ':' && cmd[2] == '\\' && cmd.endsWith(".exe", ignoreCase = true) &&
                     cmd.substringAfterLast('\\') !in WINE_SERVICES) games += pid
             }
+            val serverTicks = HashMap<Int, Long>()
+            val newServerShares = HashMap<Int, Double>()
+            for (pid in servers) {
+                val t = cpuTicks("/proc/$pid/stat") ?: continue
+                serverTicks[pid] = t
+                if (seconds > 0) newServerShares[pid] = (t - (lastServerTicks[pid] ?: t)) / hz / seconds
+            }
+            lastServerTicks = serverTicks
+            serverShares = newServerShares
             val ticks = HashMap<Int, Long>()
             val switches = HashMap<Int, Long>()
             val newShares = HashMap<Int, Double>()
@@ -242,7 +303,7 @@ object WineServerColocation {
             lastSwitches = switches
             shares = newShares
             val b = best ?: return null
-            // One wineserver per prefix: the game's is the one with its WINEPREFIX.
+            // One wineserver per prefix: the game's has its WINEPREFIX.
             val server = servers.singleOrNull() ?: prefix(b.pid)?.let { p -> servers.firstOrNull { prefix(it) == p } }
             return server?.let { b to it }
         }

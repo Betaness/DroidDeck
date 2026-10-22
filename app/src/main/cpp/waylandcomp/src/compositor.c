@@ -753,8 +753,10 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
 
 uint64_t droiddeck_game_frames(void) { return g_game_frames; }
 
-/* [mali-g2] A frame a game presented without a Wayland surface (Vortek's zero-copy layer). */
-void droiddeck_count_game_frame(void) { g_game_frames++; droiddeck_on_game_frame(); }
+/* [mali-g2] A frame a game presented without a Wayland surface (Vortek's zero-copy layer): counted
+ * for the app (WaylandCompositor.gameFrameCount), not in g_game_frames, which frame generation reads
+ * as frames this compositor composites. */
+void droiddeck_count_game_frame(void) { droiddeck_on_game_frame(); }
 
 struct dmabuf_buffer *droiddeck_dmabuf_from_resource(struct wl_resource *buffer) { return get_dmabuf(buffer); }
 int droiddeck_dmabuf_fd(const struct dmabuf_buffer *b) { return b && b->n_planes > 0 ? b->fd[0] : -1; }

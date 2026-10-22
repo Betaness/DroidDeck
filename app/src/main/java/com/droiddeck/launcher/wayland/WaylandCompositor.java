@@ -53,7 +53,10 @@ public final class WaylandCompositor {
     public static long recentFrameIntervalMs() {
         long last = lastFrameNanos;
         if (last == 0) return -1;
-        return Math.max(frameIntervalNanos, System.nanoTime() - last) / 1_000_000;
+        long since = System.nanoTime() - last;
+        // No frame for a second: no game on screen (a Vortek game's layer can go away without a word).
+        if (since > 1_000_000_000L) return -1;
+        return Math.max(frameIntervalNanos, since) / 1_000_000;
     }
 
     @SuppressWarnings("unused")
