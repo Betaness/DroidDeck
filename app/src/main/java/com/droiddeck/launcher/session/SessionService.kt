@@ -650,6 +650,9 @@ class SessionService : Service() {
             guest.add("LIBGL_ALWAYS_SOFTWARE=1")
             // Bring-up: Proton writes ~/steam-<appid>.log (DXVK output included); SessionArtifacts collects it.
             if (userEnv.none { it.startsWith("PROTON_LOG=") }) guest.add("PROTON_LOG=1")
+            // Proton's default channels for PROTON_LOG add +seh,+unwind: a backtrace per exception, which
+            // slowed games that throw a lot (Lua in Richman 10) to a crawl. Errors and fixmes still show.
+            if (userEnv.none { it.startsWith("WINEDEBUG=") }) guest.add("WINEDEBUG=+timestamp,+pid,+tid,+threadname,+loaddll")
             vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
             Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
         }
