@@ -21,6 +21,10 @@ the root's _NET_ACTIVE_WINDOW, and only then makes the window foreground. Withou
 stayed inactive behind its own picture at under 1 fps. So the helper keeps WM_STATE (Normal while
 mapped, Withdrawn after unmapping, iconify requests answered with Normal as gamescope does) and
 rewrites _NET_ACTIVE_WINDOW on every activation, giving the window input focus the ICCCM way.
+
+Wine also leaves room for the frame it expects a window manager to draw: a 1280x720 game window
+with a caption sat at 3,22, a black band above it. Game windows as large as the screen are moved
+to its corner, as gamescope shows them.
 """
 import ctypes as c
 import select
@@ -64,6 +68,7 @@ class X:
                                     c.c_void_p, c.c_ulong, c.c_void_p]
         x.XCreateWindow.restype = W
         x.XMoveResizeWindow.argtypes = [D, W, c.c_int, c.c_int, c.c_uint, c.c_uint]
+        x.XMoveWindow.argtypes = [D, W, c.c_int, c.c_int]
         x.XSendEvent.argtypes = [D, W, c.c_int, c.c_long, c.c_void_p]
         x.XWindowEvent.argtypes = [D, W, c.c_long, c.c_void_p]
         x.XGetWMHints.argtypes = [D, W]
@@ -233,6 +238,18 @@ def main():
         if a and a.map_state == 2 and not a.override_redirect and wm_state(w) is None:
             set_wm_state(w, NORMAL)
 
+    moved = {}  # window -> times moved to the corner; a client that keeps moving it back wins
+
+    def to_corner(w, a):
+        if (a.x, a.y) == (0, 0) or a.width < root_attrs.width or a.height < root_attrs.height:
+            return
+        if moved.get(w, 0) >= 5:
+            return
+        moved[w] = moved.get(w, 0) + 1
+        x.x.XMoveWindow(x.dpy, w, 0, 0)
+        print('droiddeck-vortek-focus: window 0x%x %dx%d moved from %d,%d to the corner'
+              % (w, a.width, a.height, a.x, a.y), flush=True)
+
     tags = {}  # window -> (app, pid), read once the client has tagged it
     watched = {}  # window -> event mask we selected on it
     restore = None
@@ -298,6 +315,8 @@ def main():
                     stack.append((w, 0, pid[0] if pid else 0))
                     continue
                 tags[w] = (app[0], pid[0] if pid else 0)
+            if tags[w][0] != STEAM_APP:
+                to_corner(w, a)
             # The Steam window's children are its menus: wake up when they map or unmap.
             mask = SUBSTRUCTURE_NOTIFY if tags[w][0] == STEAM_APP else 0
             if watched.get(w) != mask:
@@ -310,6 +329,8 @@ def main():
             del watched[w]
         for w in set(saved) - {e[0] for e in stack}:
             del saved[w]
+        for w in set(moved) - {e[0] for e in stack}:
+            del moved[w]
         steam = next((w for w, app, _ in stack if app == STEAM_APP), 0)
         steam_index = next((i for i, (w, _, _) in enumerate(stack) if w == steam), -1)
 
