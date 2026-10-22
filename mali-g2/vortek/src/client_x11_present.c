@@ -96,6 +96,9 @@ typedef struct X11Swapchain {
     xcb_window_t root;
     uint32_t rootW, rootH;
     bool occluded;
+    bool covered;              /* nothing of the window is visible: frames are dropped, paced */
+    uint32_t coverCountdown;
+    double lastCoveredFrame;
     /* the window's ancestors up to the root and their origins in root coordinates */
     int chainLength;
     xcb_window_t chain[16];
@@ -586,9 +589,14 @@ static bool findAncestors(X11Swapchain* sc) {
 /* At every level from the window up to its top-level window, a mapped sibling stacked above it
  * that overlaps the window hides part of it (Steam's menus are such siblings inside its own
  * top-level window), and so does a mapped child of the window. Two round trips per frame. */
-static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* stale) {
+static bool rectContains(int ox, int oy, int ow, int oh, int x, int y, int w, int h) {
+    return ox <= x && oy <= y && ox + ow >= x + w && oy + oh >= y + h;
+}
+
+static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* stale, bool* covered) {
     xcb_connection_t* conn = sc->surface->conn;
     int levels = sc->chainLength;
+    xcb_get_window_attributes_cookie_t selfAttrs = xcb_get_window_attributes(conn, sc->chain[0]);
     xcb_query_tree_cookie_t trees[17];
     for (int i = 0; i < levels; i++) trees[i] = xcb_query_tree(conn, i + 1 < levels ? sc->chain[i + 1] : sc->root);
     trees[levels] = xcb_query_tree(conn, sc->chain[0]);
@@ -625,9 +633,13 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
         }
     }
     for (int i = 0; i <= levels; i++) free(replies[i]);
+    xcb_get_window_attributes_reply_t* self = xcb_get_window_attributes_reply(conn, selfAttrs, NULL);
+    /* Viewable means the window and all its ancestors are mapped. */
+    *covered = !self || self->map_state != XCB_MAP_STATE_VIEWABLE;
+    free(self);
     if (!ok || *stale) return true;
 
-    bool occluded = false;
+    bool occluded = *covered;
     if (total > 0) {
         xcb_get_window_attributes_cookie_t attrs[total];
         xcb_get_geometry_cookie_t geos[total];
@@ -638,10 +650,12 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
         for (int k = 0; k < total; k++) {
             xcb_get_window_attributes_reply_t* a = xcb_get_window_attributes_reply(conn, attrs[k], NULL);
             xcb_get_geometry_reply_t* g = xcb_get_geometry_reply(conn, geos[k], NULL);
-            if (a && g && a->map_state == XCB_MAP_STATE_VIEWABLE &&
-                rectsOverlap(x, y, w, h, originX[k] + g->x, originY[k] + g->y,
-                             g->width + 2 * g->border_width, g->height + 2 * g->border_width))
-                occluded = true;
+            if (a && g && a->map_state == XCB_MAP_STATE_VIEWABLE) {
+                int ox = originX[k] + g->x, oy = originY[k] + g->y;
+                int ow = g->width + 2 * g->border_width, oh = g->height + 2 * g->border_width;
+                if (rectsOverlap(x, y, w, h, ox, oy, ow, oh)) occluded = true;
+                if (rectContains(ox, oy, ow, oh, x, y, w, h)) *covered = true;
+            }
             free(a);
             free(g);
         }
@@ -651,16 +665,69 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
 
 static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
     /* Parents rarely move or change; refresh their list now and then and when it went stale. */
+    sc->covered = false;
     if (sc->chainLength == 0 || ++sc->chainAge > 120) {
         if (!findAncestors(sc)) return true;
     }
-    bool stale;
-    bool occluded = checkOccludedOnce(sc, x, y, w, h, &stale);
+    bool stale, covered;
+    bool occluded = checkOccludedOnce(sc, x, y, w, h, &stale, &covered);
     if (stale) {
         if (!findAncestors(sc)) return true;
-        occluded = checkOccludedOnce(sc, x, y, w, h, &stale);
+        occluded = checkOccludedOnce(sc, x, y, w, h, &stale, &covered);
     }
+    sc->covered = !stale && covered;
     return occluded;
+}
+
+/* For swapchains on the X11 path: whether the window is entirely hidden, re-checked every frame
+ * while it is (cheap at the paced rate) and every 10 frames otherwise. */
+static void updateCoverage(X11Swapchain* sc) {
+    if (sc->coverCountdown > 0 && !sc->covered) {
+        sc->coverCountdown--;
+        return;
+    }
+    sc->coverCountdown = 10;
+    xcb_connection_t* conn = sc->surface->conn;
+    xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, sc->surface->window), NULL);
+    if (!geo) { sc->covered = false; return; }
+    xcb_translate_coordinates_reply_t* pos =
+        xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, sc->surface->window, geo->root, 0, 0), NULL);
+    if (pos) {
+        sc->root = geo->root;
+        checkOccluded(sc, pos->dst_x, pos->dst_y, geo->width, geo->height);
+    }
+    else sc->covered = false;
+    free(pos);
+    free(geo);
+}
+
+/* A hidden window's frame: its semaphores are waited for and nothing is copied or drawn, at most
+ * COVERED_FPS a second. Windows hidden behind a game (a launcher left running, the Steam client)
+ * otherwise render as fast as the GPU allows and take it from the game. */
+#define COVERED_FPS 10
+static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentInfoKHR* presentInfo, bool* waitedSemaphores) {
+    VkPipelineStageFlags waitStages[presentInfo->waitSemaphoreCount + 1];
+    for (uint32_t s = 0; s < presentInfo->waitSemaphoreCount; s++) waitStages[s] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    if (!*waitedSemaphores) {
+        submitInfo.waitSemaphoreCount = presentInfo->waitSemaphoreCount;
+        submitInfo.pWaitSemaphores = presentInfo->pWaitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+        *waitedSemaphores = true;
+    }
+    VkResult result = vk.QueueSubmit(queue, 1, &submitInfo, sc->fence);
+    if (result == VK_SUCCESS) result = vk.WaitForFences(sc->device, 1, &sc->fence, VK_TRUE, UINT64_MAX);
+    if (result == VK_SUCCESS) vk.ResetFences(sc->device, 1, &sc->fence);
+    double now = nowSeconds(), next = sc->lastCoveredFrame + 1.0 / COVERED_FPS;
+    if (now < next) {
+        double wait = next - now;
+        struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
+        nanosleep(&ts, NULL);
+        now = next;
+    }
+    sc->lastCoveredFrame = now;
+    return result;
 }
 
 /* VK_ERROR_FEATURE_NOT_PRESENT (never again for this swapchain) or VK_NOT_READY (not this frame):
@@ -743,7 +810,8 @@ static void countFrame(X11Swapchain* sc) {
         if (sc->statStart == 0) sc->statStart = now;
         if (now - sc->statStart >= statEvery) {
             fprintf(stderr, "vortek-x11: %llu frames, %.1f fps%s\n", (unsigned long long)sc->frames,
-                    sc->statFrames / (now - sc->statStart), sc->zeroCopy == 1 && !sc->occluded ? " (zero-copy)" : "");
+                    sc->statFrames / (now - sc->statStart),
+                    sc->covered ? " (hidden, paced)" : sc->zeroCopy == 1 && !sc->occluded ? " (zero-copy)" : "");
             sc->statStart = now;
             sc->statFrames = 0;
         }
@@ -784,6 +852,18 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
         }
 
         if (sc && sc->ready) {
+            if (sc->zeroCopy < 0 || sc->occluded) {
+                if (sc->zeroCopy < 0) updateCoverage(sc);
+                if (sc->covered) {
+                    result = presentCovered(sc, queue, presentInfo, &waitedSemaphores);
+                    countFrame(sc);
+                    if (results) results[i] = result;
+                    if (result < 0 || (overall == VK_SUCCESS && result != VK_SUCCESS)) {
+                        if (overall >= 0) overall = result;
+                    }
+                    continue;
+                }
+            }
             uint32_t imageIndex = presentInfo->pImageIndices[i];
             xcb_get_geometry_cookie_t geometryCookie = xcb_get_geometry(sc->surface->conn, sc->surface->window);
             xcb_flush(sc->surface->conn);
