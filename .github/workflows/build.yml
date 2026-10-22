@@ -444,6 +444,8 @@ jobs:
             test -f app/src/main/assets/droiddeck-esync/index.json.sig
             ls -lR app/src/main/assets/droiddeck-esync
           fi
+      - name: Bundle the extra droiddeck-esync packs (tools/droiddeck-esync/extra.list)
+        run: tools/droiddeck-esync/fetch-extra.sh "$PWD"
 
       - name: Cache PulseAudio 13.0 source
         id: pa-src

@@ -41,6 +41,7 @@ object EsyncPacks {
     const val NTDLL = "files/lib/wine/aarch64-unix/ntdll.so"
     const val WINESERVER = "files/bin-arm64/wineserver"
     const val GUEST_STORE = "/root/.local/share/droiddeck-esync"
+    const val EXTRA_ASSETS = "droiddeck-esync-extra"
     private const val STORE = "root/.local/share/droiddeck-esync"
     private const val PACK_JSON = "pack.json"
     private const val COMPLETE = ".complete"
@@ -172,9 +173,15 @@ object EsyncPacks {
     private fun parseEntry(o: JSONObject): Entry {
         val id = o.getString("id")
         require(ID.matches(id)) { "invalid id $id" }
-        val asset = o.getJSONObject("asset")
-        val url = asset.getString("url")
+        val url = o.getJSONObject("asset").getString("url")
         require(allowedUrl(url)) { "$id: asset $url is outside $ASSET_PREFIX" }
+        return entryOf(o, url, o.optBoolean("revoked", false))
+    }
+
+    private fun entryOf(o: JSONObject, url: String, revoked: Boolean): Entry {
+        val id = o.getString("id")
+        require(ID.matches(id)) { "invalid id $id" }
+        val asset = o.getJSONObject("asset")
         val sha256 = asset.getString("sha256").lowercase()
         require(SHA256.matches(sha256)) { "$id: invalid asset sha256" }
         val size = asset.getLong("size")
@@ -184,8 +191,38 @@ object EsyncPacks {
         return Entry(
             id, flavor, o.getInt("rev"), o.optString("version"), o.optString("version_line"),
             hashes(o.getJSONObject("stock")), o.optString("exports").lowercase(), o.opt("source_match") == true,
-            hashes(o.getJSONObject("files")), Asset(url, sha256, size), o.optBoolean("revoked", false),
+            hashes(o.getJSONObject("files")), Asset(url, sha256, size), revoked,
         )
+    }
+
+    internal fun parseExtras(bytes: ByteArray): List<Entry> {
+        val root = JSONObject(String(bytes, Charsets.UTF_8))
+        val format = root.getInt("format")
+        require(format == 1) { "extra sync pack manifest format $format is not supported" }
+        val array = root.getJSONArray("packs")
+        val packs = ArrayList<Entry>()
+        val seen = HashSet<String>()
+        for (i in 0 until array.length()) {
+            val entry = try {
+                parseExtra(array.getJSONObject(i))
+            } catch (e: Exception) {
+                Log.w(TAG, "extra sync pack $i skipped: ${e.message}")
+                continue
+            }
+            if (seen.add(entry.id)) packs.add(entry)
+        }
+        return packs
+    }
+
+    private fun parseExtra(o: JSONObject): Entry {
+        val id = o.getString("id")
+        require(ID.matches(id)) { "invalid id $id" }
+        val sha256 = o.getString("sha256").lowercase()
+        require(SHA256.matches(sha256)) { "$id: invalid sha256" }
+        val entry = entryOf(o.getJSONObject("entry"), "", false)
+        require(entry.id == id) { "the manifest names $id, its entry ${entry.id}" }
+        require(entry.asset.sha256 == sha256) { "$id: the manifest and the entry disagree on the archive checksum" }
+        return entry
     }
 
     private fun hashes(o: JSONObject): Map<String, String> = BINARIES.associateWith { rel ->
@@ -361,16 +398,26 @@ object EsyncPacks {
     }
 
     fun stageBundled(context: Context, root: File) {
+        val store = store(root)
+        val ready = try {
+            store.isDirectory || store.mkdirs()
+        } catch (t: Throwable) {
+            false
+        }
+        if (!ready) {
+            Log.w(TAG, "could not create $store")
+            return
+        }
+        stageSigned(context, store)
+        stageExtras(context, store)
+    }
+
+    private fun stageSigned(context: Context, store: File) {
         try {
-            val store = store(root)
-            if (!store.isDirectory && !store.mkdirs()) {
-                Log.w(TAG, "could not create $store")
-                return
-            }
             val bundled = bundledIndex(context)
             val trusted = if (bundled == null) cachedIndex(context)
             else storeIndex(context, bundled.bytes, bundled.sig, bundled.index, newerOnly = true)
-            if (trusted != null) removeRevoked(store, trusted)
+            if (trusted != null) removeRevoked(store, trusted, extraIds(context))
             if (bundled == null) return
             if (trusted == null) {
                 Log.w(TAG, "the bundled sync index is older than one already accepted; bundled packs skipped")
@@ -401,24 +448,46 @@ object EsyncPacks {
         return Signed(bytes, sig, parseIndex(bytes))
     }
 
-    private fun installBundled(context: Context, store: File, entry: Entry) {
+    private fun stageExtras(context: Context, store: File) {
+        try {
+            val shipped = context.assets.list("$EXTRA_ASSETS/packs")?.toSet().orEmpty()
+            if (shipped.isEmpty()) return
+            val bytes = context.assets.open("$EXTRA_ASSETS/manifest.json").use { readBounded(it, INDEX_LIMIT) }
+            val missing = parseExtras(bytes).filter {
+                "${it.id}.tzst" in shipped && !File(store, "packs/${it.id}/$COMPLETE").isFile
+            }
+            if (missing.isEmpty()) return
+            sweep(context, store)
+            for (entry in missing) installBundled(context, store, entry, "$EXTRA_ASSETS/packs", "extra")
+        } catch (t: Throwable) {
+            Log.w(TAG, "extra sync packs", t)
+        }
+    }
+
+    private fun installBundled(
+        context: Context,
+        store: File,
+        entry: Entry,
+        folder: String = "droiddeck-esync/packs",
+        source: String = "bundled",
+    ) {
         val copy = try {
             tempFile(context, entry.id)
         } catch (e: IOException) {
-            Log.w(TAG, "bundled sync pack ${entry.id}", e)
+            Log.w(TAG, "$source sync pack ${entry.id}", e)
             return
         }
         try {
-            context.assets.open("droiddeck-esync/packs/${entry.id}.tzst").use { input ->
+            context.assets.open("$folder/${entry.id}.tzst").use { input ->
                 FileOutputStream(copy).use { output -> copyBounded(input, output, entry.asset.size) }
             }
             if (install(store, entry, copy)) {
-                Log.i(TAG, "sync pack ${entry.id} installed from the app")
-                SessionEvents.record("sync.pack", mapOf("id" to entry.id, "source" to "bundled", "result" to "installed"))
+                Log.i(TAG, "sync pack ${entry.id} installed from the app ($source)")
+                SessionEvents.record("sync.pack", mapOf("id" to entry.id, "source" to source, "result" to "installed"))
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "bundled sync pack ${entry.id}", t)
-            SessionEvents.record("sync.pack", mapOf("id" to entry.id, "source" to "bundled", "result" to "failed", "reason" to t.message))
+            Log.w(TAG, "$source sync pack ${entry.id}", t)
+            SessionEvents.record("sync.pack", mapOf("id" to entry.id, "source" to source, "result" to "failed", "reason" to t.message))
         } finally {
             copy.delete()
         }
@@ -450,16 +519,17 @@ object EsyncPacks {
         try {
             val store = store(root)
             if (!store.isDirectory) return 0
-            cachedIndex(context)?.let { removeRevoked(store, it) }
+            val extras = extraIds(context)
+            cachedIndex(context)?.let { removeRevoked(store, it, extras) }
             if (!enabled(context)) return 0
             sweep(context, store)
             val toolsText = readText(File(store, TOOLS))
             val tools = toolsText?.let { parseTools(it) }.orEmpty()
             val wanted = withEpochs(readText(File(store, WANTED))?.let { parseWanted(it) }.orEmpty(), tools)
             val index = refreshIndex(context, wanted) ?: return 0
-            removeRevoked(store, index)
+            removeRevoked(store, index, extras)
             val rows = wanted + upgradeRows(store, tools)
-            if (toolsText != null) prune(store, keep(store, index, rows, tools, bundledIds(context)), System.currentTimeMillis())
+            if (toolsText != null) prune(store, keep(store, index, rows, tools, bundledIds(context) + extras), System.currentTimeMillis())
             val planned = plan(index, rows, installedIds(store))
             val state = loadState(context)
             val previous = state.optJSONObject(PACK_FAILURES)
@@ -778,8 +848,8 @@ object EsyncPacks {
         .map { it.name }
         .toSet()
 
-    internal fun removeRevoked(store: File, index: Index): List<String> {
-        val revoked = index.packs.filter { it.revoked }.map { it.id }.toSet()
+    internal fun removeRevoked(store: File, index: Index, spared: Set<String> = emptySet()): List<String> {
+        val revoked = index.packs.filter { it.revoked && it.id !in spared }.map { it.id }.toSet()
         if (revoked.isEmpty()) return emptyList()
         val packs = File(store, "packs")
         val removed = ArrayList<String>()
@@ -798,8 +868,15 @@ object EsyncPacks {
         return removed
     }
 
-    private fun bundledIds(context: Context): Set<String> =
-        context.assets.list("droiddeck-esync/packs").orEmpty().filter { it.endsWith(".tzst") }.map { it.removeSuffix(".tzst") }.toSet()
+    private fun bundledIds(context: Context): Set<String> = assetIds(context, "droiddeck-esync/packs")
+
+    private fun extraIds(context: Context): Set<String> = assetIds(context, "$EXTRA_ASSETS/packs")
+
+    private fun assetIds(context: Context, folder: String): Set<String> = try {
+        context.assets.list(folder).orEmpty().filter { it.endsWith(".tzst") }.map { it.removeSuffix(".tzst") }.toSet()
+    } catch (e: IOException) {
+        emptySet()
+    }
 
     internal fun keep(store: File, index: Index, rows: List<Wanted>, tools: List<ToolState>, bundled: Set<String>): Set<String> {
         val ids = HashSet(bundled)
