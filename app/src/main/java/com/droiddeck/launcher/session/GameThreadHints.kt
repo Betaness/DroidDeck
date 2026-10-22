@@ -109,7 +109,7 @@ object GameThreadHints {
                             " (game ${fps.toInt()} fps${if (paced) ", holding pace" else ""})")
                     }
                 }
-                session?.reportActualWorkDuration(TARGET_NS * 3 / 2)
+                session?.let { report(it) }
                 Thread.sleep(REPORT_MS)
             }
         } catch (_: InterruptedException) {
@@ -118,6 +118,34 @@ object GameThreadHints {
         } finally {
             session?.close()
         }
+    }
+
+    private val workDuration: java.lang.reflect.Constructor<*>? by lazy {
+        if (Build.VERSION.SDK_INT < 35) null else runCatching {
+            Class.forName("android.os.WorkDuration").getConstructor(
+                Long::class.javaPrimitiveType, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType, Long::class.javaPrimitiveType)
+        }.getOrNull()
+    }
+    private val reportWork: java.lang.reflect.Method? by lazy {
+        workDuration?.let { c -> runCatching {
+            PerformanceHintManager.Session::class.java.getMethod("reportActualWorkDuration", c.declaringClass)
+        }.getOrNull() }
+    }
+
+    /**
+     * Behind target on the CPU and, from API 35, on the GPU too: the GPU governor otherwise settles
+     * where a game that waits on its CPU threads keeps it ~90% busy (Duckov on the Xring O3: 520 MHz
+     * of 1248), and frames come faster when it clocks up. The reports carry no real timing.
+     */
+    private fun report(session: PerformanceHintManager.Session) {
+        val c = workDuration
+        val m = reportWork
+        if (c != null && m != null) {
+            val now = System.nanoTime()
+            val behind = TARGET_NS * 3 / 2
+            if (runCatching { m.invoke(session, c.newInstance(now - behind, behind, behind, behind)) }.isSuccess) return
+        }
+        session.reportActualWorkDuration(TARGET_NS * 3 / 2)
     }
 
     /** A new session over [tids] in place of [session]; null for none. The set changes seldom, so no setThreads. */
