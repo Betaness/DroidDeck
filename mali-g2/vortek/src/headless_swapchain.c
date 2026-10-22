@@ -49,6 +49,7 @@ typedef struct HeadlessSwapchain {
     uint8_t* owner;
     int* releaseFd;
     bool stealLogged;
+    void* ownerContext;   /* the VkContext that presented it, to clean up when that client is gone */
 } HeadlessSwapchain;
 
 enum { OWNER_FREE = 0, OWNER_APP = 1, OWNER_COMPOSITOR = 2 };
@@ -74,7 +75,14 @@ static void onRelease(uint32_t chain, uint32_t index, int fd) {
     for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) {
         HeadlessSwapchain* headless = zcChains[i];
         if (!headless) continue;
-        if (index == ZC_RELEASE_ALL) {
+        if (index == ZC_REFUSED) {
+            if (headless->chainId == chain) {
+                headless->zeroCopy = false;
+                headless->shown = false;
+                println("vortek-server: compositor refused zero-copy swapchain %u, presenting through X11", chain);
+            }
+        }
+        else if (index == ZC_RELEASE_ALL) {
             for (int j = 0; j < headless->base.imageCount; j++) releaseImageLocked(headless, j, -1);
             headless->zeroCopy = false;
             headless->shown = false;
@@ -405,11 +413,14 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
  * image to the compositor. VK_ERROR_FEATURE_NOT_PRESENT leaves the semaphores untouched so the
  * client can present through X11 instead. */
 VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t index, const VkSemaphore* waitSemaphores,
-                                          uint32_t waitCount, int32_t x, int32_t y, int32_t w, int32_t h) {
+                                          uint32_t waitCount, int32_t x, int32_t y, int32_t w, int32_t h,
+                                          uint32_t rootW, uint32_t rootH, void* context) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     if (!headless || !headless->owner || !headless->zeroCopy || index >= (uint32_t)swapchain->imageCount ||
         !vulkanWrapper.vkGetFenceFd)
         return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!ZeroCopy_accepting()) return VK_NOT_READY;
+    headless->ownerContext = context;
 
     VkExportFenceCreateInfo exportInfo = {0};
     exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO;
@@ -447,7 +458,7 @@ VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t 
     pthread_mutex_lock(&zcLock);
     headless->owner[index] = OWNER_COMPOSITOR;
     pthread_mutex_unlock(&zcLock);
-    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, fd)) {
+    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, rootW, rootH, fd)) {
         headless->shown = true;
     }
     else {
@@ -595,16 +606,25 @@ static void dumpImage(HeadlessSwapchain* headless, const char* path) {
     vulkanWrapper.vkUnmapMemory(device, headless->dumpMemory);
 }
 
+void XWindowSwapchain_presentImageIndex(XWindowSwapchain* swapchain, uint32_t index);
+
 void XWindowSwapchain_presentImage(XWindowSwapchain* swapchain) {
+    if (!swapchain) return;
+    XWindowSwapchain_presentImageIndex(swapchain, ((HeadlessSwapchain*)swapchain)->lastAcquired);
+}
+
+/* vkQueuePresentKHR, after the client presented image `index` zero-copy or through X11. */
+void XWindowSwapchain_presentImageIndex(XWindowSwapchain* swapchain, uint32_t index) {
     if (!swapchain) return;
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     headless->presentCount++;
+    if (index >= (uint32_t)swapchain->imageCount) index = headless->lastAcquired;
     if (headless->owner) {
-        /* An image the app still holds was presented through X11: free it, and take the layer down. */
+        /* Still the app's: it went through X11. Free it, and take the layer down. */
         bool hide = false;
         pthread_mutex_lock(&zcLock);
-        if (headless->owner[headless->lastAcquired] == OWNER_APP) {
-            headless->owner[headless->lastAcquired] = OWNER_FREE;
+        if (headless->owner[index] == OWNER_APP) {
+            headless->owner[index] = OWNER_FREE;
             hide = headless->shown;
             headless->shown = false;
             pthread_cond_broadcast(&zcCond);
@@ -615,11 +635,33 @@ void XWindowSwapchain_presentImage(XWindowSwapchain* swapchain) {
 
     int logEvery = envInt("VORTEK_PRESENT_LOG", 60);
     if (logEvery > 0 && (headless->presentCount == 1 || headless->presentCount % logEvery == 0))
-        println("vortek-server: present #%llu (image %u, window %d)", (unsigned long long)headless->presentCount, headless->lastAcquired, swapchain->windowId);
+        println("vortek-server: present #%llu (image %u, window %d)", (unsigned long long)headless->presentCount, index, swapchain->windowId);
 
     const char* dumpPath = getenv("VORTEK_DUMP_PPM");
     int dumpEvery = MAX(envInt("VORTEK_DUMP_EVERY", 1), 1);
     if (dumpPath && *dumpPath && headless->presentCount % dumpEvery == 0) dumpImage(headless, dumpPath);
+}
+
+/* The client's connection is gone without it destroying its swapchains: take its frames off the
+ * screen and give the compositor's buffers back. The swapchains themselves leak like the rest of
+ * the client's objects. */
+void XWindowSwapchain_forgetContext(void* context) {
+    uint32_t chains[MAX_ZERO_COPY_CHAINS];
+    int count = 0;
+    pthread_mutex_lock(&zcLock);
+    for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) {
+        HeadlessSwapchain* headless = zcChains[i];
+        if (!headless || headless->ownerContext != context) continue;
+        chains[count++] = headless->chainId;
+        headless->zeroCopy = false;
+        headless->shown = false;
+        zcChains[i] = NULL;
+    }
+    pthread_mutex_unlock(&zcLock);
+    for (int i = 0; i < count; i++) {
+        ZeroCopy_destroyChain(chains[i]);
+        println("vortek-server: client gone, zero-copy swapchain %u taken off the screen", chains[i]);
+    }
 }
 
 /* REQUEST_CODE_DD_PRESENT_ZERO_COPY, dispatched by the patched getHandleRequestFunc. */
@@ -638,7 +680,8 @@ void droiddeck_handlePresentZeroCopy(VkContext* context) {
             }
             XWindowSwapchain* swapchain = VkObject_fromId(request.swapchainId);
             result = XWindowSwapchain_presentZeroCopy(swapchain, request.imageIndex, semaphores, count,
-                                                      request.x, request.y, request.w, request.h);
+                                                      request.x, request.y, request.w, request.h,
+                                                      request.rootW, request.rootH, context);
             if (result == VK_ERROR_DEVICE_LOST) context->status = result;
         }
     }

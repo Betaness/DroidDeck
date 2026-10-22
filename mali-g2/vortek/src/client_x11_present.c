@@ -94,7 +94,7 @@ typedef struct X11Swapchain {
 
     int zeroCopy;              /* 0: try, 1: in use, -1: unavailable for this swapchain */
     xcb_window_t root, toplevel;
-    uint32_t occlusionCountdown;
+    uint32_t rootW, rootH;
     bool occluded;
 } X11Swapchain;
 
@@ -550,28 +550,36 @@ static bool rectsOverlap(int ax, int ay, int aw, int ah, int bx, int by, int bw,
 
 /* True when a mapped top-level window above ours overlaps it: then the X11 path must draw the
  * frame so that window stays visible. Checked every few frames; a query_tree is a round trip. */
-static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
+static void findToplevel(X11Swapchain* sc) {
     xcb_connection_t* conn = sc->surface->conn;
-    if (!sc->toplevel) {
-        xcb_window_t win = sc->surface->window;
-        for (int depth = 0; depth < 16; depth++) {
-            xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, win), NULL);
-            if (!tree) return true;
-            xcb_window_t parent = tree->parent, root = tree->root;
-            free(tree);
-            sc->root = root;
-            if (parent == root || parent == XCB_WINDOW_NONE) break;
-            win = parent;
-        }
-        sc->toplevel = win;
+    xcb_window_t win = sc->surface->window;
+    for (int depth = 0; depth < 16; depth++) {
+        xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, win), NULL);
+        if (!tree) break;
+        xcb_window_t parent = tree->parent, root = tree->root;
+        free(tree);
+        sc->root = root;
+        if (parent == root || parent == XCB_WINDOW_NONE) break;
+        win = parent;
     }
+    sc->toplevel = win;
+}
+
+static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* lost) {
+    xcb_connection_t* conn = sc->surface->conn;
+    *lost = false;
     xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, sc->root), NULL);
     if (!tree) return true;
     xcb_window_t* children = xcb_query_tree_children(tree);
     int count = xcb_query_tree_children_length(tree), mine = -1;
     for (int i = 0; i < count; i++) if (children[i] == sc->toplevel) mine = i;
-    bool occluded = mine < 0;
-    int above = mine >= 0 ? count - mine - 1 : 0;
+    if (mine < 0) {
+        free(tree);
+        *lost = true;
+        return true;
+    }
+    bool occluded = false;
+    int above = count - mine - 1;
     if (above > 0) {
         xcb_get_window_attributes_cookie_t attrs[above];
         xcb_get_geometry_cookie_t geos[above];
@@ -593,32 +601,61 @@ static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
     return occluded;
 }
 
-/* Returns VK_ERROR_FEATURE_NOT_PRESENT when the frame must take the X11 path (semaphores untouched). */
+/* True when a mapped top-level window above ours overlaps it: then the X11 path must draw the
+ * frame so that window stays visible. Checked on every zero-copy present (a query_tree, plus one
+ * attribute and geometry request per window above ours). */
+static bool checkOccluded(X11Swapchain* sc, int x, int y, int w, int h) {
+    if (!sc->toplevel) findToplevel(sc);
+    bool lost;
+    bool occluded = checkOccludedOnce(sc, x, y, w, h, &lost);
+    if (lost) {
+        /* Reparented since: find the top-level window again. */
+        findToplevel(sc);
+        occluded = checkOccludedOnce(sc, x, y, w, h, &lost);
+    }
+    return occluded;
+}
+
+/* VK_ERROR_FEATURE_NOT_PRESENT (never again for this swapchain) or VK_NOT_READY (not this frame):
+ * the frame must take the X11 path, the semaphores are untouched. */
 static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint32_t imageIndex,
                                 const VkSemaphore* waits, uint32_t waitCount, bool* suboptimal) {
     if (sc->zeroCopy < 0 || waitCount > 16) return VK_ERROR_FEATURE_NOT_PRESENT;
     xcb_connection_t* conn = sc->surface->conn;
     xcb_get_geometry_cookie_t geoCookie = xcb_get_geometry(conn, sc->surface->window);
     xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, geoCookie, NULL);
-    if (!geo) return VK_ERROR_SURFACE_LOST_KHR;
+    if (!geo) return VK_NOT_READY;
     xcb_translate_coordinates_reply_t* pos =
         xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, sc->surface->window, geo->root, 0, 0), NULL);
     if (!pos) {
         free(geo);
+        return VK_NOT_READY;
+    }
+    if (geo->depth == 32) {
+        /* A window with alpha (the Steam client's own UI and its popups) is composited with what
+         * lies below; the compositor's layer is opaque, so it stays on the X11 path. */
+        free(pos);
+        free(geo);
+        sc->zeroCopy = -1;
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     int x = pos->dst_x, y = pos->dst_y, w = geo->width, h = geo->height;
     *suboptimal = geo->width != sc->extent.width || geo->height != sc->extent.height;
+    xcb_window_t root = geo->root;
     free(pos);
     free(geo);
-    if (w <= 0 || h <= 0) return VK_ERROR_FEATURE_NOT_PRESENT;
-
-    if (sc->occlusionCountdown == 0) {
-        sc->occluded = checkOccluded(sc, x, y, w, h);
-        sc->occlusionCountdown = 30;
+    if (w <= 0 || h <= 0) return VK_NOT_READY;
+    if (!sc->rootW || root != sc->root) {
+        xcb_get_geometry_reply_t* rootGeo = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, root), NULL);
+        if (!rootGeo) return VK_NOT_READY;
+        sc->root = root;
+        sc->rootW = rootGeo->width;
+        sc->rootH = rootGeo->height;
+        free(rootGeo);
     }
-    sc->occlusionCountdown--;
-    if (sc->occluded) return VK_ERROR_FEATURE_NOT_PRESENT;
+
+    sc->occluded = checkOccluded(sc, x, y, w, h);
+    if (sc->occluded) return VK_NOT_READY;
 
     char payload[sizeof(DDPresentZeroCopy) + 16 * sizeof(uint64_t)];
     DDPresentZeroCopy request = {0};
@@ -628,6 +665,8 @@ static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint
     request.y = y;
     request.w = w;
     request.h = h;
+    request.rootW = sc->rootW;
+    request.rootH = sc->rootH;
     request.waitCount = waitCount;
     memcpy(payload, &request, sizeof(request));
     for (uint32_t i = 0; i < waitCount; i++) {
@@ -675,7 +714,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
             bool suboptimal = false;
             VkResult zc = presentZeroCopy(sc, presentInfo->pSwapchains[i], presentInfo->pImageIndices[i],
                                           presentInfo->pWaitSemaphores, presentInfo->waitSemaphoreCount, &suboptimal);
-            if (zc != VK_ERROR_FEATURE_NOT_PRESENT) {
+            if (zc != VK_ERROR_FEATURE_NOT_PRESENT && zc != VK_NOT_READY) {
                 if (zc == VK_SUCCESS) {
                     waitedSemaphores = true;
                     countFrame(sc);

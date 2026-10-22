@@ -19,6 +19,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int connFd = -1;
 static bool triedOnce;
 static ZeroCopyReleaseFunc releaseHandler;
+static volatile int accepting = 1;
 
 static int sendMsg(int fd, const ZeroCopyMsg* msg, int passFd) {
     struct iovec iov = {(void*)msg, sizeof(*msg)};
@@ -65,11 +66,20 @@ static void* readerThread(void* arg) {
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fence, CMSG_DATA(c), sizeof(int));
         if (r == (ssize_t)sizeof(msg) && msg.type == ZC_MSG_RELEASE && releaseHandler) {
             releaseHandler(msg.chain, msg.index, fence);
+            fence = -1;
         }
-        else if (fence >= 0) close(fence);
+        else if (r == (ssize_t)sizeof(msg) && msg.type == ZC_MSG_REFUSED && releaseHandler) {
+            releaseHandler(msg.chain, ZC_REFUSED, -1);
+        }
+        else if (r == (ssize_t)sizeof(msg) && msg.type == ZC_MSG_MODE) {
+            accepting = msg.index != 0;
+            fprintf(stderr, "vortek-server: compositor %s zero-copy presents\n", accepting ? "accepts" : "pauses");
+        }
+        if (fence >= 0) close(fence);
     }
     pthread_mutex_lock(&lock);
     if (connFd == fd) connFd = -1;
+    accepting = 1;
     pthread_mutex_unlock(&lock);
     close(fd);
     if (releaseHandler) releaseHandler(0, ZC_RELEASE_ALL, -1);
@@ -125,8 +135,14 @@ bool ZeroCopy_createChain(uint32_t chain, uint32_t width, uint32_t height, AHard
     return ok;
 }
 
-bool ZeroCopy_present(uint32_t chain, uint32_t index, int32_t x, int32_t y, int32_t w, int32_t h, int acquireFd) {
-    ZeroCopyMsg msg = {.type = ZC_MSG_PRESENT, .chain = chain, .index = index, .x = x, .y = y, .w = w, .h = h};
+bool ZeroCopy_accepting(void) {
+    return accepting != 0;
+}
+
+bool ZeroCopy_present(uint32_t chain, uint32_t index, int32_t x, int32_t y, int32_t w, int32_t h,
+                      uint32_t rootW, uint32_t rootH, int acquireFd) {
+    ZeroCopyMsg msg = {.type = ZC_MSG_PRESENT, .chain = chain, .index = index, .x = x, .y = y, .w = w, .h = h,
+                       .rootW = rootW, .rootH = rootH};
     pthread_mutex_lock(&lock);
     bool ok = connFd >= 0 && sendMsg(connFd, &msg, acquireFd) == 0;
     if (!ok) disconnectLocked();

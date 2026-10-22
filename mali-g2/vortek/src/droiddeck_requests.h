@@ -10,14 +10,16 @@
 
 #include <stdint.h>
 
-/* Payload: DDPresentZeroCopy, then waitCount uint64 semaphore ids. Reply: a VkResult, and
- * VK_ERROR_FEATURE_NOT_PRESENT means the semaphores were not touched (present through X11). */
+/* Payload: DDPresentZeroCopy, then waitCount uint64 semaphore ids. Reply: a VkResult. With
+ * VK_ERROR_FEATURE_NOT_PRESENT (never for this swapchain) or VK_NOT_READY (not this frame) the
+ * semaphores were not touched and the frame must be presented through X11. */
 #define REQUEST_CODE_DD_PRESENT_ZERO_COPY 90
 
 typedef struct DDPresentZeroCopy {
     uint64_t swapchainId;
     uint32_t imageIndex;
     int32_t x, y, w, h;
+    uint32_t rootW, rootH;
     uint32_t waitCount;
 } DDPresentZeroCopy;
 

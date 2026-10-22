@@ -261,6 +261,8 @@ static bool readFully(int fd, void* buffer, int size) {
     return true;
 }
 
+extern void XWindowSwapchain_forgetContext(void* context);
+
 static void* connectionThread(void* param) {
     int clientFd = (int)(intptr_t)param;
     VkContext* context = NULL;
@@ -292,7 +294,10 @@ static void* connectionThread(void* param) {
         }
     }
 
-    if (context) destroyVkContext(context);
+    if (context) {
+        XWindowSwapchain_forgetContext(context);
+        destroyVkContext(context);
+    }
     close(clientFd);
     fprintf(stderr, "vortek-server: connection closed (fd=%d)\n", clientFd);
     return NULL;

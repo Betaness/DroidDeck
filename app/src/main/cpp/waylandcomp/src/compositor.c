@@ -1872,6 +1872,7 @@ static void render_scene(void) {
     int fx_on = vkp_effects_active();
     int framegen = vkp_framegen_active();
     const int cardboard = vkp_cardboard_active();
+    vortek_present_set_accept(!fx_on && !framegen && !cardboard);
     struct hdr_scene hs;
     int hdr_route = hdr_plan(&dl, w, h, fx_on, framegen, &hs);
     const char *hdr_copy = NULL;

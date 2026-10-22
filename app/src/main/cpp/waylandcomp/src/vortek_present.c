@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <android/hardware_buffer.h>
 
@@ -30,8 +31,14 @@ static int g_conn_fd = -1;
 static int g_scene_w, g_scene_h;
 static unsigned g_stat_frames;
 static uint32_t g_shown_chain;
+static int32_t g_shown_rect[4];
 static int g_shown;
 static int g_first_logged;
+static int g_accept = 1;
+static struct wl_event_source *g_stall_timer;
+
+/* A game that stops presenting (blocked on a dialog, hung) must not keep covering the X windows. */
+#define VP_STALL_MS 2000
 
 /* sc_layer only compares tokens, and its completion callback may run after the chain is gone,
  * so a token encodes chain and image instead of pointing at them. */
@@ -107,6 +114,18 @@ void vortek_present_released(void *token, int release_fd) {
     send_release((uint32_t)(t >> 8) & 0xffffffffu, (uint32_t)(t & 0xff), release_fd);
 }
 
+static void send_simple(uint32_t type, uint32_t chain, uint32_t index) {
+    struct vp_msg m = {.type = type, .chain = chain, .index = index};
+    pthread_mutex_lock(&g_conn_lock);
+    if (g_conn_fd >= 0) send_msg(g_conn_fd, &m, -1);
+    pthread_mutex_unlock(&g_conn_lock);
+}
+
+static void refuse(uint32_t chain, const char *why) {
+    send_simple(VP_MSG_REFUSED, chain, 0);
+    droiddeck_log("vortek", "zero-copy refused for swapchain %u: %s", chain, why);
+}
+
 static void hide(void) {
     if (!g_shown) return;
     sc_layer_hide_vortek();
@@ -141,9 +160,11 @@ static void on_create(int fd, const struct vp_msg *m) {
         if (i < VP_MAX_IMAGES) ahb[i] = b;
         else if (b) AHardwareBuffer_release(b);
     }
-    if (!c || n == 0 || n > VP_MAX_IMAGES || !m->chain) {
+    int complete = c && n > 0 && n <= VP_MAX_IMAGES && m->chain;
+    for (uint32_t i = 0; complete && i < n; i++) complete = ahb[i] != NULL;
+    if (!complete) {
         for (uint32_t i = 0; i < n && i < VP_MAX_IMAGES; i++) if (ahb[i]) AHardwareBuffer_release(ahb[i]);
-        droiddeck_log("vortek", "zero-copy swapchain %u refused (%u images)", m->chain, n);
+        refuse(m->chain, !c ? "no free swapchain slot" : "its buffers did not arrive");
         return;
     }
     c->id = m->chain;
@@ -154,27 +175,65 @@ static void on_create(int fd, const struct vp_msg *m) {
     droiddeck_log("vortek", "zero-copy swapchain %u: %ux%u, %u AHardwareBuffers", c->id, c->w, c->h, c->n);
 }
 
+static int rects_overlap(const int32_t a[4], const struct vp_msg *m) {
+    return a[0] < m->x + m->w && m->x < a[0] + a[2] && a[1] < m->y + m->h && m->y < a[1] + a[3];
+}
+
 static void on_present(const struct vp_msg *m, int acquire_fd) {
     struct vp_chain *c = chain_of(m->chain);
-    if (!c || m->index >= c->n || !c->ahb[m->index] || g_scene_w <= 0 || g_scene_h <= 0) {
+    if (!c || m->index >= c->n || !c->ahb[m->index] || g_scene_w <= 0 || g_scene_h <= 0 || !g_accept) {
         if (acquire_fd >= 0) close(acquire_fd);
         send_release(m->chain, m->index, -1);
+        if (!c) refuse(m->chain, "unknown swapchain");
         return;
     }
+    /* One layer: a swapchain recreated for the same window takes it over, another window does not. */
+    if (g_shown && g_shown_chain != m->chain && !rects_overlap(g_shown_rect, m)) {
+        if (acquire_fd >= 0) close(acquire_fd);
+        send_release(m->chain, m->index, -1);
+        refuse(m->chain, "another window already uses the layer");
+        return;
+    }
+    int x = m->x, y = m->y, w = m->w, h = m->h;
+    if (m->root_w > 0 && m->root_h > 0 && ((int)m->root_w != g_scene_w || (int)m->root_h != g_scene_h)) {
+        const double sx = (double)g_scene_w / m->root_w, sy = (double)g_scene_h / m->root_h;
+        x = (int)(m->x * sx + 0.5); y = (int)(m->y * sy + 0.5);
+        w = (int)((m->x + m->w) * sx + 0.5) - x; h = (int)((m->y + m->h) * sy + 0.5) - y;
+    }
     int r = sc_layer_present_vortek(c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd, token_of(m->chain, m->index),
-                                    m->x, m->y, m->w, m->h, g_scene_w, g_scene_h);
+                                    x, y, w, h, g_scene_w, g_scene_h);
     if (r != 0) {
         send_release(m->chain, m->index, -1);
         return;
     }
     g_shown = 1;
     g_shown_chain = m->chain;
+    g_shown_rect[0] = m->x; g_shown_rect[1] = m->y; g_shown_rect[2] = m->w; g_shown_rect[3] = m->h;
+    if (g_stall_timer) wl_event_source_timer_update(g_stall_timer, VP_STALL_MS);
     g_stat_frames++;
     if (!g_first_logged) {
         g_first_logged = 1;
-        droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer at %d,%d %dx%d of the %dx%d scene",
-                      c->w, c->h, m->x, m->y, m->w, m->h, g_scene_w, g_scene_h);
+        droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer over the window at %d,%d %dx%d (X root %ux%u, scene %dx%d)",
+                      c->w, c->h, m->x, m->y, m->w, m->h, m->root_w, m->root_h, g_scene_w, g_scene_h);
     }
+}
+
+static int on_stall(void *data) {
+    (void)data;
+    if (g_shown) {
+        droiddeck_log("vortek", "no zero-copy frame for %d ms: showing the X windows again", VP_STALL_MS);
+        hide();
+    }
+    return 0;
+}
+
+void vortek_present_set_accept(int accept) {
+    accept = accept ? 1 : 0;
+    if (accept == g_accept) return;
+    g_accept = accept;
+    if (!accept) hide();
+    send_simple(VP_MSG_MODE, 0, (uint32_t)accept);
+    droiddeck_log("vortek", "zero-copy %s", accept ? "resumed" : "paused: screen effects, frame generation or cardboard need the composited scene");
 }
 
 static int on_conn(int fd, uint32_t mask, void *data) {
@@ -218,6 +277,7 @@ static int on_listen(int fd, uint32_t mask, void *data) {
     g_conn_fd = c;
     pthread_mutex_unlock(&g_conn_lock);
     g_conn_src = wl_event_loop_add_fd(g_loop, c, WL_EVENT_READABLE, on_conn, NULL);
+    if (!g_accept) send_simple(VP_MSG_MODE, 0, 0);
     droiddeck_log("vortek", "zero-copy presenter connected");
     return 0;
 }
@@ -239,6 +299,7 @@ void vortek_present_init(struct wl_event_loop *loop) {
     g_loop = loop;
     g_listen_fd = fd;
     g_listen_src = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE, on_listen, NULL);
+    g_stall_timer = wl_event_loop_add_timer(loop, on_stall, NULL);
 }
 
 void vortek_present_scene_size(int w, int h) {

@@ -807,14 +807,8 @@ int sc_layer_present_vortek(AHardwareBuffer *ahb, int buf_w, int buf_h, int acqu
     struct layer *l = layer_of(SC_LAYER_VORTEK);
     int r[8];
     if (!ahb || !token || w <= 0 || h <= 0 || ensure_sc(l) != 0) goto unavailable;
-    int g = layer_geometry(scene_w, scene_h, scene_w, scene_h, r);
-    if (g <= 0) goto unavailable;
-    /* r[4..7] is the whole scene on screen; place the window's rectangle inside it. */
-    const double sx = (double)(r[6] - r[4]) / scene_w, sy = (double)(r[7] - r[5]) / scene_h;
-    const int dst[4] = {r[4] + (int)(x * sx + 0.5), r[5] + (int)(y * sy + 0.5),
-                        r[4] + (int)((x + w) * sx + 0.5), r[5] + (int)((y + h) * sy + 0.5)};
-    r[0] = 0; r[1] = 0; r[2] = buf_w; r[3] = buf_h;
-    memcpy(&r[4], dst, sizeof(dst));
+    if (vkp_update_map(scene_w, scene_h) != 0) goto unavailable;
+    if (!vkp_map_window(buf_w, buf_h, x, y, w, h, scene_w, scene_h, r)) goto unavailable;
     ASurfaceTransaction *tx = api.txCreate();
     if (!tx) goto unavailable;
     ASurfaceControl *old = swap_sc_begin(l);
