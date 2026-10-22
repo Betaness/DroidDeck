@@ -24,7 +24,7 @@ Mali 设备（例如 Mali-G2 / v15，Android 17）也能在 DroidDeck 的 Linux 
 | 文件 | 作用 |
 |---|---|
 | `fetch.sh` | 拉取上游到 `work/` 并应用 `patches/` |
-| `patches/` | 对上游的修改：socket 路径可配置、X11 呈现钩子、去掉 JNI 的独立服务端钩子、Mali 上 `vkWaitForFences` 的修复 |
+| `patches/` | 对上游的修改：socket 路径可配置、X11 呈现钩子、去掉 JNI 的独立服务端钩子、Mali 上 `vkWaitForFences` 的修复、`VK_EXT_graphics_pipeline_library` 的线上结构（特性/属性、库创建信息、库句柄转换，`vortek-0008`/`winlator-0010`；服务端在链接出的管线还在时推迟销毁它用到的库，绕开 Mali 的问题；测试 `tests/gpl_test.c`） |
 | `src/standalone_main.c` | 服务端入口（代替 JNI 的 `main.c` 和 Java 的 `VortekRendererComponent`）：监听 socket、每个连接一个线程、经 `sphal` 加载厂商 HAL |
 | `src/headless_swapchain.c` | 代替依赖 Winlator X server 的 `xwindow_swapchain.c` |
 | `src/client_x11_present.c/.h` | 客户端的软件 X11 呈现（MIT-SHM / PutImage） |

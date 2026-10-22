@@ -10,6 +10,10 @@
  * features on the real driver when the extensions are requested
  * (patches/winlator-0003-enable-maintenance5-6.patch).
  *
+ * VK_EXT_graphics_pipeline_library goes over the wire (patches/vortek-0008, winlator-0010:
+ * features, properties, library create infos, library handles); this file only drops the
+ * state that the spec ignores for the library subsets a create call does not provide.
+ *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
  */
@@ -125,13 +129,72 @@ static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, V
     }
 }
 
+/* ---- VK_EXT_graphics_pipeline_library ---- */
+
+/* The spec ignores the state of a subset that a library or linking call does not provide, so
+ * those pointers/handles may dangle; the serializer would follow them. Drop them.
+ *
+ * Known gap on the server (ShaderInspector, shader_inspector.c): its SPIR-V fixes only apply
+ * to VkShaderModule objects and only see the stages of one create call, and a module is
+ * rewritten and compiled once, on its first use. So for module-based apps the cross-stage fixes
+ * (USCALED/SSCALED vertex formats, VS/FS varying sizes) are skipped for library parts, and once
+ * a module has been used in a library, later monolithic pipelines with that module do not get
+ * them either. Inline SPIR-V (DXVK) is never inspected; zink is not offered GPL. */
+static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
+    const VkGraphicsPipelineLibraryCreateInfoEXT* gpl = findInChain(info->pNext, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT);
+    const VkPipelineLibraryCreateInfoKHR* libs = findInChain(info->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR);
+    uint32_t libraryCount = libs ? libs->libraryCount : 0;
+    VkGraphicsPipelineLibraryFlagsEXT parts;
+    if (gpl) parts = gpl->flags;
+    else if ((info->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) || libraryCount) parts = 0;
+    else return; /* a complete pipeline */
+
+    bool vertexInput = parts & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+    bool preRaster = parts & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+    bool fragmentShader = parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+    bool fragmentOutput = parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+    if (!vertexInput) {
+        info->pVertexInputState = NULL;
+        info->pInputAssemblyState = NULL;
+    }
+    if (!preRaster) {
+        info->pTessellationState = NULL;
+        info->pViewportState = NULL;
+        info->pRasterizationState = NULL;
+    }
+    if (!preRaster && !fragmentShader) {
+        info->stageCount = 0;
+        info->pStages = NULL;
+        if (!libraryCount) info->layout = VK_NULL_HANDLE; /* a linked pipeline still uses its layout */
+    }
+    if (!fragmentShader) info->pDepthStencilState = NULL;
+    if (!fragmentShader && !fragmentOutput) info->pMultisampleState = NULL;
+    if (!fragmentOutput) info->pColorBlendState = NULL;
+    if (!preRaster && !fragmentShader && !fragmentOutput) {
+        /* VUID-VkGraphicsPipelineCreateInfo-flags-06643: renderPass only matters for those three */
+        info->renderPass = VK_NULL_HANDLE;
+        info->subpass = 0;
+    }
+}
+
 /* ---- 64-bit flag structs folded into the legacy fields ---- */
 
 static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* pipelines) {
+    VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
+    if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(copy, infos, count * sizeof(*copy));
+    for (uint32_t i = 0; i < count; i++) {
+        const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
+        if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
+        dropIgnoredLibraryState(&copy[i]);
+    }
     for (uint32_t i = 0; traceOn > 0 && i < count; i++) {
-        const VkGraphicsPipelineCreateInfo* g = &infos[i];
+        const VkGraphicsPipelineCreateInfo* g = &copy[i];
         traceChain("CreateGraphicsPipelines", g->pNext);
         trace("  flags 0x%x stages %u layout %p renderPass %p", g->flags, g->stageCount, (void*)g->layout, (void*)g->renderPass);
+        const VkGraphicsPipelineLibraryCreateInfoEXT* gl = findInChain(g->pNext, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT);
+        const VkPipelineLibraryCreateInfoKHR* pl = findInChain(g->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR);
+        if (gl || pl) trace("  library parts 0x%x, links %u libraries", gl ? gl->flags : 0, pl ? pl->libraryCount : 0);
         for (uint32_t s = 0; s < g->stageCount; s++) traceChain("  stage", g->pStages[s].pNext);
         if (g->pVertexInputState) {
             const VkPipelineVertexInputStateCreateInfo* v = g->pVertexInputState;
@@ -148,13 +211,6 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
         if (g->pDynamicState) { char b[512]; int n = 0; b[0] = 0; for (uint32_t d = 0; d < g->pDynamicState->dynamicStateCount && n < 480; d++) n += snprintf(b + n, sizeof(b) - n, " %d", g->pDynamicState->pDynamicStates[d]); trace("  dynamic:%s", b); }
         const VkPipelineRenderingCreateInfo* r = findInChain(g->pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
         if (r) trace("  rendering colors %u fmt0 %d depth %d stencil %d viewMask %u", r->colorAttachmentCount, r->colorAttachmentCount ? r->pColorAttachmentFormats[0] : 0, r->depthAttachmentFormat, r->stencilAttachmentFormat, r->viewMask);
-    }
-    VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
-    if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    memcpy(copy, infos, count * sizeof(*copy));
-    for (uint32_t i = 0; i < count; i++) {
-        const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
-        if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
     }
     VkResult result = vt_call_vkCreateGraphicsPipelines(device, cache, count, copy, alloc, pipelines);
     free(copy);
