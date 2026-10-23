@@ -304,6 +304,9 @@ static void relink(SavedLink* saved, int count) {
 
 /* ---- feature / property queries ---- */
 
+/* Set by dd_vkCreateInstance: the application is vkd3d-proton (D3D12). */
+static bool engineIsVkd3d;
+
 static void dd_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures) {
     traceChain("GetPhysicalDeviceFeatures2", pFeatures->pNext);
     SavedLink saved[64];
@@ -324,6 +327,18 @@ static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, V
                                  sizeof(knownPropertyStructs) / sizeof(knownPropertyStructs[0]), saved, 64);
     vt_call_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
     relink(saved, unlinked);
+    /* vkd3d-proton refuses a device without single-texel alignment for storage texel buffers; the
+     * Mali asks for 64-byte offsets. D3D12 games create typed UAV buffer views at element offsets
+     * that are aligned in practice, so vkd3d-proton (only) is told the Mali has it, as other Mali
+     * Windows emulators do. VORTEK_STRICT_TEXEL_ALIGNMENT=1 reports the driver's value. */
+    const char* strict = getenv("VORTEK_STRICT_TEXEL_ALIGNMENT");
+    if (engineIsVkd3d && !(strict && *strict == '1')) {
+        VkPhysicalDeviceVulkan13Properties* p13 = findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES);
+        if (p13) p13->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+        VkPhysicalDeviceTexelBufferAlignmentProperties* tba =
+            findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES);
+        if (tba) tba->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+    }
     VkPhysicalDeviceLayeredApiPropertiesListKHR* layered =
         findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_PROPERTIES_LIST_KHR);
     if (layered) layered->layeredApiCount = 0;
@@ -821,6 +836,8 @@ static VkResult dd_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice pd, con
  * Mali's 175; that list holds zink's OpenGL at 3.2 and turns dynamic state off). */
 VkResult vt_call_vkCreateInstance(const VkInstanceCreateInfo*, const VkAllocationCallbacks*, VkInstance*);
 static VkResult dd_vkCreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* instance) {
+    if (ci->pApplicationInfo && ci->pApplicationInfo->pEngineName &&
+        !strcmp(ci->pApplicationInfo->pEngineName, "vkd3d")) engineIsVkd3d = true;
     const char* all = getenv("VORTEK_ZINK_ALL_EXTENSIONS");
     if (all && *all == '1' && ci->pApplicationInfo && ci->pApplicationInfo->pEngineName &&
         !strcmp(ci->pApplicationInfo->pEngineName, "mesa zink")) {
