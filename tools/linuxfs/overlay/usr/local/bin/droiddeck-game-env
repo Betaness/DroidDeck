@@ -302,14 +302,18 @@ def force_ssbs(command, env):
 
 def dxvk_frame_rate_set(command, env):
     """Whether the game's DXVK configuration (DXVK_CONFIG, or the dxvk.conf it reads) has a frame rate
-    limit of its own; DXVK_FRAME_RATE would override it."""
+    limit of its own; the app's limit would override it."""
     texts = [env.get("DXVK_CONFIG", "").replace(";", "\n")]
-    conf = env.get("DXVK_CONFIG_FILE") or os.path.join(os.path.dirname(command[2]), "dxvk.conf")
-    try:
-        with open(conf, encoding="utf-8", errors="replace") as source:
-            texts.append(source.read(65536))
-    except OSError:
-        pass
+    # DXVK reads $DXVK_CONFIG_FILE, else dxvk.conf in its working directory (the game's, as this execs
+    # Proton); the one beside the executable is where players usually put it.
+    confs = ([env["DXVK_CONFIG_FILE"]] if env.get("DXVK_CONFIG_FILE")
+             else ["dxvk.conf", os.path.join(os.path.dirname(command[2]), "dxvk.conf")])
+    for conf in confs:
+        try:
+            with open(conf, encoding="utf-8", errors="replace") as source:
+                texts.append(source.read(65536))
+        except OSError:
+            pass
     return any(re.match(r"(?:[\w.]+\.)?maxFrameRate\s*=", line.strip())
                for text in texts for line in text.splitlines())
 
@@ -329,8 +333,15 @@ def frame_rate_limit(command, env):
         names.remove("DXVK_FRAME_RATE")
     if not names:
         return env
+    result = dict(env, **{name: fps for name in names})
+    if "DXVK_FRAME_RATE" in names:
+        # DXVK 3 dropped DXVK_FRAME_RATE for this option (2.x ignores the option, 3 the variable).
+        own = env.get("DXVK_CONFIG", "").strip().rstrip(";").strip()
+        limit = "dxvk.maxFrameRate = " + fps
+        result["DXVK_CONFIG"] = own + "; " + limit if own else limit
+        names.append("DXVK_CONFIG " + limit)
     print("droiddeck-game-env: frame rate limit %s (%s)" % (fps, ", ".join(names)), file=sys.stderr)
-    return dict(env, **{name: fps for name in names})
+    return result
 
 
 EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
