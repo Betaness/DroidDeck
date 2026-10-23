@@ -326,6 +326,9 @@ if [ -z "${BL_INSIDE:-}" ]; then
     if [ "$_bl_gl" = zink ]; then
       unset LIBGL_ALWAYS_SOFTWARE
       export MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=true BL_VORTEK_ZINK=1
+      # Swap interval stays 1: Chromium switches it between 0 and 1 as pages change, and zink then
+      # recreates the swapchain each time (three new screen-sized buffers: a visible hitch).
+      export vblank_mode=${vblank_mode:-3}
       echo "== vortek: OpenGL on the GPU (zink over Vortek)"
     else
       unset MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2 BL_VORTEK_ZINK

@@ -130,6 +130,8 @@ typedef struct X11Swapchain {
     pthread_mutex_t presentLock;
 } X11Swapchain;
 
+enum { PATH_ZERO_COPY = 1, PATH_COVERED, PATH_OCCLUDED, PATH_X11 };
+
 /* Every X11Swapchain of this process, to tell which windows are on compositor layers. */
 #define MAX_TRACKED_SWAPCHAINS 64
 static pthread_mutex_t registryLock = PTHREAD_MUTEX_INITIALIZER;
@@ -665,13 +667,18 @@ static bool rectContains(int ox, int oy, int ow, int oh, int x, int y, int w, in
 
 /* Whether another window of this process shows its frames on a compositor layer that covers all of
  * `win` (at ox,oy ow x oh in root coordinates): `win` is that window or one of its ancestors. That
- * window is stacked above ours (it is `win` or inside it), so its layer is above ours too. */
+ * window is stacked above ours (it is `win` or inside it), so its layer is above ours too. A window
+ * that was on a layer before and is mapped again (Steam's menu reopening) counts already: its next
+ * frame goes zero-copy, and until then ours would otherwise take the X11 path for a frame or two. */
 static bool coveredByOwnLayer(X11Swapchain* sc, xcb_window_t win, int ox, int oy, int ow, int oh) {
     bool found = false;
     pthread_mutex_lock(&registryLock);
     for (int i = 0; i < MAX_TRACKED_SWAPCHAINS && !found; i++) {
         X11Swapchain* other = registry[i];
-        if (!other || other == sc || !other->pub.shown) continue;
+        if (!other || other == sc || other->pub.chainLength == 0) continue;
+        /* Not on a layer now: only a window that was hidden (not one drawn through X11) comes back on one. */
+        if (!other->pub.shown && (other->zeroCopy != 1 || other->lastPath == PATH_OCCLUDED || other->lastPath == PATH_X11))
+            continue;
         /* Stacking keys only tell the four root-most levels apart: deeper, the layers' order is unsure. */
         if (sc->chainLength > 4 || other->pub.chainLength > 4) continue;
         if (!rectContains(other->pub.rect[0], other->pub.rect[1], other->pub.rect[2], other->pub.rect[3], ox, oy, ow, oh))
@@ -917,8 +924,6 @@ static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint
     pthread_mutex_unlock(&sc->presentLock);
     return result;
 }
-
-enum { PATH_ZERO_COPY = 1, PATH_COVERED, PATH_OCCLUDED, PATH_X11 };
 
 static void notePath(X11Swapchain* sc, int path) {
     if (path == sc->lastPath) return;
