@@ -190,7 +190,8 @@ static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
  * nothing, as with the device's limits of 0. VORTEK_KEEP_CLIP_DISTANCE=1 keeps the shaders as they are. */
 enum { OpNop = 0, OpTypeStruct = 30, OpTypePointer = 32, OpConstant = 43, OpVariable = 59, OpStore = 62,
        OpAccessChain = 65, OpInBoundsAccessChain = 66, OpDecorate = 71, OpMemberDecorate = 72,
-       OpCopyObject = 83, DecBuiltIn = 11, BuiltInClipDistance = 3, BuiltInCullDistance = 4 };
+       OpCopyObject = 83, OpFunction = 54, OpLoad = 61, OpExtInst = 12, OpSwitch = 251, OpLine = 8, OpNoLine = 317,
+       OpName = 5, DecBuiltIn = 11, BuiltInClipDistance = 3, BuiltInCullDistance = 4 };
 
 typedef struct { uint32_t structId, member; } Member;
 
@@ -221,7 +222,8 @@ static uint32_t* dd_strip_clip_cull(const uint32_t* code, size_t words, size_t* 
     uint32_t* varStruct = calloc(bound, 4);    /* variable -> pointee struct type */
     uint8_t* tainted = calloc(bound, 1);       /* pointer into a clip/cull member */
     uint32_t* uses = calloc(bound, 4);
-    if (!w || !constVal || !pointee || !varStruct || !tainted || !uses) goto fail;
+    uint8_t* removed = calloc(bound, 1);
+    if (!w || !constVal || !pointee || !varStruct || !tainted || !uses || !removed) goto fail;
     memcpy(w, code, words * 4);
     for (int v = 0; v < nvars; v++) if (vars[v] < bound) tainted[vars[v]] = 1;
 
@@ -250,35 +252,53 @@ static uint32_t* dd_strip_clip_cull(const uint32_t* code, size_t words, size_t* 
             changed = 1;
         }
     }
-    /* the access chains (and copies) that fed only those stores */
+    /* the access chains (and copies) that fed only those stores: counted as uses are the id
+     * operands of instructions inside functions (literal operands are skipped, a literal equal to
+     * a chain's id would keep the chain, and a chain left pointing at the built-in still crashes) */
     for (int again = 1; again;) {
         again = 0;
         memset(uses, 0, bound * 4);
+        int inFunction = 0;
         for (size_t i = 5; i < words; i += w[i] >> 16) {
             uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
-            if (op == OpNop) continue;
-            /* operands: every word after the opcode may be an id; the result id of the chain itself
-             * is counted once too, hence "uses <= 1" below */
-            for (uint32_t j = 1; j < n; j++) if (w[i + j] < bound) uses[w[i + j]]++;
+            if (op == OpFunction) inFunction = 1;
+            if (!inFunction || op == OpNop || op == OpLine || op == OpNoLine) continue;
+            uint32_t first = 1, last = n;                      /* operand words [first, last) to count */
+            if (op == OpLoad) { first = 3; last = n < 4 ? n : 4; }
+            else if (op == OpStore) { first = 1; last = n < 3 ? n : 3; }
+            else if (op == OpExtInst) { first = 3; }           /* word 4 (instruction number) skipped below */
+            else if (op == OpSwitch) { first = 1; last = n < 3 ? n : 3; }
+            else if (op == OpAccessChain || op == OpInBoundsAccessChain || op == OpCopyObject) first = 3;
+            for (uint32_t j = first; j < last; j++) {
+                if (op == OpExtInst && j == 4) continue;
+                if (w[i + j] < bound) uses[w[i + j]]++;
+            }
+            if (op == OpSwitch) for (uint32_t j = 4; j < n; j += 2) if (w[i + j] < bound) uses[w[i + j]]++;  /* labels */
         }
         for (size_t i = 5; i < words; i += w[i] >> 16) {
             uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
             if ((op == OpAccessChain || op == OpInBoundsAccessChain || op == OpCopyObject) && n >= 4 &&
-                w[i + 2] < bound && tainted[w[i + 2]] && uses[w[i + 2]] <= 1) {
+                w[i + 2] < bound && tainted[w[i + 2]] && uses[w[i + 2]] == 0) {
+                removed[w[i + 2]] = 1;
                 for (uint32_t j = 0; j < n; j++) w[i + j] = (1u << 16) | OpNop;
-                again = 1;
+                again = changed = 1;
             }
         }
     }
-    free(constVal); free(pointee); free(varStruct); free(tainted); free(uses);
+    /* decorations of removed ids (NonUniform and the like) would name ids that no longer exist */
+    for (size_t i = 5; i < words; i += w[i] >> 16) {
+        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if ((op == OpDecorate || op == OpName) && n >= 2 && w[i + 1] < bound && removed[w[i + 1]])
+            for (uint32_t j = 0; j < n; j++) w[i + j] = (1u << 16) | OpNop;
+    }
+    free(constVal); free(pointee); free(varStruct); free(tainted); free(uses); free(removed);
     if (!changed) { free(w); return NULL; }
     *outWords = words;
     return w;
 fail:
-    free(w); free(constVal); free(pointee); free(varStruct); free(tainted); free(uses);
+    free(w); free(constVal); free(pointee); free(varStruct); free(tainted); free(uses); free(removed);
     return NULL;
 }
-
 
 static bool clipStripOn(void) {
     static int on = -1;
