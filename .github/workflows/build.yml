@@ -129,6 +129,8 @@ jobs:
           persist-credentials: false
 
       - name: Check human authorship
+        # [mali-g2] Upstream only: fork commits carry Co-Authored-By trailers and the old bot-authored history.
+        if: github.repository == 'Droid-Deck/DroidDeck'
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}

@@ -24,6 +24,8 @@ permissions:
 jobs:
   validate:
     name: Build APK
+    # [mali-g2] Upstream only, as the authorship step in build.yml.
+    if: github.repository == 'Droid-Deck/DroidDeck'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
