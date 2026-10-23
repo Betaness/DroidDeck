@@ -23,6 +23,15 @@ int install_handler(int sig, void (*fn)(int, siginfo_t *, void *), void **seen) 
   *seen = (void *)old.sa_sigaction;
   return 0;
 }
+
+int install_oneshot(int sig, void (*fn)(int, siginfo_t *, void *)) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = fn;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_RESETHAND;
+  sigemptyset(&sa.sa_mask);
+  return sigaction(sig, &sa, NULL);
+}
 """
 
 PROGRAM = r"""
@@ -63,6 +72,7 @@ struct wait_args { uint64_t timeout, objs; uint32_t count, index, flags, owner, 
 #define NT_EVENT_READ _IOR('N', 0x8d, struct event_args)
 
 int install_handler(int sig, void (*fn)(int, siginfo_t *, void *), void **seen);
+int install_oneshot(int sig, void (*fn)(int, siginfo_t *, void *));
 
 static int dev, fails;
 #define CHECK(name, cond) do { if (!(cond)) { printf("FAIL %s line %d errno %d\n", name, __LINE__, errno); fails++; } } while (0)
@@ -423,6 +433,32 @@ static void bursts(void) {
   close(busy_obj);
 }
 
+static volatile int oneshot_count;
+static void oneshot(int sig, siginfo_t *si, void *uc) {
+  (void)sig; (void)si; (void)uc;
+  __atomic_add_fetch(&oneshot_count, 1, __ATOMIC_RELAXED);
+}
+
+static void oneshots(void) {
+  busy_obj = event(0, 0);
+  pthread_t w;
+  stop_worker = 0;
+  oneshot_count = 0;
+  pthread_create(&w, NULL, worker, NULL);
+  int fired = 0;
+  for (int i = 0; i < 300; i++) {
+    if (install_oneshot(SIGWINCH, oneshot) != 0) break;
+    int before = __atomic_load_n(&oneshot_count, __ATOMIC_RELAXED);
+    pthread_kill(w, SIGWINCH);
+    fired++;
+    for (int j = 0; j < 2000 && __atomic_load_n(&oneshot_count, __ATOMIC_RELAXED) == before; j++) usleep(50);
+  }
+  stop_worker = 1;
+  pthread_join(w, NULL);
+  CHECK("oneshot_handlers_run", oneshot_count == fired && fired == 300);
+  close(busy_obj);
+}
+
 static int outer_obj, inner_obj, other_dev, other_obj;
 static volatile int nested_ok, nested_done, outer_done;
 static void nesting(int sig, siginfo_t *si, void *uc) {
@@ -495,6 +531,7 @@ int main(void) {
   stress();
   signals();
   bursts();
+  oneshots();
   nested_waits();
   printf("done fails=%d\n", fails);
   return fails != 0;

@@ -260,14 +260,16 @@ static void ns_unlock(uint32_t *w) {
 }
 
 #define NS_DEFER 4
+#define NS_LEVELS 8
 
 struct ns_cs {
   int depth;
   int count;
-  int nheld;
+  int level;
+  unsigned held_levels;
   int sigs[NS_DEFER];
   siginfo_t info[NS_DEFER];
-  sigset_t held;
+  sigset_t held[NS_LEVELS];
 };
 
 static __thread struct ns_cs ns_cs;
@@ -284,17 +286,23 @@ static int ns_deferrable(int sig) {
 static int ns_defer(int sig, const siginfo_t *si) {
   struct ns_cs *cs = &ns_cs;
   if (sig < SIGRTMIN)
-    for (int i = 0; i < cs->count; i++)
-      if (cs->sigs[i] == sig) return 1;
-  if (cs->count >= NS_DEFER) return 0;
-  cs->sigs[cs->count] = sig;
-  if (si) memcpy(&cs->info[cs->count], si, sizeof(*si));
-  else memset(&cs->info[cs->count], 0, sizeof(*si));
-  cs->count++;
+    for (int i = 0; i < NS_DEFER; i++)
+      if (__atomic_load_n(&cs->sigs[i], __ATOMIC_RELAXED) == sig) return 1;
+  int i = __atomic_fetch_add(&cs->count, 1, __ATOMIC_RELAXED);
+  if (i >= NS_DEFER) {
+    __atomic_fetch_sub(&cs->count, 1, __ATOMIC_RELAXED);
+    return 0;
+  }
+  if (si) memcpy(&cs->info[i], si, sizeof(*si));
+  else memset(&cs->info[i], 0, sizeof(*si));
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  __atomic_store_n(&cs->sigs[i], sig, __ATOMIC_RELAXED);
   return 1;
 }
 
 static int ns_park(int sig, const siginfo_t *si, ucontext_t *uc) {
+  int level = ns_cs.level;
+  if (level < 0 || level >= NS_LEVELS) return 0;
   sigset_t one;
   sigemptyset(&one);
   sigaddset(&one, sig);
@@ -306,9 +314,10 @@ static int ns_park(int sig, const siginfo_t *si, ucontext_t *uc) {
   errno = saved;
   if (!ok) return 0;
   sigaddset(&uc->uc_sigmask, sig);
-  if (!ns_cs.nheld) sigemptyset(&ns_cs.held);
-  sigaddset(&ns_cs.held, sig);
-  ns_cs.nheld = 1;
+  unsigned long *words = (unsigned long *)&ns_cs.held[level];
+  unsigned bits = 8 * sizeof(unsigned long);
+  __atomic_fetch_or(&words[(unsigned)(sig - 1) / bits], 1ul << ((unsigned)(sig - 1) % bits), __ATOMIC_RELAXED);
+  __atomic_fetch_or(&ns_cs.held_levels, 1u << level, __ATOMIC_RELAXED);
   return 1;
 }
 
@@ -316,21 +325,34 @@ static void ns_trampoline(int sig, siginfo_t *si, void *uc) {
   if (__atomic_load_n(&ns_cs.depth, __ATOMIC_RELAXED) > 0 && (ns_defer(sig, si) || (uc && ns_park(sig, si, uc)))) return;
   uintptr_t h = __atomic_load_n(&ns_handlers[sig], __ATOMIC_ACQUIRE);
   if (!h) return;
+  ns_cs.level++;
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
   if (__atomic_load_n(&ns_siginfo[sig], __ATOMIC_RELAXED)) ((void (*)(int, siginfo_t *, void *))h)(sig, si, uc);
   else ((void (*)(int))h)(sig);
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  ns_cs.level--;
 }
 
 static void ns_flush(void) {
   struct ns_cs *cs = &ns_cs;
-  int n = cs->count, sigs[NS_DEFER];
-  siginfo_t info[NS_DEFER];
-  memcpy(sigs, cs->sigs, sizeof(sigs));
-  memcpy(info, cs->info, sizeof(info));
-  cs->count = 0;
+  sigset_t all, mask;
+  sigfillset(&all);
   int saved = errno;
+  pthread_sigmask(SIG_BLOCK, &all, &mask);
+  int n = cs->count < NS_DEFER ? cs->count : NS_DEFER;
   pid_t pid = getpid(), tid = (pid_t)ns_self();
   for (int i = 0; i < n; i++)
-    if (syscall(SYS_rt_tgsigqueueinfo, pid, tid, sigs[i], &info[i]) != 0) syscall(SYS_tgkill, pid, tid, sigs[i]);
+    if (cs->sigs[i] > 0 && syscall(SYS_rt_tgsigqueueinfo, pid, tid, cs->sigs[i], &cs->info[i]) != 0) syscall(SYS_tgkill, pid, tid, cs->sigs[i]);
+  memset(cs->sigs, 0, sizeof(cs->sigs));
+  cs->count = 0;
+  int level = cs->level;
+  if (level >= 0 && level < NS_LEVELS && (cs->held_levels & (1u << level))) {
+    for (int sig = 1; sig < _NSIG; sig++)
+      if (sigismember(&cs->held[level], sig) == 1) sigdelset(&mask, sig);
+    sigemptyset(&cs->held[level]);
+    cs->held_levels &= ~(1u << level);
+  }
+  pthread_sigmask(SIG_SETMASK, &mask, NULL);
   errno = saved;
 }
 
@@ -343,19 +365,8 @@ static void ns_restore(void) {
   __atomic_signal_fence(__ATOMIC_SEQ_CST);
   if (--ns_cs.depth == 0) {
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    int nheld = ns_cs.nheld;
-    sigset_t held;
-    if (nheld) {
-      held = ns_cs.held;
-      ns_cs.nheld = 0;
-      __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    }
-    if (ns_cs.count) ns_flush();
-    if (nheld) {
-      int saved = errno;
-      pthread_sigmask(SIG_UNBLOCK, &held, NULL);
-      errno = saved;
-    }
+    if (ns_cs.count || (ns_cs.held_levels && ns_cs.level >= 0 && ns_cs.level < NS_LEVELS && (ns_cs.held_levels & (1u << ns_cs.level))))
+      ns_flush();
   }
 }
 
@@ -371,7 +382,8 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
   uint8_t prev_info = __atomic_load_n(&ns_siginfo[sig], __ATOMIC_RELAXED);
   struct sigaction mine;
   const struct sigaction *use = act;
-  if (act && act->sa_handler != SIG_DFL && act->sa_handler != SIG_IGN && bl_from_ntdll(__builtin_return_address(0))) {
+  if (act && act->sa_handler != SIG_DFL && act->sa_handler != SIG_IGN && !(act->sa_flags & SA_RESETHAND) &&
+      bl_from_ntdll(__builtin_return_address(0))) {
     mine = *act;
     mine.sa_sigaction = ns_trampoline;
     mine.sa_flags |= SA_SIGINFO;
