@@ -1,3 +1,4 @@
+# Also built in the private Betaness/DroidDeck-G2-build (Actions were disabled on the public fork).
 name: Build APK
 run-name: ${{ github.event_name == 'pull_request' && format('building pr {0} on {1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('building {0} on {1}', github.ref_name, github.sha) }}
 
