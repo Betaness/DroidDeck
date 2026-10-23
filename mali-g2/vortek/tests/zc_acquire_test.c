@@ -97,7 +97,7 @@ int main(void) {
         printf("FAIL no X display\n");
         return 1;
     }
-    Window win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0, 640, 360, 0, 0, 0);
+    Window win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0, envInt("ZC_W", 640), envInt("ZC_H", 360), 0, 0, 0);
     XMapWindow(dpy, win);
     XSync(dpy, False);
 
