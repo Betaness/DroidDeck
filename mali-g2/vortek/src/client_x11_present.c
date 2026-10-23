@@ -35,6 +35,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -108,6 +109,8 @@ typedef struct X11Swapchain {
     int chainLength;
     xcb_window_t chain[16];
     int16_t chainX[16], chainY[16];
+    /* where the ancestors let the window show, in root coordinates: their rectangles intersected */
+    int32_t clipX0, clipY0, clipX1, clipY1;
     uint32_t chainAge;
     /* what kept the last frame off the zero-copy layer, logged when it changes */
     xcb_window_t blocker;
@@ -647,6 +650,8 @@ static bool findAncestors(X11Swapchain* sc) {
         if (parent == sc->root || parent == XCB_WINDOW_NONE) break;
         win = parent;
     }
+    sc->clipX0 = sc->clipY0 = INT32_MIN;
+    sc->clipX1 = sc->clipY1 = INT32_MAX;
     for (int i = 0; i < sc->chainLength; i++) {
         xcb_window_t parent = i + 1 < sc->chainLength ? sc->chain[i + 1] : sc->root;
         xcb_translate_coordinates_reply_t* pos =
@@ -655,6 +660,15 @@ static bool findAncestors(X11Swapchain* sc) {
         sc->chainX[i] = pos->dst_x;   /* origin of chain[i]'s parent */
         sc->chainY[i] = pos->dst_y;
         free(pos);
+        if (i + 1 < sc->chainLength) {
+            xcb_get_geometry_reply_t* g = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, parent), NULL);
+            if (!g) return false;
+            if (sc->chainX[i] > sc->clipX0) sc->clipX0 = sc->chainX[i];
+            if (sc->chainY[i] > sc->clipY0) sc->clipY0 = sc->chainY[i];
+            if (sc->chainX[i] + g->width < sc->clipX1) sc->clipX1 = sc->chainX[i] + g->width;
+            if (sc->chainY[i] + g->height < sc->clipY1) sc->clipY1 = sc->chainY[i] + g->height;
+            free(g);
+        }
     }
     sc->chainAge = 0;
     return true;
@@ -932,6 +946,14 @@ static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain
     /* Fully covered (also by a window of ours on a layer above): paced on the covered path. */
     sc->occluded = checkOccluded(sc, x, y, w, h) || sc->covered;
     if (sc->occluded) return VK_NOT_READY;
+    /* A parent smaller than the window clips it. Wine puts a game's Vulkan window in a 1x1 parent
+     * when it shows the frames elsewhere (A.V.A.: a 1024x768 client window at 0,0, its frames scaled
+     * into the 846x536 game window in the middle): a layer at 0,0 showed them in the wrong place,
+     * over a black game window that took the clicks. The X11 path lets Wine copy them. */
+    if (x < sc->clipX0 || y < sc->clipY0 || x + w > sc->clipX1 || y + h > sc->clipY1) {
+        sc->x11Why = "a smaller parent window clips it (Wine shows its frames in another window)";
+        return VK_NOT_READY;
+    }
 
     char payload[sizeof(DDPresentZeroCopy) + 18 * sizeof(uint64_t)];
     DDPresentZeroCopy request = {0};
