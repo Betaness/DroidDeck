@@ -38,6 +38,7 @@ class App : Application() {
             override fun onActivityDestroyed(activity: android.app.Activity) {}
         })
         com.droiddeck.launcher.session.QuestExperimental.initialize(this)
+        com.droiddeck.launcher.session.SessionPrefs.applyNtsyncDefault(this)
         com.droiddeck.launcher.session.SessionPrefs.settleGpuDriverMode(this)
         com.droiddeck.launcher.update.AppUpdates.init(this)
         com.droiddeck.launcher.core.DownloadSource.init(this)
