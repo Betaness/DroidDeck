@@ -76,6 +76,7 @@ typedef struct HeadlessSwapchain {
     double lastPresentTime;
     double frameInterval;
     bool slowAcquireLogged;
+    bool declineLogged;
 } HeadlessSwapchain;
 
 enum { OWNER_FREE = 0, OWNER_APP = 1, OWNER_COMPOSITOR = 2 };
@@ -690,8 +691,16 @@ VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t 
                                           uint32_t rootW, uint32_t rootH, void* context) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     if (!headless || !headless->owner || !headless->zeroCopy || index >= (uint32_t)swapchain->imageCount ||
-        !vulkanWrapper.vkGetFenceFd)
+        !vulkanWrapper.vkGetFenceFd) {
+        if (headless && !headless->declineLogged) {
+            headless->declineLogged = true;
+            println("vortek-server: swapchain %ux%u presents through X11: %s", swapchain->imageExtent.width,
+                    swapchain->imageExtent.height,
+                    !headless->owner ? "not registered for zero-copy (no AHardwareBuffers or no free slot)"
+                    : !headless->zeroCopy ? "zero-copy was turned off for it" : "no sync fd export");
+        }
         return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
     if (!ZeroCopy_accepting()) return VK_NOT_READY;
     if (!announceChain(headless)) return VK_ERROR_FEATURE_NOT_PRESENT;
     headless->ownerContext = context;

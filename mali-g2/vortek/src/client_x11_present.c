@@ -104,6 +104,10 @@ typedef struct X11Swapchain {
     xcb_window_t chain[16];
     int16_t chainX[16], chainY[16];
     uint32_t chainAge;
+    /* what kept the last frame off the zero-copy layer, logged when it changes */
+    xcb_window_t blocker;
+    int16_t blockerRect[4];
+    int lastPath;
 } X11Swapchain;
 
 static struct {
@@ -640,6 +644,7 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
     if (!ok || *stale) return true;
 
     bool occluded = *covered;
+    sc->blocker = XCB_NONE;
     if (total > 0) {
         xcb_get_window_attributes_cookie_t attrs[total];
         xcb_get_geometry_cookie_t geos[total];
@@ -650,10 +655,20 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
         for (int k = 0; k < total; k++) {
             xcb_get_window_attributes_reply_t* a = xcb_get_window_attributes_reply(conn, attrs[k], NULL);
             xcb_get_geometry_reply_t* g = xcb_get_geometry_reply(conn, geos[k], NULL);
-            if (a && g && a->map_state == XCB_MAP_STATE_VIEWABLE) {
+            /* Input-only windows draw nothing; a 1x1 window (wine and Chromium keep such helpers
+             * mapped) would cost a whole-screen copy per frame to show one pixel. */
+            if (a && g && a->map_state == XCB_MAP_STATE_VIEWABLE && a->_class != XCB_WINDOW_CLASS_INPUT_ONLY &&
+                (g->width > 1 || g->height > 1)) {
                 int ox = originX[k] + g->x, oy = originY[k] + g->y;
                 int ow = g->width + 2 * g->border_width, oh = g->height + 2 * g->border_width;
-                if (rectsOverlap(x, y, w, h, ox, oy, ow, oh)) occluded = true;
+                if (rectsOverlap(x, y, w, h, ox, oy, ow, oh)) {
+                    if (!occluded) {
+                        sc->blocker = candidates[k];
+                        sc->blockerRect[0] = (int16_t)ox; sc->blockerRect[1] = (int16_t)oy;
+                        sc->blockerRect[2] = (int16_t)ow; sc->blockerRect[3] = (int16_t)oh;
+                    }
+                    occluded = true;
+                }
                 if (rectContains(ox, oy, ow, oh, x, y, w, h)) *covered = true;
             }
             free(a);
@@ -801,6 +816,24 @@ static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint
     return result;
 }
 
+enum { PATH_ZERO_COPY = 1, PATH_COVERED, PATH_OCCLUDED, PATH_X11 };
+
+static void notePath(X11Swapchain* sc, int path) {
+    if (path == sc->lastPath) return;
+    sc->lastPath = path;
+    const char* what = path == PATH_ZERO_COPY ? "zero-copy"
+                     : path == PATH_COVERED   ? "hidden, frames paced"
+                     : path == PATH_OCCLUDED  ? "through X11, partly covered"
+                                              : "through X11, the compositor's layer is not available";
+    if (path == PATH_OCCLUDED && sc->blocker)
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s by 0x%x at %d,%d %dx%d\n", sc->surface->window,
+                sc->extent.width, sc->extent.height, what, sc->blocker, sc->blockerRect[0], sc->blockerRect[1],
+                sc->blockerRect[2], sc->blockerRect[3]);
+    else
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s\n", sc->surface->window, sc->extent.width,
+                sc->extent.height, what);
+}
+
 static void countFrame(X11Swapchain* sc) {
     sc->frames++;
     sc->statFrames++;
@@ -832,6 +865,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
             if (zc != VK_ERROR_FEATURE_NOT_PRESENT && zc != VK_NOT_READY) {
                 if (zc == VK_SUCCESS) {
                     waitedSemaphores = true;
+                    notePath(sc, PATH_ZERO_COPY);
                     countFrame(sc);
                     if (suboptimal) zc = VK_SUBOPTIMAL_KHR;
                 }
@@ -856,6 +890,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
                 if (sc->zeroCopy < 0) updateCoverage(sc);
                 if (sc->covered) {
                     result = presentCovered(sc, queue, presentInfo, &waitedSemaphores);
+                    notePath(sc, PATH_COVERED);
                     countFrame(sc);
                     if (results) results[i] = result;
                     if (result < 0 || (overall == VK_SUCCESS && result != VK_SUCCESS)) {
@@ -898,6 +933,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
                     vk.InvalidateMappedMemoryRanges(sc->device, 1, &range);
                 }
                 putFrame(sc, geometry->depth);
+                notePath(sc, sc->zeroCopy >= 0 && sc->occluded ? PATH_OCCLUDED : PATH_X11);
                 if (geometry->width != sc->extent.width || geometry->height != sc->extent.height) result = VK_SUBOPTIMAL_KHR;
             }
             free(geometry);
