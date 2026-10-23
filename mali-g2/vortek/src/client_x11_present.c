@@ -103,6 +103,7 @@ typedef struct X11Swapchain {
     bool covered;              /* nothing of the window is visible: frames are dropped, paced */
     uint32_t coverCountdown;
     double lastCoveredFrame;
+    uint32_t rootOrder;        /* the root's children when coverage was last checked (hashed), 0: unknown */
     /* the window's ancestors up to the root and their origins in root coordinates */
     int chainLength;
     xcb_window_t chain[16];
@@ -697,6 +698,16 @@ static bool coveredByOwnLayer(X11Swapchain* sc, xcb_window_t win, int ox, int oy
     return found;
 }
 
+/* The root's children in stacking order, hashed: a top-level window raised, lowered, created or
+ * destroyed changes it (mapping does not: query_tree lists unmapped windows too). Never 0. */
+static uint32_t rootOrderOf(const xcb_query_tree_reply_t* tree) {
+    const xcb_window_t* children = xcb_query_tree_children(tree);
+    int count = xcb_query_tree_children_length(tree);
+    uint32_t hash = 2166136261u;
+    for (int k = 0; k < count; k++) hash = (hash ^ children[k]) * 16777619u;
+    return hash ? hash : 1;
+}
+
 static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* stale, bool* covered) {
     xcb_connection_t* conn = sc->surface->conn;
     int levels = sc->chainLength;
@@ -710,6 +721,7 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
         replies[i] = xcb_query_tree_reply(conn, trees[i], NULL);
         if (!replies[i]) ok = false;
     }
+    sc->rootOrder = levels > 0 && replies[levels - 1] ? rootOrderOf(replies[levels - 1]) : 0;
     *stale = false;
     int total = 0;
     xcb_window_t candidates[256];
@@ -821,24 +833,28 @@ static void updateCoverage(X11Swapchain* sc) {
     free(geo);
 }
 
-/* Whether the root's children are no longer `before` (the WM raised or lowered a top-level window,
- * or one came or went). One round trip. */
-static bool rootRestacked(xcb_connection_t* conn, xcb_window_t root, const xcb_query_tree_reply_t* before) {
-    xcb_query_tree_reply_t* now = xcb_query_tree_reply(conn, xcb_query_tree(conn, root), NULL);
+/* Whether the root's children changed since the window was found covered (the WM raised or lowered
+ * a top-level window, or one came or went). The new order is kept, so a coverage that was not
+ * checked again (another swapchain of the present took the semaphores) ends one wait, not all. One
+ * round trip. */
+static bool rootRestacked(X11Swapchain* sc) {
+    if (!sc->rootOrder || !sc->root) return false;
+    xcb_connection_t* conn = sc->surface->conn;
+    xcb_query_tree_reply_t* now = xcb_query_tree_reply(conn, xcb_query_tree(conn, sc->root), NULL);
     if (!now) return false;
-    int count = xcb_query_tree_children_length(now);
-    bool changed = count != xcb_query_tree_children_length(before) ||
-                   memcmp(xcb_query_tree_children(now), xcb_query_tree_children(before), count * sizeof(xcb_window_t)) != 0;
+    uint32_t order = rootOrderOf(now);
     free(now);
+    bool changed = order != sc->rootOrder;
+    sc->rootOrder = order;
     return changed;
 }
 
 /* A hidden window's frame: its semaphores are waited for and nothing is copied or drawn, at most
  * COVERED_FPS a second. Windows hidden behind a game (a launcher left running, the Steam client)
  * otherwise render as fast as the GPU allows and take it from the game. The wait is cut into
- * COVERED_SLICE slices and ends early when the root's children were restacked: a game raised back
- * over a closed menu is checked again on its next frame instead of up to 100 ms later, while the
- * screen shows Xwayland's stale copy of it. */
+ * COVERED_SLICE slices and ends early when the root's children changed since the coverage check
+ * (also during this frame's GPU wait): a game raised back over a closed menu is checked again on
+ * its next frame instead of up to 100 ms later, while the screen shows Xwayland's stale copy of it. */
 #define COVERED_FPS 10
 #define COVERED_SLICE 0.008
 static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentInfoKHR* presentInfo, bool* waitedSemaphores) {
@@ -856,20 +872,15 @@ static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentI
     if (result == VK_SUCCESS) result = vk.WaitForFences(sc->device, 1, &sc->fence, VK_TRUE, UINT64_MAX);
     if (result == VK_SUCCESS) vk.ResetFences(sc->device, 1, &sc->fence);
     double now = nowSeconds(), next = sc->lastCoveredFrame + 1.0 / COVERED_FPS;
-    if (now < next) {
-        xcb_connection_t* conn = sc->surface->conn;
-        xcb_query_tree_reply_t* before = sc->root ? xcb_query_tree_reply(conn, xcb_query_tree(conn, sc->root), NULL) : NULL;
-        bool early = false;
-        while (now < next && !early) {
-            double wait = next - now < COVERED_SLICE ? next - now : COVERED_SLICE;
-            struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
-            nanosleep(&ts, NULL);
-            now = nowSeconds();
-            early = before && now < next && rootRestacked(conn, sc->root, before);
-        }
-        free(before);
-        if (!early) now = next;
+    bool slept = false;
+    while (now < next && !rootRestacked(sc)) {
+        double wait = next - now < COVERED_SLICE ? next - now : COVERED_SLICE;
+        struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
+        nanosleep(&ts, NULL);
+        now = nowSeconds();
+        slept = true;
     }
+    if (slept && now >= next) now = next;
     sc->lastCoveredFrame = now;
     return result;
 }
