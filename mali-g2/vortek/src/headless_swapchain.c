@@ -923,8 +923,8 @@ void XWindowSwapchain_presentImageIndex(XWindowSwapchain* swapchain, uint32_t in
 }
 
 /* The client's connection is gone without it destroying its swapchains: take its frames off the
- * screen and give the compositor's buffers back. The swapchains themselves leak like the rest of
- * the client's objects. */
+ * screen and give the compositor's buffers back. destroyVkContext then destroys the swapchains with
+ * the rest of the client's objects (winlator-0015); the chain is not destroyed a second time. */
 void XWindowSwapchain_forgetContext(void* context) {
     uint32_t chains[MAX_ZERO_COPY_CHAINS];
     int count = 0;
@@ -935,8 +935,10 @@ void XWindowSwapchain_forgetContext(void* context) {
         chains[count++] = headless->chainId;
         headless->zeroCopy = false;
         headless->shown = false;
+        headless->announced = false;
         zcChains[i] = NULL;
     }
+    pthread_cond_broadcast(&zcCond); /* an acquire still waiting for a release gives up now */
     pthread_mutex_unlock(&zcLock);
     for (int i = 0; i < count; i++) {
         ZeroCopy_destroyChain(chains[i]);

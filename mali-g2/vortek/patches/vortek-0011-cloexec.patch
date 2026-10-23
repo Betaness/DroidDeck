@@ -1,0 +1,30 @@
+[mali-g2] The client socket and the fds it receives are close-on-exec: Wine forks and execs
+helper processes, which otherwise inherited the connection and kept the server holding the
+game's objects after the game exited.
+
+diff --git a/include/socket_utils.h b/include/socket_utils.h
+index 8ee14ab..77b6026 100644
+--- a/include/socket_utils.h
++++ b/include/socket_utils.h
+@@ -53,7 +53,7 @@ static inline int recv_fds(int sockFd, int* outFds, int* outNumFds, void* outDat
+     };
+ 
+     *outNumFds = 0;
+-    int res = recvmsg(sockFd, &msg, 0);
++    int res = recvmsg(sockFd, &msg, MSG_CMSG_CLOEXEC);
+     if (res > 0) {
+         struct cmsghdr* cmsg;
+         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+diff --git a/src/main.c b/src/main.c
+index 8a28911..a7768fd 100755
+--- a/src/main.c
++++ b/src/main.c
+@@ -12,7 +12,7 @@ RingBuffer* serverRing = NULL;
+ RingBuffer* clientRing = NULL;
+ 
+ static int vortekServerConnect() {
+-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+     if (fd < 0) return -1;
+ 
+     struct sockaddr_un server_addr;
