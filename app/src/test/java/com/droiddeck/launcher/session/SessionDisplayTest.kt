@@ -34,6 +34,22 @@ class SessionDisplayTest {
         assertEquals(2560 to 1440, SessionDisplay.resolveChoice(2560 to 1440, SessionDisplay.MATCH_SCREEN))
     }
 
+    @Test fun halfScreenIsAnExactTwoTimesChoiceOnlyWhereItAddsANewSize() {
+        assertEquals(1704 to 1136, SessionDisplay.resolveChoice(3408 to 2272, SessionDisplay.HALF_SCREEN))
+        assertEquals(1704 to 1136, SessionDisplay.resolveChoice(2272 to 3408, SessionDisplay.HALF_SCREEN))
+        assertEquals(listOf("720p", "900p", "1080p", SessionDisplay.HALF_SCREEN, SessionDisplay.MATCH_SCREEN,
+            SessionDisplay.FOLLOW_SCREEN), SessionDisplay.resolutionOptions(3408 to 2272))
+        assertEquals(listOf("720p", SessionDisplay.HALF_SCREEN, "900p", "1080p", SessionDisplay.MATCH_SCREEN,
+            SessionDisplay.FOLLOW_SCREEN), SessionDisplay.resolutionOptions(2560 to 1600))
+        assertNull(SessionDisplay.halfSize(2266 to 1440))
+        assertNull(SessionDisplay.halfSize(1920 to 1080))
+        assertEquals(listOf("720p", "900p", "1080p", SessionDisplay.MATCH_SCREEN, SessionDisplay.FOLLOW_SCREEN),
+            SessionDisplay.resolutionOptions(2560 to 1440))
+        assertEquals(1280 to 720, SessionDisplay.resolveChoice(1920 to 1080, SessionDisplay.HALF_SCREEN))
+        assertTrue(SessionDisplay.panelRelative(SessionDisplay.HALF_SCREEN))
+        assertFalse(SessionDisplay.panelRelative("1704x1136"))
+    }
+
     @Test fun unfoldedControlsKeepTheGameSixteenByNineAcrossTheWidth() {
         assertEquals(1376, SessionDisplay.unfoldedGameHeight(2448, 1848))
         assertEquals(1038, SessionDisplay.unfoldedGameHeight(1848, 2448))

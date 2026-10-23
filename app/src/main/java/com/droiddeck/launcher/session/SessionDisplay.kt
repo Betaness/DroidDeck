@@ -6,6 +6,7 @@ import android.view.WindowManager
 object SessionDisplay {
     const val MATCH_SCREEN = "screen"
     const val FOLLOW_SCREEN = "follow"
+    const val HALF_SCREEN = "half"
     const val FOLLOW_MIN_SIDE = 480
 
     const val DEFAULT_RESOLUTION = "720p"
@@ -14,11 +15,22 @@ object SessionDisplay {
     fun presetHeight(choice: String): Int? =
         if (choice.endsWith("p")) choice.dropLast(1).toIntOrNull()?.takeIf { it > 0 } else null
 
+    fun panelRelative(choice: String): Boolean =
+        choice == MATCH_SCREEN || choice == FOLLOW_SCREEN || choice == HALF_SCREEN || presetHeight(choice) != null
+
+    // Offered only when every session pixel maps to exactly 2x2 panel pixels.
+    fun halfSize(panel: Pair<Int, Int>): Pair<Int, Int>? {
+        val w = maxOf(panel.first, panel.second)
+        val h = minOf(panel.first, panel.second)
+        return if (w % 4 != 0 || h % 4 != 0 || h / 2 < PRESET_HEIGHTS.first()) null else w / 2 to h / 2
+    }
+
     fun screenSize(panel: Pair<Int, Int>): Pair<Int, Int> =
         (maxOf(panel.first, panel.second) and 1.inv()) to (minOf(panel.first, panel.second) and 1.inv())
 
     fun resolveChoice(panel: Pair<Int, Int>, choice: String): Pair<Int, Int> {
         if (choice == MATCH_SCREEN || choice == FOLLOW_SCREEN) return screenSize(panel)
+        if (choice == HALF_SCREEN) halfSize(panel)?.let { return it }
         presetHeight(choice)?.let { return resolve(panel, it, SessionPrefs.SHAPE_AUTO) }
         val parts = choice.split('x').map { it.toIntOrNull() }
         return if (parts.size == 2 && parts.all { it != null && it > 0 }) parts[0]!! to parts[1]!!
@@ -27,7 +39,9 @@ object SessionDisplay {
 
     fun resolutionOptions(panel: Pair<Int, Int>): List<String> {
         val panelHeight = minOf(panel.first, panel.second)
-        return PRESET_HEIGHTS.filter { it <= panelHeight }.map { "${it}p" }
+        val presets = PRESET_HEIGHTS.filter { it <= panelHeight }.map { "${it}p" }
+        val half = halfSize(panel)?.takeIf { size -> presets.none { resolveChoice(panel, it) == size } }
+        return (presets + listOfNotNull(half?.let { HALF_SCREEN })).sortedBy { resolveChoice(panel, it).second }
             .filter { resolveChoice(panel, it) != screenSize(panel) } + MATCH_SCREEN + FOLLOW_SCREEN
     }
 

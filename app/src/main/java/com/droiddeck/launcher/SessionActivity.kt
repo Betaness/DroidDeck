@@ -3274,7 +3274,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val display = com.droiddeck.launcher.session.SessionDisplay
         val choice = SessionPrefs.resolutionChoice(this, mode, panel)
         val size = display.resolveChoice(panel, choice)
-        val fixed = choice != display.MATCH_SCREEN && choice != display.FOLLOW_SCREEN && display.presetHeight(choice) == null
+        val fixed = !display.panelRelative(choice)
         return if (fixed) display.resolve(panel, minOf(size.first, size.second), SessionPrefs.SHAPE_AUTO) else size
     }
 

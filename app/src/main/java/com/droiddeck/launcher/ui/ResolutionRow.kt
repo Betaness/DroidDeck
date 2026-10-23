@@ -26,6 +26,7 @@ fun ResolutionRow(
         val dimensions = SessionDisplay.resolveChoice(panel, value)
         value to if (value == SessionDisplay.MATCH_SCREEN) stringResource(R.string.display_match_screen, screen.first, screen.second)
         else if (value == SessionDisplay.FOLLOW_SCREEN) stringResource(R.string.display_follow_screen)
+        else if (value == SessionDisplay.HALF_SCREEN) stringResource(R.string.display_half_screen, dimensions.first, dimensions.second)
         else if (value == SessionDisplay.DEFAULT_RESOLUTION) stringResource(R.string.mode_res_default, "${dimensions.first}×${dimensions.second}")
         else "${dimensions.first}×${dimensions.second}"
     } + (custom to if (selected in choices) stringResource(R.string.mode_res_custom)
