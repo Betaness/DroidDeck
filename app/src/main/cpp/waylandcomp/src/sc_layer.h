@@ -42,11 +42,16 @@ int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int transl
 
 void sc_layer_hide(void);
 /* [mali-g2] Vortek zero-copy: an AHB shown over the X window at x,y,w,h of the scene, on Vortek
- * layer `slot` (0 .. SC_VORTEK_LAYERS - 1) at z `z`. */
+ * layer `slot` (0 .. SC_VORTEK_LAYERS - 1) at z `z`. `batch`: a transaction from sc_layer_tx_begin
+ * that the caller applies with sc_layer_tx_apply, so changes to several layers reach the screen in
+ * the same frame (one buffer per layer and batch); NULL applies a transaction of its own. */
+struct ASurfaceTransaction;
+struct ASurfaceTransaction *sc_layer_tx_begin(void);
+void sc_layer_tx_apply(struct ASurfaceTransaction *batch);
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
-                            int x, int y, int w, int h, int scene_w, int scene_h);
-void sc_layer_hide_vortek(int slot);
-void sc_layer_vortek_z(int slot, int z);
+                            int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch);
+void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch);
+void sc_layer_vortek_z(int slot, int z, struct ASurfaceTransaction *batch);
 int sc_layer_base_black(int width, int height);
 void sc_layer_hide_base(void);
 void sc_layer_hide_overlay(void);

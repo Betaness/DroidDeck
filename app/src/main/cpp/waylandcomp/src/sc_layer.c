@@ -180,6 +180,7 @@ struct layer {
 static struct layer g_layers[SC_LAYER_COUNT];
 static void apply_frame_rate(ASurfaceTransaction *tx, struct layer *l);
 static void hide_layer(struct layer *l);
+static void hide_layer_on(ASurfaceTransaction *batch, struct layer *l);
 static void coverage_text(const struct layer *l, char *out, size_t n);
 static int g_layers_ready;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -248,16 +249,21 @@ static void on_complete(void *context, ASurfaceTransactionStats *stats) {
     free(ctx);
 }
 
-static int add_complete_on(ASurfaceTransaction *tx, struct layer *l, ASurfaceControl *sc,
-                           int prev_slot, void *prev_token, int retire) {
-    struct complete_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) return -1;
+static void attach_complete(ASurfaceTransaction *tx, struct complete_ctx *ctx, struct layer *l, ASurfaceControl *sc,
+                            int prev_slot, void *prev_token, int retire) {
     ctx->sc = sc; ctx->layer = (int)(l - g_layers); ctx->prev_slot = prev_slot;
     ctx->prev_token = prev_token; ctx->retire = retire;
     pthread_mutex_lock(&g_lock);
     g_pending_cb++;
     pthread_mutex_unlock(&g_lock);
     api.setOnComplete(tx, ctx, on_complete);
+}
+
+static int add_complete_on(ASurfaceTransaction *tx, struct layer *l, ASurfaceControl *sc,
+                           int prev_slot, void *prev_token, int retire) {
+    struct complete_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return -1;
+    attach_complete(tx, ctx, l, sc, prev_slot, prev_token, retire);
     return 0;
 }
 
@@ -805,18 +811,31 @@ unavailable:
     return -1;
 }
 
+struct ASurfaceTransaction *sc_layer_tx_begin(void) {
+    return load_api() == 0 ? api.txCreate() : NULL;
+}
+
+void sc_layer_tx_apply(struct ASurfaceTransaction *batch) {
+    if (!batch) return;
+    api.txApply(batch);
+    api.txDelete(batch);
+}
+
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
-                            int x, int y, int w, int h, int scene_w, int scene_h) {
+                            int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch) {
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     int r[8];
     if (!l || !ahb || !token || w <= 0 || h <= 0) goto unavailable;
-    /* l->z is the z the SurfaceControl has; it changes only once the transaction is applied. */
+    /* l->z is the z the SurfaceControl has, or gets when the caller's batch is applied. */
     if (ensure_sc(l) != 0) goto unavailable;
     int restack = l->z != z;
     if (vkp_update_map(scene_w, scene_h) != 0) goto unavailable;
     if (!vkp_map_window(buf_w, buf_h, x, y, w, h, scene_w, scene_h, r)) goto unavailable;
-    ASurfaceTransaction *tx = api.txCreate();
-    if (!tx) goto unavailable;
+    /* Allocated before the transaction is touched: a batch cannot be taken back. */
+    struct complete_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) goto unavailable;
+    ASurfaceTransaction *tx = batch ? batch : api.txCreate();
+    if (!tx) { free(ctx); goto unavailable; }
     ASurfaceControl *old = swap_sc_begin(l);
     if (old || restack) api.setZOrder(tx, l->sc, z);
     api.setBuffer(tx, l->sc, ahb, acquire_fd);
@@ -825,13 +844,11 @@ int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, in
     apply_frame_rate(tx, l);
     if (!l->shown) api.setVisibility(tx, l->sc, ASC_VISIBILITY_SHOW);
     if (old) retire_ops(tx, old);
-    if (add_complete_on(tx, l, old ? old : l->sc, -1, l->cur_token == token ? NULL : l->cur_token, old ? 1 : 0) != 0) {
+    attach_complete(tx, ctx, l, old ? old : l->sc, -1, l->cur_token == token ? NULL : l->cur_token, old ? 1 : 0);
+    if (!batch) {
+        api.txApply(tx);
         api.txDelete(tx);
-        if (old) api.release(old);
-        return -1;
     }
-    api.txApply(tx);
-    api.txDelete(tx);
     l->z = z;
     l->cur_token = token;
     if (!l->shown) { l->shown = 1; droiddeck_log("layer", "%s: layer shown", l->name); }
@@ -842,14 +859,14 @@ unavailable:
     return -1;
 }
 
-void sc_layer_hide_vortek(int slot) {
+void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch) {
     layers_init();
     if (slot < 0 || slot >= SC_VORTEK_LAYERS) return;
     struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
-    if (l->shown) hide_layer(l);
+    if (l->shown) hide_layer_on(batch, l);
 }
 
-void sc_layer_vortek_z(int slot, int z) {
+void sc_layer_vortek_z(int slot, int z, struct ASurfaceTransaction *batch) {
     layers_init();
     if (slot < 0 || slot >= SC_VORTEK_LAYERS) return;
     struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
@@ -858,11 +875,13 @@ void sc_layer_vortek_z(int slot, int z) {
         l->z = z; /* ensure_sc creates the SurfaceControl at this z */
         return;
     }
-    ASurfaceTransaction *tx = api.txCreate();
+    ASurfaceTransaction *tx = batch ? batch : api.txCreate();
     if (!tx) return;
     api.setZOrder(tx, l->sc, z);
-    api.txApply(tx);
-    api.txDelete(tx);
+    if (!batch) {
+        api.txApply(tx);
+        api.txDelete(tx);
+    }
     l->z = z;
 }
 
@@ -1014,16 +1033,19 @@ int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int transl
     return 0;
 }
 
-static void hide_layer(struct layer *l) {
+/* batch: the caller's transaction, applied by the caller; NULL: one of its own. */
+static void hide_layer_on(ASurfaceTransaction *batch, struct layer *l) {
     if (!l->sc || !l->shown || api.state != 1) return;
-    ASurfaceTransaction *tx = api.txCreate();
+    ASurfaceTransaction *tx = batch ? batch : api.txCreate();
     if (!tx) return;
     replace_with_blank(tx, l);
     api.setVisibility(tx, l->sc, ASC_VISIBILITY_HIDE);
     add_complete(tx, l, l->cur_slot, l->cur_token, 0);
-    api.txApply(tx); api.txDelete(tx);
+    if (!batch) { api.txApply(tx); api.txDelete(tx); }
     l->shown = 0; l->cur_slot = -1; l->cur_token = NULL;
 }
+
+static void hide_layer(struct layer *l) { hide_layer_on(NULL, l); }
 
 void sc_layer_hide(void) {
     layers_init();

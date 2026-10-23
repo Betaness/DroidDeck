@@ -30,6 +30,11 @@ typedef struct DDPresentZeroCopy {
 #define DD_ZC_FLAG_HIDE 0x40000000u
 /* RESTACK (with STACK_KEY): no image, the swapchain's window moved in the X stacking order. */
 #define DD_ZC_FLAG_RESTACK 0x20000000u
+/* TOPLEVEL (with STACK_KEY): a uint64 top-level window id (the root's child that holds the window)
+ * ends the payload, after the semaphore ids, so a server without the flag reads the rest as before.
+ * The compositor breaks ties between different top-level windows with the same root-level key by the
+ * most recent report: the other one's key is stale (an idle window, raised over or lowered since). */
+#define DD_ZC_FLAG_TOPLEVEL 0x10000000u
 #define DD_ZC_WAIT_COUNT_MASK 0x0000ffffu
 
 /* Payload: the layout of REQUEST_CODE_VK_END_COMMAND_BUFFER (uint64 command buffer id, then the

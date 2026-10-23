@@ -721,6 +721,13 @@ class SessionService : Service() {
             // slowed games that throw a lot (Lua in Richman 10) to a crawl. Errors and fixmes still show.
             if (userEnv.none { it.startsWith("WINEDEBUG=") }) guest.add("WINEDEBUG=+timestamp,+pid,+tid,+threadname,+loaddll")
             vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
+            // VORTEK_PRESENT_TRACE=1: the compositor (this process, read when the server connects) logs each
+            // zero-copy message with its CLOCK_MONOTONIC time.
+            val presentTrace = userEnv.lastOrNull { it.startsWith("VORTEK_PRESENT_TRACE=") }?.substringAfter('=')
+            runCatching {
+                if (presentTrace != null) android.system.Os.setenv("VORTEK_PRESENT_TRACE", presentTrace, true)
+                else android.system.Os.unsetenv("VORTEK_PRESENT_TRACE")
+            }.onFailure { Log.w(TAG, "VORTEK_PRESENT_TRACE", it) }
             // BL_VK_BRIDGE=malibridge: the same session with MaliBridge instead of Vortek (for A/B runs).
             val bridgeWanted = userEnv.lastOrNull { it.startsWith("BL_VK_BRIDGE=") } == MaliBridgeComponent.SWITCH
             maliBridge = bridgeWanted && MaliBridgeComponent.available(this)

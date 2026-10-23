@@ -692,7 +692,8 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
  * client can present through X11 instead. */
 VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t index, const VkSemaphore* waitSemaphores,
                                           uint32_t waitCount, int32_t x, int32_t y, int32_t w, int32_t h,
-                                          uint32_t rootW, uint32_t rootH, uint64_t stackKey, void* context) {
+                                          uint32_t rootW, uint32_t rootH, uint64_t stackKey, uint32_t topLevel,
+                                          void* context) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     if (!headless || !headless->owner || !headless->zeroCopy || index >= (uint32_t)swapchain->imageCount ||
         !vulkanWrapper.vkGetFenceFd) {
@@ -751,7 +752,7 @@ VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t 
     pthread_mutex_lock(&zcLock);
     headless->owner[index] = OWNER_COMPOSITOR;
     pthread_mutex_unlock(&zcLock);
-    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, rootW, rootH, stackKey, fd)) {
+    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, rootW, rootH, stackKey, topLevel, fd)) {
         headless->shown = true;
     }
     else {
@@ -962,13 +963,13 @@ void XWindowSwapchain_forgetContext(void* context) {
 /* DD_ZC_FLAG_HIDE: the client's window is gone or hidden; its frames leave the screen. Images the
  * compositor holds come back with its release messages. */
 /* DD_ZC_FLAG_RESTACK: the window of a shown swapchain moved in the X stacking order. */
-static VkResult restackZeroCopy(XWindowSwapchain* swapchain, uint64_t stackKey) {
+static VkResult restackZeroCopy(XWindowSwapchain* swapchain, uint64_t stackKey, uint32_t topLevel) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     if (!headless || !headless->owner) return VK_SUCCESS;
     pthread_mutex_lock(&zcLock);
     bool shown = headless->shown;
     pthread_mutex_unlock(&zcLock);
-    if (shown) ZeroCopy_restack(headless->chainId, stackKey);
+    if (shown) ZeroCopy_restack(headless->chainId, stackKey, topLevel);
     return VK_SUCCESS;
 }
 
@@ -992,6 +993,14 @@ void droiddeck_handlePresentZeroCopy(VkContext* context) {
         uint32_t flags = request.waitCount & ~DD_ZC_WAIT_COUNT_MASK;
         uint32_t count = request.waitCount & DD_ZC_WAIT_COUNT_MASK;
         uint32_t extra = (flags & DD_ZC_FLAG_STACK_KEY) ? 1 : 0;
+        /* DD_ZC_FLAG_TOPLEVEL: the top-level window id ends the payload, after the key and semaphores. */
+        uint32_t topLevel = 0;
+        size_t topAt = sizeof(request) + (count + extra) * sizeof(uint64_t);
+        if ((flags & DD_ZC_FLAG_TOPLEVEL) && count <= 16 && context->inputBufferSize >= (int)(topAt + sizeof(uint64_t))) {
+            uint64_t id;
+            memcpy(&id, context->inputBuffer + topAt, sizeof(id));
+            topLevel = (uint32_t)id;
+        }
         if (flags & DD_ZC_FLAG_HIDE) {
             result = hideZeroCopy(VkObject_fromId(request.swapchainId));
         }
@@ -999,7 +1008,7 @@ void droiddeck_handlePresentZeroCopy(VkContext* context) {
             uint64_t stackKey = 0;
             if (extra && context->inputBufferSize >= (int)(sizeof(request) + sizeof(stackKey))) {
                 memcpy(&stackKey, context->inputBuffer + sizeof(request), sizeof(stackKey));
-                result = restackZeroCopy(VkObject_fromId(request.swapchainId), stackKey);
+                result = restackZeroCopy(VkObject_fromId(request.swapchainId), stackKey, topLevel);
             }
         }
         else if (count <= 16 && context->inputBufferSize >= (int)(sizeof(request) + (count + extra) * sizeof(uint64_t))) {
@@ -1014,7 +1023,7 @@ void droiddeck_handlePresentZeroCopy(VkContext* context) {
             XWindowSwapchain* swapchain = VkObject_fromId(request.swapchainId);
             result = XWindowSwapchain_presentZeroCopy(swapchain, request.imageIndex, semaphores, count,
                                                       request.x, request.y, request.w, request.h,
-                                                      request.rootW, request.rootH, stackKey, context);
+                                                      request.rootW, request.rootH, stackKey, topLevel, context);
             if (result == VK_ERROR_DEVICE_LOST) context->status = result;
         }
     }

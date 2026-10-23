@@ -40,13 +40,21 @@ struct vp_shown {
     int32_t rect[4];          /* X root coordinates */
     uint64_t key;
     uint32_t seq;
+    uint32_t toplevel;        /* the window's top-level X window, 0 if the client did not say */
+    uint32_t report;          /* g_report_seq of the last PRESENT or RESTACK with its key */
     int z;
 };
 static struct vp_shown g_show[VP_LAYERS];
-static uint32_t g_show_seq;
+static uint32_t g_show_seq, g_report_seq;
 static int g_first_logged;
 static int g_accept = 1;
 static int g_spatial;
+/* While on_conn drains the socket: the messages' layer changes go into one transaction (created on
+ * first use), so a menu's HIDE and the view below's next frame reach the screen together. */
+static int g_batching;
+static struct ASurfaceTransaction *g_batch;
+static unsigned g_batch_buffers;  /* layers that got a buffer in g_batch */
+static int g_trace;               /* VORTEK_PRESENT_TRACE=1: a timestamped line per message */
 
 /* sc_layer only compares tokens, and its completion callback may run after the chain is gone,
  * so a token encodes chain and image instead of pointing at them. */
@@ -87,6 +95,7 @@ static int send_msg(int fd, const struct vp_msg *m, int pass_fd) {
     return r == (ssize_t)sizeof(*m) ? 0 : -1;
 }
 
+/* 0: a message; 1: none waiting; -1: the connection is broken. */
 static int recv_msg(int fd, struct vp_msg *m, int *got_fd) {
     struct iovec iov = {m, sizeof(*m)};
     char cbuf[CMSG_SPACE(sizeof(int))];
@@ -97,7 +106,8 @@ static int recv_msg(int fd, struct vp_msg *m, int *got_fd) {
     h.msg_controllen = sizeof(cbuf);
     *got_fd = -1;
     ssize_t r;
-    do r = recvmsg(fd, &h, MSG_CMSG_CLOEXEC); while (r < 0 && errno == EINTR);
+    do r = recvmsg(fd, &h, MSG_CMSG_CLOEXEC | MSG_DONTWAIT); while (r < 0 && errno == EINTR);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
     if (r <= 0) return -1;
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&h); c; c = CMSG_NXTHDR(&h, c))
         if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(got_fd, CMSG_DATA(c), sizeof(int));
@@ -134,9 +144,27 @@ static void refuse(uint32_t chain, const char *why) {
     droiddeck_log("vortek", "zero-copy refused for swapchain %u: %s", chain, why);
 }
 
+static struct ASurfaceTransaction *batch(void) {
+    if (g_batching && !g_batch) g_batch = sc_layer_tx_begin();
+    return g_batch;
+}
+
+static void batch_apply(void) {
+    sc_layer_tx_apply(g_batch);
+    g_batch = NULL;
+    g_batch_buffers = 0;
+}
+
+/* A layer gets one buffer per transaction: a second one would replace the first unseen, and the
+ * first's token would come back with a release fence that is not its own. */
+static void batch_touch(int slot) {
+    if (g_batch_buffers & (1u << slot)) batch_apply();
+}
+
 static void hide_slot(int i) {
     if (!g_show[i].chain) return;
-    sc_layer_hide_vortek(i);
+    batch_touch(i);
+    sc_layer_hide_vortek(i, batch());
     memset(&g_show[i], 0, sizeof(g_show[i]));
 }
 
@@ -149,15 +177,36 @@ static void hide(void) {
     for (int i = 0; i < VP_LAYERS; i++) hide_slot(i);
 }
 
+/* Whether layer a goes below layer b. Two top-level windows cannot hold the same place among the
+ * root's children: when their keys agree there (the top 16 bits), one key is stale (an idle window
+ * raised over or lowered since it last reported), and the top-level window that reported last goes
+ * above. Otherwise by key, then by arrival. `recent`: per layer, its top-level window's last report. */
+static int below(int a, int b, const uint32_t *recent) {
+    const struct vp_shown *x = &g_show[a], *y = &g_show[b];
+    if (x->toplevel && y->toplevel && x->toplevel != y->toplevel && (x->key >> 48) == (y->key >> 48) &&
+        recent[a] != recent[b])
+        return recent[a] < recent[b];
+    if (x->key != y->key) return x->key < y->key;
+    return x->seq < y->seq;
+}
+
 /* Layer order from the stacking keys; returns the z of `slot` and moves the other layers whose
  * place changed (slot -1: moves them all). The z values sit between sc_layer's GAME and OVERLAY. */
 static int restack(int slot) {
     int order[VP_LAYERS], n = 0;
-    for (int i = 0; i < VP_LAYERS; i++) if (g_show[i].chain) order[n++] = i;
+    uint32_t recent[VP_LAYERS] = {0};
+    for (int i = 0; i < VP_LAYERS; i++) {
+        if (!g_show[i].chain) continue;
+        order[n++] = i;
+        /* All windows of a top-level window share its recency, so the order stays transitive. */
+        for (int j = 0; j < VP_LAYERS; j++)
+            if (g_show[j].chain && (j == i || (g_show[i].toplevel && g_show[j].toplevel == g_show[i].toplevel)) &&
+                g_show[j].report > recent[i])
+                recent[i] = g_show[j].report;
+    }
     for (int a = 1; a < n; a++) {
         int cur = order[a], b = a - 1;
-        while (b >= 0 && (g_show[order[b]].key > g_show[cur].key ||
-                          (g_show[order[b]].key == g_show[cur].key && g_show[order[b]].seq > g_show[cur].seq))) {
+        while (b >= 0 && below(cur, order[b], recent)) {
             order[b + 1] = order[b];
             b--;
         }
@@ -167,7 +216,7 @@ static int restack(int slot) {
     for (int r = 0; r < n; r++) {
         int i = order[r], want = SC_VORTEK_Z_BASE + r;
         if (i == slot) z = want;
-        else if (g_show[i].z != want) sc_layer_vortek_z(i, want);
+        else if (g_show[i].z != want) sc_layer_vortek_z(i, want, batch());
         g_show[i].z = want;
     }
     return z;
@@ -242,11 +291,14 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
             return;
         }
     }
+    batch_touch(slot);
     struct vp_shown before = g_show[slot];
     if (fresh) g_show[slot].seq = ++g_show_seq;
     g_show[slot].chain = m->chain;
     g_show[slot].rect[0] = m->x; g_show[slot].rect[1] = m->y; g_show[slot].rect[2] = m->w; g_show[slot].rect[3] = m->h;
     g_show[slot].key = ((uint64_t)m->key_hi << 32) | m->key_lo;
+    g_show[slot].toplevel = m->toplevel;
+    g_show[slot].report = ++g_report_seq;
     int z = restack(slot);
     int x = m->x, y = m->y, w = m->w, h = m->h;
     if (m->root_w > 0 && m->root_h > 0 && ((int)m->root_w != g_scene_w || (int)m->root_h != g_scene_h)) {
@@ -255,7 +307,8 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         w = (int)((m->x + m->w) * sx + 0.5) - x; h = (int)((m->y + m->h) * sy + 0.5) - y;
     }
     int r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,
-                                    token_of(m->chain, m->index), x, y, w, h, g_scene_w, g_scene_h);
+                                    token_of(m->chain, m->index), x, y, w, h, g_scene_w, g_scene_h, batch());
+    if (r == 0 && g_batch) g_batch_buffers |= 1u << slot;
     if (r != 0) {
         send_release(m->chain, m->index, -1);
         if (fresh) {
@@ -295,38 +348,48 @@ void vortek_present_set_accept(int accept) {
 
 void vortek_present_set_spatial(int on) { g_spatial = on ? 1 : 0; }
 
-static int on_conn(int fd, uint32_t mask, void *data) {
-    (void)data;
-    if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) { drop_connection(); return 0; }
-    struct vp_msg m;
-    int got_fd;
-    if (recv_msg(fd, &m, &got_fd) != 0) { drop_connection(); return 0; }
-    switch (m.type) {
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* CLOCK_MONOTONIC, the clock of the client's "(t=...)" log lines (the guest shares the kernel's). */
+static void trace_msg(const struct vp_msg *m) {
+    static const char *const names[] = {"?", "CREATE", "PRESENT", "HIDE", "DESTROY", "?", "?", "?", "RESTACK"};
+    droiddeck_log("vortek", "trace t=%.4f %s chain %u index %u key %08x%08x top 0x%x", now_s(),
+                  m->type < sizeof(names) / sizeof(names[0]) ? names[m->type] : "?", m->chain, m->index,
+                  m->key_hi, m->key_lo, m->toplevel);
+}
+
+static void on_msg(int fd, const struct vp_msg *m, int got_fd) {
+    if (g_trace) trace_msg(m);
+    switch (m->type) {
         case VP_MSG_CHAIN_CREATE:
             if (got_fd >= 0) close(got_fd);
-            on_create(fd, &m);
+            on_create(fd, m);
             break;
         case VP_MSG_PRESENT:
-            on_present(&m, got_fd);
+            on_present(m, got_fd);
             break;
         case VP_MSG_HIDE:
             if (got_fd >= 0) close(got_fd);
-            hide_chain(m.chain);
+            hide_chain(m->chain);
             break;
         case VP_MSG_RESTACK:
             if (got_fd >= 0) close(got_fd);
             for (int i = 0; i < VP_LAYERS; i++) {
-                uint64_t key = ((uint64_t)m.key_hi << 32) | m.key_lo;
-                if (g_show[i].chain == m.chain && g_show[i].key != key) {
-                    g_show[i].key = key;
-                    restack(-1);
-                }
+                if (g_show[i].chain != m->chain) continue;
+                g_show[i].key = ((uint64_t)m->key_hi << 32) | m->key_lo;
+                g_show[i].toplevel = m->toplevel;
+                g_show[i].report = ++g_report_seq;
+                restack(-1);
             }
             break;
         case VP_MSG_CHAIN_DESTROY: {
             if (got_fd >= 0) close(got_fd);
-            hide_chain(m.chain);
-            struct vp_chain *c = chain_of(m.chain);
+            hide_chain(m->chain);
+            struct vp_chain *c = chain_of(m->chain);
             if (c) chain_free(c);
             break;
         }
@@ -334,6 +397,27 @@ static int on_conn(int fd, uint32_t mask, void *data) {
             if (got_fd >= 0) close(got_fd);
             break;
     }
+}
+
+/* Everything the server sent so far is handled in one go and its layer changes applied in one
+ * transaction; at most VP_BATCH_MAX messages, so a flood cannot hold up the event loop. */
+#define VP_BATCH_MAX 64
+static int on_conn(int fd, uint32_t mask, void *data) {
+    (void)data;
+    if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) { drop_connection(); return 0; }
+    g_batching = 1;
+    int n = 0;
+    for (; n < VP_BATCH_MAX; n++) {
+        struct vp_msg m;
+        int got_fd;
+        int r = recv_msg(fd, &m, &got_fd);
+        if (r > 0) break;
+        if (r < 0) { drop_connection(); break; }
+        on_msg(fd, &m, got_fd);
+    }
+    g_batching = 0;
+    if (g_trace && g_batch) droiddeck_log("vortek", "trace t=%.4f applied %d message%s", now_s(), n, n == 1 ? "" : "s");
+    batch_apply();
     return 0;
 }
 
@@ -346,6 +430,8 @@ static int on_listen(int fd, uint32_t mask, void *data) {
     g_conn_fd = c;
     pthread_mutex_unlock(&g_conn_lock);
     g_conn_src = wl_event_loop_add_fd(g_loop, c, WL_EVENT_READABLE, on_conn, NULL);
+    const char *trace = getenv("VORTEK_PRESENT_TRACE");
+    g_trace = trace && atoi(trace) > 0;
     if (!g_accept) send_simple(VP_MSG_MODE, 0, 0);
     droiddeck_log("vortek", "zero-copy presenter connected");
     return 0;
