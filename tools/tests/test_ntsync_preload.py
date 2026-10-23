@@ -393,6 +393,91 @@ static void signals(void) {
   close(busy_obj);
 }
 
+static volatile int burst_count;
+static void bursting(int sig, siginfo_t *si, void *uc) {
+  (void)sig; (void)si; (void)uc;
+  uint32_t v = 0;
+  ioctl(busy_obj, NT_EVENT_SET, &v);
+  __atomic_add_fetch(&burst_count, 1, __ATOMIC_RELAXED);
+}
+
+static void bursts(void) {
+  void *seen = NULL;
+  busy_obj = event(0, 0);
+  for (int s = 0; s < 8; s++) CHECK("install_burst", install_handler(SIGRTMIN + s, bursting, &seen) == 0);
+  pthread_t w;
+  stop_worker = 0;
+  burst_count = 0;
+  pthread_create(&w, NULL, worker, NULL);
+  union sigval val = {0};
+  int sent = 0;
+  for (int i = 0; i < 400; i++) {
+    for (int s = 0; s < 8; s++)
+      if (pthread_sigqueue(w, SIGRTMIN + s, val) == 0) sent++;
+    usleep(200);
+  }
+  for (int i = 0; i < 2000 && __atomic_load_n(&burst_count, __ATOMIC_RELAXED) < sent; i++) usleep(1000);
+  stop_worker = 1;
+  pthread_join(w, NULL);
+  CHECK("burst_all_handled", burst_count == sent && sent > 0);
+  close(busy_obj);
+}
+
+static int outer_obj, inner_obj, other_dev, other_obj;
+static volatile int nested_ok, nested_done, outer_done;
+static void nesting(int sig, siginfo_t *si, void *uc) {
+  (void)sig; (void)si; (void)uc;
+  uint32_t idx = 99;
+  int ok = wait_on(NT_WAIT_ANY, &inner_obj, 1, 21, 0, mono_ns(50), &idx) == 0 && idx == 0;
+  struct wait_args w = {mono_ns(2), (uintptr_t)&other_obj, 1, 0xdead, 0, 22, 0, 0};
+  ok = ok && ioctl(other_dev, NT_WAIT_ANY, &w) < 0 && errno == ETIMEDOUT;
+  nested_ok += ok;
+  __atomic_store_n(&nested_done, 1, __ATOMIC_RELEASE);
+}
+static void *outer_waiter(void *p) {
+  struct wait_args w = {mono_ns(3000), (uintptr_t)&outer_obj, 1, 99, 0, 23, 0, 0};
+  int r;
+  do { r = ioctl(dev, NT_WAIT_ANY, &w); } while (r < 0 && errno == EINTR);
+  *(int *)p = r == 0 && w.index == 0;
+  __atomic_store_n(&outer_done, 1, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+static void nested_waits(void) {
+  void *seen = NULL;
+  other_dev = open("/dev/ntsync", O_RDWR | O_CLOEXEC);
+  CHECK("second_device", other_dev >= 0);
+  struct event_args ea = {0, 0};
+  other_obj = ioctl(other_dev, NT_CREATE_EVENT, &ea);
+  inner_obj = event(1, 1);
+  CHECK("install_nesting", install_handler(SIGUSR2, nesting, &seen) == 0);
+  int good = 0, early = 0;
+  nested_ok = 0;
+  for (int i = 0; i < 40; i++) {
+    outer_obj = event(0, 0);
+    int result = 0;
+    pthread_t t;
+    nested_done = outer_done = 0;
+    pthread_create(&t, NULL, outer_waiter, &result);
+    usleep(5000);
+    pthread_kill(t, SIGUSR2);
+    while (!__atomic_load_n(&nested_done, __ATOMIC_ACQUIRE)) usleep(200);
+    usleep(5000);
+    early += __atomic_load_n(&outer_done, __ATOMIC_ACQUIRE);
+    uint32_t v = 0;
+    ioctl(outer_obj, NT_EVENT_SET, &v);
+    pthread_join(t, NULL);
+    good += result;
+    close(outer_obj);
+  }
+  CHECK("outer_wait_not_woken_by_nested_wait", early == 0);
+  CHECK("outer_wait_survives_nested_waits", good == 40);
+  CHECK("nested_waits_complete", nested_ok == 40);
+  close(inner_obj);
+  close(other_obj);
+  close(other_dev);
+}
+
 int main(void) {
   alarm(60);
   dev = open("/dev/ntsync", O_RDWR | O_CLOEXEC);
@@ -409,6 +494,8 @@ int main(void) {
   cross_process();
   stress();
   signals();
+  bursts();
+  nested_waits();
   printf("done fails=%d\n", fails);
   return fails != 0;
 }

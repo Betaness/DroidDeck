@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 struct ns_sem_args {
@@ -170,6 +171,7 @@ struct ns_tls {
   struct ns_dev *d;
   uint32_t q;
   int waiting;
+  int sleep;
 };
 
 static struct ns_dev ns_devs[NS_DEVS];
@@ -262,8 +264,10 @@ static void ns_unlock(uint32_t *w) {
 struct ns_cs {
   int depth;
   int count;
+  int nheld;
   int sigs[NS_DEFER];
   siginfo_t info[NS_DEFER];
+  sigset_t held;
 };
 
 static __thread struct ns_cs ns_cs;
@@ -290,8 +294,26 @@ static int ns_defer(int sig, const siginfo_t *si) {
   return 1;
 }
 
+static int ns_park(int sig, const siginfo_t *si, ucontext_t *uc) {
+  sigset_t one;
+  sigemptyset(&one);
+  sigaddset(&one, sig);
+  int saved = errno;
+  pthread_sigmask(SIG_BLOCK, &one, NULL);
+  pid_t pid = getpid(), tid = (pid_t)ns_self();
+  int ok = (si && syscall(SYS_rt_tgsigqueueinfo, pid, tid, sig, si) == 0) || syscall(SYS_tgkill, pid, tid, sig) == 0;
+  if (!ok) pthread_sigmask(SIG_UNBLOCK, &one, NULL);
+  errno = saved;
+  if (!ok) return 0;
+  sigaddset(&uc->uc_sigmask, sig);
+  if (!ns_cs.nheld) sigemptyset(&ns_cs.held);
+  sigaddset(&ns_cs.held, sig);
+  ns_cs.nheld = 1;
+  return 1;
+}
+
 static void ns_trampoline(int sig, siginfo_t *si, void *uc) {
-  if (__atomic_load_n(&ns_cs.depth, __ATOMIC_RELAXED) > 0 && ns_defer(sig, si)) return;
+  if (__atomic_load_n(&ns_cs.depth, __ATOMIC_RELAXED) > 0 && (ns_defer(sig, si) || (uc && ns_park(sig, si, uc)))) return;
   uintptr_t h = __atomic_load_n(&ns_handlers[sig], __ATOMIC_ACQUIRE);
   if (!h) return;
   if (__atomic_load_n(&ns_siginfo[sig], __ATOMIC_RELAXED)) ((void (*)(int, siginfo_t *, void *))h)(sig, si, uc);
@@ -321,7 +343,19 @@ static void ns_restore(void) {
   __atomic_signal_fence(__ATOMIC_SEQ_CST);
   if (--ns_cs.depth == 0) {
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    int nheld = ns_cs.nheld;
+    sigset_t held;
+    if (nheld) {
+      held = ns_cs.held;
+      ns_cs.nheld = 0;
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    }
     if (ns_cs.count) ns_flush();
+    if (nheld) {
+      int saved = errno;
+      pthread_sigmask(SIG_UNBLOCK, &held, NULL);
+      errno = saved;
+    }
   }
 }
 
@@ -875,6 +909,7 @@ static void ns_key_init(void) {
 static int ns_hold(struct ns_dev *d) {
   if (ns_tq.d == d) return 1;
   if (!ns_dev_get(d)) return 0;
+  if (ns_tq.sleep) return 2;
   struct ns_dev *old = ns_tq.d;
   if (old) {
     ns_block();
@@ -891,6 +926,22 @@ static int ns_hold(struct ns_dev *d) {
   return 1;
 }
 
+static struct ns_q *ns_new_q(struct ns_dev *d, uint32_t *qi) {
+  struct ns_head *h = d->h;
+  uint32_t i;
+  if (!ns_pop(h, &h->q_free, 0, &i) && !ns_grow(&h->q_hwm, NS_QS, &i)) {
+    ns_sweep_dead(h);
+    if (!ns_pop(h, &h->q_free, 0, &i)) return NULL;
+  }
+  struct ns_q *q = ns_q(h, i);
+  q->proc = (uint32_t)d->proc;
+  q->waiting = 0;
+  q->sleeping = 0;
+  q->inuse = 1;
+  *qi = i;
+  return q;
+}
+
 static struct ns_q *ns_thread_q(struct ns_dev *d, uint32_t *qi) {
   struct ns_head *h = d->h;
   if (ns_tq.d != d) return NULL;
@@ -902,19 +953,10 @@ static struct ns_q *ns_thread_q(struct ns_dev *d, uint32_t *qi) {
     *qi = ns_tq.q - 1;
     return ns_q(h, *qi);
   }
-  uint32_t i;
-  if (!ns_pop(h, &h->q_free, 0, &i) && !ns_grow(&h->q_hwm, NS_QS, &i)) {
-    ns_sweep_dead(h);
-    if (!ns_pop(h, &h->q_free, 0, &i)) return NULL;
-  }
-  struct ns_q *q = ns_q(h, i);
-  q->proc = (uint32_t)d->proc;
-  q->waiting = 0;
-  q->sleeping = 0;
-  q->inuse = 1;
-  ns_tq.q = i + 1;
+  struct ns_q *q = ns_new_q(d, qi);
+  if (!q) return NULL;
+  ns_tq.q = *qi + 1;
   ns_tq.waiting = 0;
-  *qi = i;
   return q;
 }
 
@@ -1064,8 +1106,9 @@ static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
       for (uint32_t j = 0; j < i; j++)
         if (slots[j] == slots[i]) return EINVAL;
   }
+  int nested = ns_tq.sleep > 0;
   ns_block();
-  if (!all && !ns_tq.waiting) {
+  if (!all && (nested || !ns_tq.waiting)) {
     int dead = 0, got = ns_try_any(h, slots, gens, total, args.owner, &dead);
     if (got >= 0) {
       ns_restore();
@@ -1078,7 +1121,7 @@ static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
     }
   }
   uint32_t qi;
-  struct ns_q *q = ns_ready(d) ? ns_thread_q(d, &qi) : NULL;
+  struct ns_q *q = !ns_ready(d) ? NULL : nested ? ns_new_q(d, &qi) : ns_thread_q(d, &qi);
   if (!q) {
     ns_restore();
     return ENOMEM;
@@ -1100,7 +1143,7 @@ static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
   }
   q->total = total;
   q->waiting = 1;
-  ns_tq.waiting = 1;
+  if (!nested) ns_tq.waiting = 1;
   int bad = 0;
   if (!all) {
     for (uint32_t i = 0; i < total && !bad; i++) {
@@ -1152,14 +1195,17 @@ static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
   }
   int ret = 0;
   if (!bad && __atomic_load_n(&q->signaled, __ATOMIC_ACQUIRE) == -1) {
+    ns_tq.sleep++;
     ns_restore();
     ret = ns_sleep(q, &args);
     ns_block();
+    ns_tq.sleep--;
   }
   ns_drop_q(h, qi);
-  ns_tq.waiting = 0;
+  if (!nested) ns_tq.waiting = 0;
   int32_t got = __atomic_load_n(&q->signaled, __ATOMIC_ACQUIRE);
   int dead = (int)q->ownerdead;
+  if (nested) ns_free_q(h, qi);
   ns_restore();
   if (bad) return EINVAL;
   if (got != -1) {
@@ -1322,8 +1368,10 @@ int bl_ntsync_ioctl(int fd, unsigned long req, void *arg, int *rc) {
   uint64_t e = ns_lookup(fd);
   if (!e) return 0;
   struct ns_dev *d = &ns_devs[(e >> 56) & 7];
-  if (!ns_hold(d)) return 0;
+  int held = ns_hold(d);
+  if (!held) return 0;
   int out = 0, err = (e & NS_E_DEVICE) ? ns_dev_ioctl(d, req, arg, &out) : ns_obj_ioctl(d, e, req, arg);
+  if (held == 2) ns_dev_put(d);
   if (err) {
     errno = err;
     *rc = -1;
