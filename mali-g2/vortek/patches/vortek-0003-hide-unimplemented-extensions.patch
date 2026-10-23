@@ -2,7 +2,7 @@ diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
 index 1e3eaa2..56ae655 100644
 --- a/src/vulkan_calls.c
 +++ b/src/vulkan_calls.c
-@@ -245,7 +245,54 @@ VkResult vt_call_vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevic
+@@ -245,7 +245,65 @@ VkResult vt_call_vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevic
      return VK_SUCCESS;
  }
  
@@ -10,10 +10,21 @@ index 1e3eaa2..56ae655 100644
 +static void* findVkDispatchFuncWithName(const char* name);
 +#include "ext_commands.h"
 +
++/* [mali-g2] Hidden whatever their commands: presents end on the server's headless swapchain or a
++ * SurfaceControl layer, so the driver's present ids, waits and timings would describe frames
++ * other than those shown; present_wait2 and present_timing also postdate ext_commands.h. */
++static const char* const vt_hidden_extensions[] = {
++    "VK_KHR_present_id", "VK_KHR_present_id2", "VK_KHR_present_wait", "VK_KHR_present_wait2",
++    "VK_EXT_present_timing", "VK_GOOGLE_display_timing",
++};
++
 +/* [mali-g2] Only advertise device extensions whose commands this client implements: the
 + * loader aborts when an app calls a command of an advertised extension that the ICD cannot
 + * resolve (Steam's webhelper died on vkGetPhysicalDeviceFragmentShadingRatesKHR). */
 +static bool vt_extension_supported(const char* name) {
++    for (size_t i = 0; i < sizeof(vt_hidden_extensions) / sizeof(vt_hidden_extensions[0]); i++) {
++        if (strcmp(vt_hidden_extensions[i], name) == 0) return false;
++    }
 +    for (size_t i = 0; i < sizeof(vt_ext_commands) / sizeof(vt_ext_commands[0]); i++) {
 +        if (strcmp(vt_ext_commands[i].extension, name) != 0) continue;
 +        for (const char* const* c = vt_ext_commands[i].commands; *c; c++) {

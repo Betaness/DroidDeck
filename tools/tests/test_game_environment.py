@@ -338,6 +338,31 @@ class GameEnvironmentTest(unittest.TestCase):
         self.assertEqual(MODULE["engine_fixes"]("/game/FSD-Win64-Shipping.exe", []), ({}, [], []))
         self.assertEqual(MODULE["engine_fixes"]("/game/Other-WinGDK-Shipping.exe", []), ({}, [], []))
 
+    def test_vortek_games_get_the_app_frame_rate_limit_unless_they_have_their_own(self):
+        limit = MODULE["frame_rate_limit"]
+        with tempfile.TemporaryDirectory() as tmp:
+            game = str(Path(tmp) / "Game.exe")
+            command = ["/proton", "waitforexitandrun", game]
+            env = {"BL_GPU_MODE": "vortek", "BL_FPS": "40"}
+            self.assertEqual(limit(command, env), dict(env, DXVK_FRAME_RATE="40", VKD3D_FRAME_RATE="40",
+                                                       DXVK_CONFIG="dxvk.maxFrameRate = 40"))
+            filtered = dict(env, DXVK_CONFIG="d3d11.samplerAnisotropy = 16;")
+            self.assertEqual(limit(command, filtered)["DXVK_CONFIG"],
+                             "d3d11.samplerAnisotropy = 16; dxvk.maxFrameRate = 40")
+            for off in ({"BL_FPS": "0"}, {"BL_FPS": ""}, {"BL_GPU_MODE": "adreno"}):
+                self.assertEqual(limit(command, dict(env, **off)), dict(env, **off))
+            self.assertEqual(limit(["/proton", "run", game], env), env)
+            own = dict(env, DXVK_FRAME_RATE="0", VKD3D_FRAME_RATE="30")
+            self.assertEqual(limit(command, own), own)
+            configured = dict(env, DXVK_CONFIG="d3d11.samplerAnisotropy = 16; dxvk.maxFrameRate = 30")
+            self.assertEqual(limit(command, configured), dict(configured, VKD3D_FRAME_RATE="40"))
+            conf = Path(tmp) / "dxvk.conf"
+            conf.write_text("# dxvk.maxFrameRate = 0\n")
+            self.assertIn("DXVK_FRAME_RATE", limit(command, env))
+            conf.write_text("d3d9.maxFrameRate = 60\n")
+            self.assertEqual(limit(command, env), dict(env, VKD3D_FRAME_RATE="40"))
+            self.assertIn("DXVK_CONFIG", limit(command, dict(env, DXVK_CONFIG_FILE=str(Path(tmp) / "none.conf"))))
+
     def test_arkham_city_gets_full_x87_precision_over_the_preset(self):
         with tempfile.TemporaryDirectory() as tmp:
             city = Path(tmp) / "Batman Arkham City GOTY/Binaries/Win32"

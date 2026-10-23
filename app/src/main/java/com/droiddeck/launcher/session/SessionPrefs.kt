@@ -203,8 +203,10 @@ object SessionPrefs {
 
     private fun hudKey(context: Context) = if (mangoappSession(context)) "hudDeck" else "hud"
 
+    // [mali-g2] Vortek sessions run without gamescope, so mangoapp never runs there and the app's HUD
+    // keeps the plain "hud" key (a BL_GPU_MODE override in droiddeck-env is not followed here).
     private fun mangoappSession(context: Context) =
-        SessionState.mode == SessionService.MODE_STEAM && mangoapp(context)
+        SessionState.mode == SessionService.MODE_STEAM && mangoapp(context) && !VortekServerComponent.available(context)
 
     fun lowLatencyController(context: Context): Boolean = prefs(context).getBoolean("lowLatencyController", false)
 

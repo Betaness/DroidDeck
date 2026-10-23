@@ -300,6 +300,50 @@ def force_ssbs(command, env):
     return env
 
 
+def dxvk_frame_rate_set(command, env):
+    """Whether the game's DXVK configuration (DXVK_CONFIG, or the dxvk.conf it reads) has a frame rate
+    limit of its own; the app's limit would override it."""
+    texts = [env.get("DXVK_CONFIG", "").replace(";", "\n")]
+    # DXVK reads $DXVK_CONFIG_FILE, else dxvk.conf in its working directory (the game's, as this execs
+    # Proton); the one beside the executable is where players usually put it.
+    confs = ([env["DXVK_CONFIG_FILE"]] if env.get("DXVK_CONFIG_FILE")
+             else ["dxvk.conf", os.path.join(os.path.dirname(command[2]), "dxvk.conf")])
+    for conf in confs:
+        try:
+            with open(conf, encoding="utf-8", errors="replace") as source:
+                texts.append(source.read(65536))
+        except OSError:
+            pass
+    return any(re.match(r"(?:[\w.]+\.)?maxFrameRate\s*=", line.strip())
+               for text in texts for line in text.splitlines())
+
+
+def frame_rate_limit(command, env):
+    """[mali-g2] Vortek runs without gamescope, which held games to the app's frame rate limit (BL_FPS),
+    and the compositor only paces wl_shm buffers, not zero-copy layers: DXVK and vkd3d-proton keep to
+    it instead, sleeping in their own present thread. Games only (Steam's web views never come here);
+    a limit the game already has is kept."""
+    if env.get("BL_GPU_MODE") != "vortek" or len(command) < 3 or command[1] != "waitforexitandrun":
+        return env
+    fps = env.get("BL_FPS", "")
+    if not fps.isdigit() or int(fps) <= 0:
+        return env
+    names = [name for name in ("DXVK_FRAME_RATE", "VKD3D_FRAME_RATE") if name not in env]
+    if "DXVK_FRAME_RATE" in names and dxvk_frame_rate_set(command, env):
+        names.remove("DXVK_FRAME_RATE")
+    if not names:
+        return env
+    result = dict(env, **{name: fps for name in names})
+    if "DXVK_FRAME_RATE" in names:
+        # DXVK 3 dropped DXVK_FRAME_RATE for this option (2.x ignores the option, 3 the variable).
+        own = env.get("DXVK_CONFIG", "").strip().rstrip(";").strip()
+        limit = "dxvk.maxFrameRate = " + fps
+        result["DXVK_CONFIG"] = own + "; " + limit if own else limit
+        names.append("DXVK_CONFIG " + limit)
+    print("droiddeck-game-env: frame rate limit %s (%s)" % (fps, ", ".join(names)), file=sys.stderr)
+    return result
+
+
 EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
 
 
@@ -466,6 +510,7 @@ def main():
             print("droiddeck-game-env: invalid configuration; using inherited environment", file=sys.stderr)
     if app_id and len(command) > 1 and command[1] == "waitforexitandrun":
         command = offline_without_anticheat(command, env)
+    env = frame_rate_limit(command, env)
     if mic_enabled == "0":
         env["BANNER_AUDIO_DIRECT_MIC"] = "0"
     env = force_ssbs(command, env)
