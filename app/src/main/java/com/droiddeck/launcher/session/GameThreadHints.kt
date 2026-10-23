@@ -30,15 +30,16 @@ import kotlin.math.abs
  * carry no frame timing, the busy share is the signal (a capped game's frame interval looks the same
  * as a slow one's). Nothing is boosted while the device is critically hot or saves power.
  *
- * Nor while the game holds the panel's rate or a fraction of it ([holdsPace]): there is nothing to
+ * Nor while the game holds the panel's rate or the session's frame rate limit ([holdsPace]): there is nothing to
  * gain, and it cost frame pacing - Serious Sam capped at 120 fps ran its boosted main thread on prime
  * cores the governor kept at 2.2 GHz, slower than a 3.5 GHz mid core, and 23-25% of its frames fell
  * under 90 fps against 2-7% unboosted. A game with no frames (Factorio's benchmark, a loading screen)
  * or one falling behind the panel is boosted; one holding pace keeps what it has for [PACE_LEAVE_S]
- * seconds and is then let go. Holding pace needs a thread with room to spare as well
- * ([limitedBy]): a CPU-bound game that happens to run near 60 fps on a 120 Hz panel has its busiest
- * thread near full, and letting it go moved Duckov's main thread from a 4.2 GHz prime core to a mid
- * core and kept it at 60 fps where it had run 73.
+ * seconds and is then let go. Half or a third of the panel's rate is no limiter: nothing in the session
+ * halves the rate of a game that misses a refresh (no gamescope, the layers are FIFO at the panel's
+ * rate), so a CPU-bound game near 60 fps on a 120 Hz panel is just slow. Counting it as paced trapped
+ * Duckov: a dip to ~60 fps (a loading screen) let its main thread go from a 4.2 GHz prime core to a
+ * mid core, where it stayed at 58-60 fps instead of 73.
  */
 object GameThreadHints {
     private val HINTED_SOCS = setOf("CQ8725S", "O3")
@@ -53,8 +54,6 @@ object GameThreadHints {
     private const val PACE_WINDOW_S = 3
     private const val PACE_LEAVE_S = 10
     private const val PACE_TOLERANCE = 0.08
-    /** Busier than this, the busiest thread is what limits the game, whatever its frame rate. */
-    internal const val PACE_MAX_BUSY = 0.75
 
     /** Busy, but not the game: the app itself and the Steam client, whose UI would otherwise hold the prime cores. */
     private val NOT_GAMES = setOf("steam", "steamwebhelper")
@@ -96,8 +95,8 @@ object GameThreadHints {
                     frames.addLast(WaylandCompositor.gameFrameCount())
                     if (frames.size > PACE_WINDOW_S + 1) frames.removeFirst()
                     val fps = (frames.last() - frames.first()).toDouble() / (frames.size - 1).coerceAtLeast(1)
-                    val paced = frames.size > PACE_WINDOW_S && holdsPace(fps, SessionState.refreshHz.toDouble()) &&
-                        limitedBy(busy.values.maxOrNull() ?: 0.0)
+                    val paced = frames.size > PACE_WINDOW_S &&
+                        holdsPace(fps, SessionState.refreshHz.toDouble(), SessionState.fpsLimit)
                     pacedFor = if (paced) pacedFor + 1 else 0
                     // Not SEVERE: the Odin 3 reports it once its skin reaches 50 C, a couple of minutes into any game.
                     val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
@@ -144,18 +143,12 @@ object GameThreadHints {
     }
 
     /**
-     * Whether a game presenting [fps] frames a second keeps up with a [refreshHz] panel: within
-     * [PACE_TOLERANCE] of the rate or of a half, a third or a quarter of it (a 60 fps limiter on 120 Hz).
+     * Whether a game presenting [fps] frames a second keeps up: within [PACE_TOLERANCE] of the
+     * [refreshHz] panel's rate, or of the session's frame rate limit [fpsLimit] (0: none).
      * A game with next to no frames (a headless benchmark, a loading screen) does not.
      */
-    internal fun holdsPace(fps: Double, refreshHz: Double): Boolean =
-        fps >= 10 && refreshHz > 0 && (1..4).any { k -> abs(fps - refreshHz / k) < PACE_TOLERANCE * refreshHz / k }
-
-    /**
-     * Whether a game whose busiest thread is busy [busiest] of the time waits on a limiter or vsync:
-     * a limited game's threads sleep part of every frame, a CPU-bound one's busiest thread does not.
-     */
-    internal fun limitedBy(busiest: Double): Boolean = busiest < PACE_MAX_BUSY
+    internal fun holdsPace(fps: Double, refreshHz: Double, fpsLimit: Int = 0): Boolean =
+        fps >= 10 && listOf(refreshHz, fpsLimit.toDouble()).any { rate -> rate > 0 && abs(fps - rate) < PACE_TOLERANCE * rate }
 
     /**
      * The threads to boost next: those already boosted that are still above [LEAVE], then new ones

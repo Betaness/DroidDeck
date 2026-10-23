@@ -24,17 +24,17 @@ class GameThreadHintsTest {
         assertEquals(setOf(2), GameThreadHints.pick(setOf(1, 2), mapOf(2 to 0.7)))
     }
 
-    @Test fun `a game at the panel's rate or a fraction of it holds pace`() {
+    @Test fun `a game at the panel's rate or at the session's limit holds pace`() {
         assertTrue(GameThreadHints.holdsPace(119.0, 120.0))
-        assertTrue(GameThreadHints.holdsPace(60.5, 120.0))
-        assertTrue(GameThreadHints.holdsPace(30.0, 120.0))
+        assertTrue(GameThreadHints.holdsPace(60.5, 120.0, 60))   // the app's 60 fps limit
+        assertTrue(GameThreadHints.holdsPace(29.6, 120.0, 30))
         assertFalse(GameThreadHints.holdsPace(92.0, 120.0))   // falling behind: boost
         assertFalse(GameThreadHints.holdsPace(105.0, 120.0))
         assertFalse(GameThreadHints.holdsPace(3.0, 120.0))    // headless or loading: boost
     }
 
-    @Test fun `a saturated thread at half the panel rate is not held by a limiter`() {
-        assertFalse(GameThreadHints.limitedBy(0.83))  // Duckov's main thread at ~60 fps on a mid core
-        assertTrue(GameThreadHints.limitedBy(0.45))   // a 60 fps limiter leaves the thread idle part of each frame
+    @Test fun `a CPU-bound game near half the panel's rate is not limited`() {
+        assertFalse(GameThreadHints.holdsPace(59.0, 120.0))   // Duckov on a mid core: keep boosting
+        assertFalse(GameThreadHints.holdsPace(30.0, 120.0))
     }
 }
