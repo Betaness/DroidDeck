@@ -196,12 +196,15 @@ static void layers_init(void) {
     g_layers[SC_LAYER_GAME] = (struct layer){.name = "droiddeck_wayland_game", .z = 1, .pool_n = POOL_MAX,
                                              .cur_slot = -1, .votes_rate = 1, .fps_applied = -1.0f, .hr_applied = -1.0f,
                                              .ds_applied = -1};
-    g_layers[SC_LAYER_OVERLAY] = (struct layer){.name = "droiddeck_wayland_overlay", .z = 2, .pool_n = 3,
+    g_layers[SC_LAYER_OVERLAY] = (struct layer){.name = "droiddeck_wayland_overlay", .z = SC_OVERLAY_Z, .pool_n = 3,
                                                 .cur_slot = -1, .votes_rate = 0, .fps_applied = -1.0f,
                                                 .hr_applied = -1.0f, .ds_applied = -1};
-    g_layers[SC_LAYER_VORTEK] = (struct layer){.name = "droiddeck_vortek_game", .z = 1, .pool_n = 0,
-                                               .cur_slot = -1, .votes_rate = 1, .fps_applied = -1.0f,
-                                               .hr_applied = -1.0f, .ds_applied = -1};
+    static const char *const vortek_names[SC_VORTEK_LAYERS] = {"droiddeck_vortek_game", "droiddeck_vortek_1",
+                                                                "droiddeck_vortek_2", "droiddeck_vortek_3"};
+    for (int i = 0; i < SC_VORTEK_LAYERS; i++)
+        g_layers[SC_LAYER_VORTEK + i] = (struct layer){.name = vortek_names[i], .z = SC_VORTEK_Z_BASE + i, .pool_n = 0,
+                                                       .cur_slot = -1, .votes_rate = 1, .fps_applied = -1.0f,
+                                                       .hr_applied = -1.0f, .ds_applied = -1};
     for (int i = 0; i < SC_LAYER_COUNT; i++)
         for (int j = 0; j < POOL_MAX; j++) g_layers[i].slots[j].release_fd = -1;
 }
@@ -238,7 +241,7 @@ static void on_complete(void *context, ASurfaceTransactionStats *stats) {
     pthread_mutex_unlock(&g_lock);
     if (ctx->prev_token) {
         int fd = (stats && ctx->sc) ? api.prevReleaseFence(stats, ctx->sc) : -1;
-        if (ctx->layer == SC_LAYER_VORTEK) vortek_present_released(ctx->prev_token, fd);
+        if (ctx->layer >= SC_LAYER_VORTEK) vortek_present_released(ctx->prev_token, fd);
         else ahb_swapchain_layer_released(ctx->prev_token, fd);
     }
     if (ctx->retire && ctx->sc) api.release(ctx->sc);
@@ -297,7 +300,7 @@ int sc_layer_base_black(int width, int height) {
     ARect src = {0, 0, 16, 16}, dst = {0, 0, width, height};
     api.setBuffer(tx, g_base_sc, black, -1);
     api.setBufferTransparency(tx, g_base_sc, ASC_TRANSPARENCY_OPAQUE);
-    api.setZOrder(tx, g_base_sc, 0); /* GAME = 1, OVERLAY = 2 */
+    api.setZOrder(tx, g_base_sc, 0); /* GAME = 1, Vortek layers above, OVERLAY = SC_OVERLAY_Z */
     api.setGeometry(tx, g_base_sc, &src, &dst, 0);
     api.setVisibility(tx, g_base_sc, ASC_VISIBILITY_SHOW);
     api.txApply(tx); api.txDelete(tx);
@@ -343,7 +346,7 @@ static void retire_sc(struct layer *l) {
         api.txApply(tx);
         api.txDelete(tx);
     } else {
-        if (l->cur_token && l == &g_layers[SC_LAYER_VORTEK]) vortek_present_released(l->cur_token, -1);
+        if (l->cur_token && l >= &g_layers[SC_LAYER_VORTEK]) vortek_present_released(l->cur_token, -1);
         else if (l->cur_token) ahb_swapchain_layer_released(l->cur_token, -1);
         api.release(l->sc);
     }
@@ -802,17 +805,20 @@ unavailable:
     return -1;
 }
 
-int sc_layer_present_vortek(AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
+int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
                             int x, int y, int w, int h, int scene_w, int scene_h) {
-    struct layer *l = layer_of(SC_LAYER_VORTEK);
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     int r[8];
-    if (!ahb || !token || w <= 0 || h <= 0 || ensure_sc(l) != 0) goto unavailable;
+    if (!l || !ahb || !token || w <= 0 || h <= 0) goto unavailable;
+    int restack = l->z != z;
+    l->z = z;
+    if (ensure_sc(l) != 0) goto unavailable;
     if (vkp_update_map(scene_w, scene_h) != 0) goto unavailable;
     if (!vkp_map_window(buf_w, buf_h, x, y, w, h, scene_w, scene_h, r)) goto unavailable;
     ASurfaceTransaction *tx = api.txCreate();
     if (!tx) goto unavailable;
     ASurfaceControl *old = swap_sc_begin(l);
-    if (old) api.setZOrder(tx, l->sc, l->z);
+    if (old || restack) api.setZOrder(tx, l->sc, l->z);
     api.setBuffer(tx, l->sc, ahb, acquire_fd);
     api.setBufferTransparency(tx, l->sc, ASC_TRANSPARENCY_OPAQUE);
     apply_geometry(tx, l, r);
@@ -835,10 +841,25 @@ unavailable:
     return -1;
 }
 
-void sc_layer_hide_vortek(void) {
+void sc_layer_hide_vortek(int slot) {
     layers_init();
-    struct layer *l = &g_layers[SC_LAYER_VORTEK];
+    if (slot < 0 || slot >= SC_VORTEK_LAYERS) return;
+    struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
     if (l->shown) hide_layer(l);
+}
+
+void sc_layer_vortek_z(int slot, int z) {
+    layers_init();
+    if (slot < 0 || slot >= SC_VORTEK_LAYERS) return;
+    struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
+    if (l->z == z) return;
+    l->z = z;
+    if (!l->sc || api.state != 1) return;
+    ASurfaceTransaction *tx = api.txCreate();
+    if (!tx) return;
+    api.setZOrder(tx, l->sc, z);
+    api.txApply(tx);
+    api.txDelete(tx);
 }
 
 int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const struct droiddeck_color *color) {

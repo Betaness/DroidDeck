@@ -23,6 +23,9 @@
  * compositor is reachable, a present that no other X window covers is handed to the server
  * (REQUEST_CODE_DD_PRESENT_ZERO_COPY) with the window's root rectangle, and the compositor shows the
  * image itself; nothing is copied. Otherwise the frame takes the X11 path below.
+ * The compositor has several such layers, ordered by the windows' X stacking: a window stays
+ * zero-copy under another window of this process that is zero-copy itself (Steam's side menu
+ * over its main view), since that window's layer covers it.
  *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * Based on Vortek (C) brunodev85, LGPL-2.1.
@@ -31,6 +34,7 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -108,7 +112,52 @@ typedef struct X11Swapchain {
     xcb_window_t blocker;
     int16_t blockerRect[4];
     int lastPath;
+    /* X stacking position, root level first: each level's index among its siblings + 1 */
+    uint64_t stackKey;
+    /* What other swapchains of this process may read, under registryLock: whether this window's
+     * frames are on a compositor layer, where, and the window's ancestors. */
+    struct {
+        bool shown;
+        int32_t rect[4];
+        xcb_window_t window;
+        int chainLength;
+        xcb_window_t chain[16];
+    } pub;
 } X11Swapchain;
+
+/* Every X11Swapchain of this process, to tell which windows are on compositor layers. */
+#define MAX_TRACKED_SWAPCHAINS 64
+static pthread_mutex_t registryLock = PTHREAD_MUTEX_INITIALIZER;
+static X11Swapchain* registry[MAX_TRACKED_SWAPCHAINS];
+
+static void registryAdd(X11Swapchain* sc) {
+    pthread_mutex_lock(&registryLock);
+    for (int i = 0; i < MAX_TRACKED_SWAPCHAINS; i++) {
+        if (!registry[i]) {
+            registry[i] = sc;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&registryLock);
+}
+
+static void registryRemove(X11Swapchain* sc) {
+    pthread_mutex_lock(&registryLock);
+    for (int i = 0; i < MAX_TRACKED_SWAPCHAINS; i++) if (registry[i] == sc) registry[i] = NULL;
+    pthread_mutex_unlock(&registryLock);
+}
+
+static void publishLayer(X11Swapchain* sc, bool shown, int x, int y, int w, int h) {
+    pthread_mutex_lock(&registryLock);
+    sc->pub.shown = shown;
+    if (shown) {
+        sc->pub.rect[0] = x; sc->pub.rect[1] = y; sc->pub.rect[2] = w; sc->pub.rect[3] = h;
+        sc->pub.window = sc->surface->window;
+        sc->pub.chainLength = sc->chainLength;
+        memcpy(sc->pub.chain, sc->chain, sizeof(sc->chain));
+    }
+    pthread_mutex_unlock(&registryLock);
+}
 
 static struct {
     bool loaded;
@@ -266,6 +315,7 @@ void X11Present_onCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKH
     sc->format = createInfo->imageFormat;
     sc->extent = createInfo->imageExtent;
     for (int i = 0; i < SHM_BUFFER_COUNT; i++) sc->shm[i].shmId = -1;
+    registryAdd(sc);
 
     switch (sc->format) {
         case VK_FORMAT_B8G8R8A8_UNORM:
@@ -502,6 +552,7 @@ void X11Present_onDestroySwapchain(VkDevice device, VkSwapchainKHR swapchain) {
     VkObject* swapchainObject = VkObject_fromHandle(swapchain);
     X11Swapchain* sc = swapchainObject->tag;
     if (!sc) return;
+    registryRemove(sc);
     if (sc->ready) {
         fprintf(stderr, "vortek-x11: swapchain %ux%u destroyed after %llu frames\n", sc->extent.width, sc->extent.height, (unsigned long long)sc->frames);
     }
@@ -597,6 +648,24 @@ static bool rectContains(int ox, int oy, int ow, int oh, int x, int y, int w, in
     return ox <= x && oy <= y && ox + ow >= x + w && oy + oh >= y + h;
 }
 
+/* Whether another window of this process shows its frames on a compositor layer that covers all of
+ * `win` (at ox,oy ow x oh in root coordinates): `win` is that window or one of its ancestors. That
+ * window is stacked above ours (it is `win` or inside it), so its layer is above ours too. */
+static bool coveredByOwnLayer(X11Swapchain* sc, xcb_window_t win, int ox, int oy, int ow, int oh) {
+    bool found = false;
+    pthread_mutex_lock(&registryLock);
+    for (int i = 0; i < MAX_TRACKED_SWAPCHAINS && !found; i++) {
+        X11Swapchain* other = registry[i];
+        if (!other || other == sc || !other->pub.shown) continue;
+        if (!rectContains(other->pub.rect[0], other->pub.rect[1], other->pub.rect[2], other->pub.rect[3], ox, oy, ow, oh))
+            continue;
+        if (other->pub.window == win) found = true;
+        for (int j = 0; j < other->pub.chainLength && !found; j++) if (other->pub.chain[j] == win) found = true;
+    }
+    pthread_mutex_unlock(&registryLock);
+    return found;
+}
+
 static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* stale, bool* covered) {
     xcb_connection_t* conn = sc->surface->conn;
     int levels = sc->chainLength;
@@ -614,11 +683,15 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
     int total = 0;
     xcb_window_t candidates[256];
     int16_t originX[256], originY[256];
+    uint64_t key = 0;
     for (int i = 0; ok && i < levels; i++) {
         xcb_window_t* children = xcb_query_tree_children(replies[i]);
         int count = xcb_query_tree_children_length(replies[i]), mine = -1;
         for (int k = 0; k < count; k++) if (children[k] == sc->chain[i]) mine = k;
         if (mine < 0) { *stale = true; break; }
+        /* 16 bits per level for the four levels nearest the root (levels - 1 is the root's child). */
+        int fromRoot = levels - 1 - i;
+        if (fromRoot < 4) key |= (uint64_t)(mine + 1 > 0xffff ? 0xffff : mine + 1) << (48 - 16 * fromRoot);
         for (int k = mine + 1; k < count && total < 256; k++) {
             candidates[total] = children[k];
             originX[total] = sc->chainX[i];
@@ -637,6 +710,7 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
         }
     }
     for (int i = 0; i <= levels; i++) free(replies[i]);
+    if (ok && !*stale) sc->stackKey = key;
     xcb_get_window_attributes_reply_t* self = xcb_get_window_attributes_reply(conn, selfAttrs, NULL);
     /* Viewable means the window and all its ancestors are mapped. */
     *covered = !self || self->map_state != XCB_MAP_STATE_VIEWABLE;
@@ -661,7 +735,7 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
                 (g->width > 1 || g->height > 1)) {
                 int ox = originX[k] + g->x, oy = originY[k] + g->y;
                 int ow = g->width + 2 * g->border_width, oh = g->height + 2 * g->border_width;
-                if (rectsOverlap(x, y, w, h, ox, oy, ow, oh)) {
+                if (rectsOverlap(x, y, w, h, ox, oy, ow, oh) && !coveredByOwnLayer(sc, candidates[k], ox, oy, ow, oh)) {
                     if (!occluded) {
                         sc->blocker = candidates[k];
                         sc->blockerRect[0] = (int16_t)ox; sc->blockerRect[1] = (int16_t)oy;
@@ -786,7 +860,7 @@ static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint
     sc->occluded = checkOccluded(sc, x, y, w, h);
     if (sc->occluded) return VK_NOT_READY;
 
-    char payload[sizeof(DDPresentZeroCopy) + 16 * sizeof(uint64_t)];
+    char payload[sizeof(DDPresentZeroCopy) + 17 * sizeof(uint64_t)];
     DDPresentZeroCopy request = {0};
     request.swapchainId = VkObject_fromHandle(swapchain)->id;
     request.imageIndex = imageIndex;
@@ -796,14 +870,16 @@ static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint
     request.h = h;
     request.rootW = sc->rootW;
     request.rootH = sc->rootH;
-    request.waitCount = waitCount;
+    request.waitCount = waitCount | DD_ZC_FLAG_STACK_KEY;
     memcpy(payload, &request, sizeof(request));
+    memcpy(payload + sizeof(request), &sc->stackKey, sizeof(uint64_t));
     for (uint32_t i = 0; i < waitCount; i++) {
         uint64_t id = VkObject_fromHandle(waits[i])->id;
-        memcpy(payload + sizeof(request) + i * sizeof(uint64_t), &id, sizeof(id));
+        memcpy(payload + sizeof(request) + (i + 1) * sizeof(uint64_t), &id, sizeof(id));
     }
     VkResult result = (VkResult)droiddeck_request(REQUEST_CODE_DD_PRESENT_ZERO_COPY, payload,
-                                                  (int)(sizeof(request) + waitCount * sizeof(uint64_t)));
+                                                  (int)(sizeof(request) + (waitCount + 1) * sizeof(uint64_t)));
+    if (result == VK_SUCCESS) publishLayer(sc, true, x, y, w, h);
     if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
         if (sc->zeroCopy == 1) fprintf(stderr, "vortek-x11: zero-copy stopped, presenting through X11\n");
         sc->zeroCopy = -1;
@@ -821,6 +897,8 @@ enum { PATH_ZERO_COPY = 1, PATH_COVERED, PATH_OCCLUDED, PATH_X11 };
 static void notePath(X11Swapchain* sc, int path) {
     if (path == sc->lastPath) return;
     sc->lastPath = path;
+    /* Off the layer: the server takes it down when it sees this frame's present. */
+    if (path != PATH_ZERO_COPY) publishLayer(sc, false, 0, 0, 0, 0);
     const char* what = path == PATH_ZERO_COPY ? "zero-copy"
                      : path == PATH_COVERED   ? "hidden, frames paced"
                      : path == PATH_OCCLUDED  ? "through X11, partly covered"
@@ -851,9 +929,39 @@ static void countFrame(X11Swapchain* sc) {
     }
 }
 
+/* A window whose frames are on a compositor layer may be unmapped and never present again (a
+ * closed menu): its layer would stay over the windows below. Checked at most every 100 ms from
+ * any present of this process; such a layer is taken down (DD_ZC_FLAG_HIDE). */
+static void sweepStaleLayers(void) {
+    static double lastSweep;
+    double now = nowSeconds();
+    if (now - lastSweep < 0.1) return;
+    lastSweep = now;
+    pthread_mutex_lock(&registryLock);
+    for (int i = 0; i < MAX_TRACKED_SWAPCHAINS; i++) {
+        X11Swapchain* other = registry[i];
+        if (!other || !other->pub.shown) continue;
+        xcb_connection_t* conn = other->surface->conn;
+        xcb_get_window_attributes_reply_t* a =
+            xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, other->surface->window), NULL);
+        bool viewable = a && a->map_state == XCB_MAP_STATE_VIEWABLE;
+        free(a);
+        if (viewable) continue;
+        DDPresentZeroCopy request = {0};
+        request.swapchainId = VkObject_fromHandle(other->handle)->id;
+        request.waitCount = DD_ZC_FLAG_HIDE;
+        droiddeck_request(REQUEST_CODE_DD_PRESENT_ZERO_COPY, &request, (int)sizeof(request));
+        other->pub.shown = false;
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u is no longer viewable, its layer was taken down\n",
+                other->surface->window, other->extent.width, other->extent.height);
+    }
+    pthread_mutex_unlock(&registryLock);
+}
+
 VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, VkResult* results) {
     VkResult overall = VK_SUCCESS;
     bool waitedSemaphores = false;
+    sweepStaleLayers();
 
     for (uint32_t i = 0; i < presentInfo->swapchainCount; i++) {
         VkResult result = VK_SUCCESS;

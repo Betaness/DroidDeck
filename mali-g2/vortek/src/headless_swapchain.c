@@ -688,7 +688,7 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
  * client can present through X11 instead. */
 VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t index, const VkSemaphore* waitSemaphores,
                                           uint32_t waitCount, int32_t x, int32_t y, int32_t w, int32_t h,
-                                          uint32_t rootW, uint32_t rootH, void* context) {
+                                          uint32_t rootW, uint32_t rootH, uint64_t stackKey, void* context) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     if (!headless || !headless->owner || !headless->zeroCopy || index >= (uint32_t)swapchain->imageCount ||
         !vulkanWrapper.vkGetFenceFd) {
@@ -747,7 +747,7 @@ VkResult XWindowSwapchain_presentZeroCopy(XWindowSwapchain* swapchain, uint32_t 
     pthread_mutex_lock(&zcLock);
     headless->owner[index] = OWNER_COMPOSITOR;
     pthread_mutex_unlock(&zcLock);
-    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, rootW, rootH, fd)) {
+    if (ZeroCopy_present(headless->chainId, index, x, y, w, h, rootW, rootH, stackKey, fd)) {
         headless->shown = true;
     }
     else {
@@ -955,24 +955,44 @@ void XWindowSwapchain_forgetContext(void* context) {
     }
 }
 
+/* DD_ZC_FLAG_HIDE: the client's window is gone or hidden; its frames leave the screen. Images the
+ * compositor holds come back with its release messages. */
+static VkResult hideZeroCopy(XWindowSwapchain* swapchain) {
+    HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
+    if (!headless || !headless->owner) return VK_SUCCESS;
+    pthread_mutex_lock(&zcLock);
+    bool hide = headless->shown;
+    headless->shown = false;
+    pthread_mutex_unlock(&zcLock);
+    if (hide) ZeroCopy_hide(headless->chainId);
+    return VK_SUCCESS;
+}
+
 /* REQUEST_CODE_DD_PRESENT_ZERO_COPY, dispatched by the patched getHandleRequestFunc. */
 void droiddeck_handlePresentZeroCopy(VkContext* context) {
     VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
     DDPresentZeroCopy request;
     if (context->inputBufferSize >= (int)sizeof(request)) {
         memcpy(&request, context->inputBuffer, sizeof(request));
-        uint32_t count = request.waitCount;
-        if (count <= 16 && context->inputBufferSize >= (int)(sizeof(request) + count * sizeof(uint64_t))) {
+        uint32_t flags = request.waitCount & ~DD_ZC_WAIT_COUNT_MASK;
+        uint32_t count = request.waitCount & DD_ZC_WAIT_COUNT_MASK;
+        uint32_t extra = (flags & DD_ZC_FLAG_STACK_KEY) ? 1 : 0;
+        if (flags & DD_ZC_FLAG_HIDE) {
+            result = hideZeroCopy(VkObject_fromId(request.swapchainId));
+        }
+        else if (count <= 16 && context->inputBufferSize >= (int)(sizeof(request) + (count + extra) * sizeof(uint64_t))) {
+            uint64_t stackKey = 0;
+            if (extra) memcpy(&stackKey, context->inputBuffer + sizeof(request), sizeof(stackKey));
             VkSemaphore semaphores[16];
             for (uint32_t i = 0; i < count; i++) {
                 uint64_t id;
-                memcpy(&id, context->inputBuffer + sizeof(request) + i * sizeof(uint64_t), sizeof(id));
+                memcpy(&id, context->inputBuffer + sizeof(request) + (i + extra) * sizeof(uint64_t), sizeof(id));
                 semaphores[i] = VkObject_fromId(id);
             }
             XWindowSwapchain* swapchain = VkObject_fromId(request.swapchainId);
             result = XWindowSwapchain_presentZeroCopy(swapchain, request.imageIndex, semaphores, count,
                                                       request.x, request.y, request.w, request.h,
-                                                      request.rootW, request.rootH, context);
+                                                      request.rootW, request.rootH, stackKey, context);
             if (result == VK_ERROR_DEVICE_LOST) context->status = result;
         }
     }

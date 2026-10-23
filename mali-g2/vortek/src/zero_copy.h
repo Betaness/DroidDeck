@@ -35,6 +35,7 @@ typedef struct ZeroCopyMsg {
     uint32_t width, height;
     int32_t x, y, w, h;
     uint32_t rootW, rootH;
+    uint32_t keyHi, keyLo;  /* PRESENT: X stacking key, a higher one goes on a higher layer */
 } ZeroCopyMsg;
 
 /* index ZC_RELEASE_ALL: the compositor went away and holds nothing any more;
@@ -48,7 +49,7 @@ bool ZeroCopy_available(void);
 void ZeroCopy_setReleaseHandler(ZeroCopyReleaseFunc func);
 bool ZeroCopy_createChain(uint32_t chain, uint32_t width, uint32_t height, AHardwareBuffer** buffers, uint32_t count);
 bool ZeroCopy_present(uint32_t chain, uint32_t index, int32_t x, int32_t y, int32_t w, int32_t h,
-                      uint32_t rootW, uint32_t rootH, int acquireFd);
+                      uint32_t rootW, uint32_t rootH, uint64_t stackKey, int acquireFd);
 /* False while the compositor needs the composited scene (screen effects and the like). */
 bool ZeroCopy_accepting(void);
 void ZeroCopy_hide(uint32_t chain);

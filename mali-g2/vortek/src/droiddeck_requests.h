@@ -23,6 +23,13 @@ typedef struct DDPresentZeroCopy {
     uint32_t waitCount;
 } DDPresentZeroCopy;
 
+/* Flags in the high bits of DDPresentZeroCopy.waitCount. STACK_KEY: a uint64 stacking key follows
+ * the struct, before the semaphore ids; the compositor puts windows with a higher key on a higher
+ * layer. HIDE: no image, take this swapchain's layer off the screen (its window is gone or hidden). */
+#define DD_ZC_FLAG_STACK_KEY 0x80000000u
+#define DD_ZC_FLAG_HIDE 0x40000000u
+#define DD_ZC_WAIT_COUNT_MASK 0x0000ffffu
+
 /* Payload: the layout of REQUEST_CODE_VK_END_COMMAND_BUFFER (uint64 command buffer id, then the
  * recorded commands, each an 8-byte header {requestCode, size} and its serialized arguments). The
  * server replays the commands into the command buffer without ending it. No reply. The client sends

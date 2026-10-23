@@ -140,9 +140,9 @@ bool ZeroCopy_accepting(void) {
 }
 
 bool ZeroCopy_present(uint32_t chain, uint32_t index, int32_t x, int32_t y, int32_t w, int32_t h,
-                      uint32_t rootW, uint32_t rootH, int acquireFd) {
+                      uint32_t rootW, uint32_t rootH, uint64_t stackKey, int acquireFd) {
     ZeroCopyMsg msg = {.type = ZC_MSG_PRESENT, .chain = chain, .index = index, .x = x, .y = y, .w = w, .h = h,
-                       .rootW = rootW, .rootH = rootH};
+                       .rootW = rootW, .rootH = rootH, .keyHi = (uint32_t)(stackKey >> 32), .keyLo = (uint32_t)stackKey};
     pthread_mutex_lock(&lock);
     bool ok = connFd >= 0 && sendMsg(connFd, &msg, acquireFd) == 0;
     if (!ok) disconnectLocked();

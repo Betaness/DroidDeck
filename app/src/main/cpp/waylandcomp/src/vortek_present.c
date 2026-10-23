@@ -31,9 +31,18 @@ static int g_conn_fd = -1;
 static int g_scene_w, g_scene_h;
 void droiddeck_count_game_frame(void);
 static unsigned g_stat_frames;
-static uint32_t g_shown_chain;
-static int32_t g_shown_rect[4];
-static int g_shown;
+/* One SurfaceControl layer per window shown zero-copy (Steam's main view and its side menu, a game),
+ * stacked like the windows: by the client's X stacking key, then by arrival. */
+#define VP_LAYERS SC_VORTEK_LAYERS
+struct vp_shown {
+    uint32_t chain;           /* 0: free */
+    int32_t rect[4];          /* X root coordinates */
+    uint64_t key;
+    uint32_t seq;
+    int z;
+};
+static struct vp_shown g_show[VP_LAYERS];
+static uint32_t g_show_seq;
 static int g_first_logged;
 static int g_accept = 1;
 
@@ -123,10 +132,43 @@ static void refuse(uint32_t chain, const char *why) {
     droiddeck_log("vortek", "zero-copy refused for swapchain %u: %s", chain, why);
 }
 
+static void hide_slot(int i) {
+    if (!g_show[i].chain) return;
+    sc_layer_hide_vortek(i);
+    memset(&g_show[i], 0, sizeof(g_show[i]));
+}
+
+static void hide_chain(uint32_t chain) {
+    for (int i = 0; i < VP_LAYERS; i++)
+        if (g_show[i].chain == chain) hide_slot(i);
+}
+
 static void hide(void) {
-    if (!g_shown) return;
-    sc_layer_hide_vortek();
-    g_shown = 0;
+    for (int i = 0; i < VP_LAYERS; i++) hide_slot(i);
+}
+
+/* Layer order from the stacking keys; returns the z of `slot` and moves the other layers whose
+ * place changed. The z values sit between sc_layer's GAME and OVERLAY layers. */
+static int restack(int slot) {
+    int order[VP_LAYERS], n = 0;
+    for (int i = 0; i < VP_LAYERS; i++) if (g_show[i].chain) order[n++] = i;
+    for (int a = 1; a < n; a++) {
+        int cur = order[a], b = a - 1;
+        while (b >= 0 && (g_show[order[b]].key > g_show[cur].key ||
+                          (g_show[order[b]].key == g_show[cur].key && g_show[order[b]].seq > g_show[cur].seq))) {
+            order[b + 1] = order[b];
+            b--;
+        }
+        order[b + 1] = cur;
+    }
+    int z = SC_VORTEK_Z_BASE;
+    for (int r = 0; r < n; r++) {
+        int i = order[r], want = SC_VORTEK_Z_BASE + r;
+        if (i == slot) z = want;
+        else if (g_show[i].z != want) sc_layer_vortek_z(i, want);
+        g_show[i].z = want;
+    }
+    return z;
 }
 
 static void drop_connection(void) {
@@ -145,7 +187,7 @@ static void drop_connection(void) {
 static void on_create(int fd, const struct vp_msg *m) {
     struct vp_chain *c = chain_of(m->chain);
     if (c) {
-        if (g_shown && g_shown_chain == m->chain) hide();
+        hide_chain(m->chain);
         chain_free(c);
     }
     c = chain_of(0);
@@ -172,10 +214,6 @@ static void on_create(int fd, const struct vp_msg *m) {
     droiddeck_log("vortek", "zero-copy swapchain %u: %ux%u, %u AHardwareBuffers", c->id, c->w, c->h, c->n);
 }
 
-static int rects_overlap(const int32_t a[4], const struct vp_msg *m) {
-    return a[0] < m->x + m->w && m->x < a[0] + a[2] && a[1] < m->y + m->h && m->y < a[1] + a[3];
-}
-
 static void on_present(const struct vp_msg *m, int acquire_fd) {
     struct vp_chain *c = chain_of(m->chain);
     if (!c || m->index >= c->n || !c->ahb[m->index] || g_scene_w <= 0 || g_scene_h <= 0 || !g_accept) {
@@ -184,30 +222,52 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         if (!c) refuse(m->chain, "unknown swapchain");
         return;
     }
-    /* One layer: a swapchain recreated for the same window takes it over, another window does not. */
-    if (g_shown && g_shown_chain != m->chain && !rects_overlap(g_shown_rect, m)) {
-        if (acquire_fd >= 0) close(acquire_fd);
-        send_release(m->chain, m->index, -1);
-        refuse(m->chain, "another window already uses the layer");
-        return;
+    int slot = -1, fresh = 0;
+    for (int i = 0; i < VP_LAYERS && slot < 0; i++) if (g_show[i].chain == m->chain) slot = i;
+    if (slot < 0) {
+        fresh = 1;
+        for (int i = 0; i < VP_LAYERS && slot < 0; i++) if (!g_show[i].chain) slot = i;
+        /* Every layer taken: a swapchain recreated for a window takes over that window's layer. */
+        for (int i = 0; i < VP_LAYERS && slot < 0; i++)
+            if (g_show[i].rect[0] == m->x && g_show[i].rect[1] == m->y && g_show[i].rect[2] == m->w &&
+                g_show[i].rect[3] == m->h) slot = i;
+        if (slot < 0) {
+            if (acquire_fd >= 0) close(acquire_fd);
+            send_release(m->chain, m->index, -1);
+            refuse(m->chain, "every zero-copy layer is in use");
+            return;
+        }
+        g_show[slot].seq = ++g_show_seq;
     }
+    struct vp_shown before = g_show[slot];
+    g_show[slot].chain = m->chain;
+    g_show[slot].rect[0] = m->x; g_show[slot].rect[1] = m->y; g_show[slot].rect[2] = m->w; g_show[slot].rect[3] = m->h;
+    g_show[slot].key = ((uint64_t)m->key_hi << 32) | m->key_lo;
+    int z = restack(slot);
     int x = m->x, y = m->y, w = m->w, h = m->h;
     if (m->root_w > 0 && m->root_h > 0 && ((int)m->root_w != g_scene_w || (int)m->root_h != g_scene_h)) {
         const double sx = (double)g_scene_w / m->root_w, sy = (double)g_scene_h / m->root_h;
         x = (int)(m->x * sx + 0.5); y = (int)(m->y * sy + 0.5);
         w = (int)((m->x + m->w) * sx + 0.5) - x; h = (int)((m->y + m->h) * sy + 0.5) - y;
     }
-    int r = sc_layer_present_vortek(c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd, token_of(m->chain, m->index),
-                                    x, y, w, h, g_scene_w, g_scene_h);
+    int r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,
+                                    token_of(m->chain, m->index), x, y, w, h, g_scene_w, g_scene_h);
     if (r != 0) {
         send_release(m->chain, m->index, -1);
+        if (fresh) {
+            /* Not on the screen: the slot stays free, or keeps the window it had. */
+            if (before.chain) g_show[slot] = before;
+            else memset(&g_show[slot], 0, sizeof(g_show[slot]));
+        }
         return;
     }
-    g_shown = 1;
-    g_shown_chain = m->chain;
-    g_shown_rect[0] = m->x; g_shown_rect[1] = m->y; g_shown_rect[2] = m->w; g_shown_rect[3] = m->h;
     g_stat_frames++;
-    droiddeck_count_game_frame();
+    /* The frame-rate counters follow the biggest window on a layer (the game, or Steam's main view). */
+    int64_t area = (int64_t)m->w * m->h, biggest = 0;
+    for (int i = 0; i < VP_LAYERS; i++)
+        if (g_show[i].chain && (int64_t)g_show[i].rect[2] * g_show[i].rect[3] > biggest)
+            biggest = (int64_t)g_show[i].rect[2] * g_show[i].rect[3];
+    if (area >= biggest) droiddeck_count_game_frame();
     if (!g_first_logged) {
         g_first_logged = 1;
         droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer over the window at %d,%d %dx%d (X root %ux%u, scene %dx%d)",
@@ -240,11 +300,11 @@ static int on_conn(int fd, uint32_t mask, void *data) {
             break;
         case VP_MSG_HIDE:
             if (got_fd >= 0) close(got_fd);
-            if (g_shown && g_shown_chain == m.chain) hide();
+            hide_chain(m.chain);
             break;
         case VP_MSG_CHAIN_DESTROY: {
             if (got_fd >= 0) close(got_fd);
-            if (g_shown && g_shown_chain == m.chain) hide();
+            hide_chain(m.chain);
             struct vp_chain *c = chain_of(m.chain);
             if (c) chain_free(c);
             break;

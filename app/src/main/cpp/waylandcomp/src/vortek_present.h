@@ -28,6 +28,7 @@ struct vp_msg {
     uint32_t width, height;   /* buffer size */
     int32_t x, y, w, h;       /* window rectangle in X root coordinates */
     uint32_t root_w, root_h;  /* X root size, which Xwayland may scale to the scene */
+    uint32_t key_hi, key_lo;  /* PRESENT: X stacking key; a higher key gets a higher layer */
 };
 
 void vortek_present_init(struct wl_event_loop *loop);
