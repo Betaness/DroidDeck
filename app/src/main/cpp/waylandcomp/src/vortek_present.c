@@ -12,6 +12,7 @@
 
 #include "sc_layer.h"
 #include "droiddeck_ext.h"
+#include "vortek_upscale.h"
 
 #define VP_MAX_CHAINS 32
 #define VP_MAX_IMAGES 8
@@ -20,7 +21,7 @@ struct vp_chain {
     uint32_t id;
     uint32_t n, w, h;
     AHardwareBuffer *ahb[VP_MAX_IMAGES];
-    int spatial_said;
+    const char *direct_said;  /* why its frames last went unfiltered, as logged */
 };
 
 static struct vp_chain g_chains[VP_MAX_CHAINS];
@@ -48,7 +49,6 @@ static struct vp_shown g_show[VP_LAYERS];
 static uint32_t g_show_seq, g_report_seq;
 static int g_first_logged;
 static int g_accept = 1;
-static int g_spatial;
 /* While on_conn drains the socket: the messages' layer changes go into one transaction (created on
  * first use), so a menu's HIDE and the view below's next frame reach the screen together. */
 static int g_batching;
@@ -119,7 +119,7 @@ static int recv_msg(int fd, struct vp_msg *m, int *got_fd) {
     return 0;
 }
 
-static void send_release(uint32_t chain, uint32_t index, int fence_fd) {
+void vortek_present_release(uint32_t chain, uint32_t index, int fence_fd) {
     struct vp_msg m = {.type = VP_MSG_RELEASE, .chain = chain, .index = index};
     pthread_mutex_lock(&g_conn_lock);
     if (g_conn_fd >= 0) send_msg(g_conn_fd, &m, fence_fd);
@@ -129,7 +129,7 @@ static void send_release(uint32_t chain, uint32_t index, int fence_fd) {
 
 void vortek_present_released(void *token, int release_fd) {
     uint64_t t = (uint64_t)(uintptr_t)token;
-    send_release((uint32_t)(t >> 8) & 0xffffffffu, (uint32_t)(t & 0xff), release_fd);
+    vortek_present_release((uint32_t)(t >> 8) & 0xffffffffu, (uint32_t)(t & 0xff), release_fd);
 }
 
 static void send_simple(uint32_t type, uint32_t chain, uint32_t index) {
@@ -164,6 +164,7 @@ static void batch_touch(int slot) {
 static void hide_slot(int i) {
     if (!g_show[i].chain) return;
     batch_touch(i);
+    vku_layer_hidden(i);
     sc_layer_hide_vortek(i, batch());
     memset(&g_show[i], 0, sizeof(g_show[i]));
 }
@@ -231,7 +232,10 @@ static void drop_connection(void) {
     g_conn_fd = -1;
     pthread_mutex_unlock(&g_conn_lock);
     for (int i = 0; i < VP_MAX_CHAINS; i++)
-        if (g_chains[i].id) chain_free(&g_chains[i]);
+        if (g_chains[i].id) {
+            vku_chain_gone(g_chains[i].id);
+            chain_free(&g_chains[i]);
+        }
     droiddeck_log("vortek", "zero-copy presenter disconnected");
 }
 
@@ -239,6 +243,7 @@ static void on_create(int fd, const struct vp_msg *m) {
     struct vp_chain *c = chain_of(m->chain);
     if (c) {
         hide_chain(m->chain);
+        vku_chain_gone(m->chain);
         chain_free(c);
     }
     c = chain_of(0);
@@ -265,11 +270,26 @@ static void on_create(int fd, const struct vp_msg *m) {
     droiddeck_log("vortek", "zero-copy swapchain %u: %ux%u, %u AHardwareBuffers", c->id, c->w, c->h, c->n);
 }
 
+/* The game or Steam's main view rather than a menu or tooltip: covers at least half of the X root and no
+ * other zero-copy window is bigger. Only that window is upscaled. */
+static int main_window(int slot, const struct vp_msg *m) {
+    const int64_t rw = m->root_w ? (int64_t)m->root_w : g_scene_w, rh = m->root_h ? (int64_t)m->root_h : g_scene_h;
+    int64_t x0 = m->x < 0 ? 0 : m->x, y0 = m->y < 0 ? 0 : m->y;
+    int64_t x1 = (int64_t)m->x + m->w, y1 = (int64_t)m->y + m->h;
+    if (x1 > rw) x1 = rw;
+    if (y1 > rh) y1 = rh;
+    if (x1 <= x0 || y1 <= y0 || (x1 - x0) * (y1 - y0) * 2 < rw * rh) return 0;
+    const int64_t area = (int64_t)m->w * m->h;
+    for (int i = 0; i < VP_LAYERS; i++)
+        if (i != slot && g_show[i].chain && (int64_t)g_show[i].rect[2] * g_show[i].rect[3] > area) return 0;
+    return 1;
+}
+
 static void on_present(const struct vp_msg *m, int acquire_fd) {
     struct vp_chain *c = chain_of(m->chain);
     if (!c || m->index >= c->n || !c->ahb[m->index] || g_scene_w <= 0 || g_scene_h <= 0 || !g_accept) {
         if (acquire_fd >= 0) close(acquire_fd);
-        send_release(m->chain, m->index, -1);
+        vortek_present_release(m->chain, m->index, -1);
         if (!c) refuse(m->chain, "unknown swapchain");
         return;
     }
@@ -286,7 +306,7 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
                 g_show[i].rect[3] == m->h && g_show[i].key == key) slot = i;
         if (slot < 0) {
             if (acquire_fd >= 0) close(acquire_fd);
-            send_release(m->chain, m->index, -1);
+            vortek_present_release(m->chain, m->index, -1);
             refuse(m->chain, "every zero-copy layer is in use");
             return;
         }
@@ -306,11 +326,18 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         x = (int)(m->x * sx + 0.5); y = (int)(m->y * sy + 0.5);
         w = (int)((m->x + m->w) * sx + 0.5) - x; h = (int)((m->y + m->h) * sy + 0.5) - y;
     }
-    int r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,
+    const struct vku_frame vf = {.slot = slot, .z = z, .chain = m->chain, .index = m->index, .ahb = c->ahb[m->index],
+                                 .buf_w = (int)c->w, .buf_h = (int)c->h, .x = x, .y = y, .w = w, .h = h,
+                                 .scene_w = g_scene_w, .scene_h = g_scene_h, .main_window = main_window(slot, m)};
+    const char *why = NULL;
+    const int up = vku_present(&vf, acquire_fd, batch(), &why);
+    int r = 0;
+    if (up == VKU_DIRECT)
+        r = sc_layer_present_vortek(slot, z, c->ahb[m->index], (int)c->w, (int)c->h, acquire_fd,
                                     token_of(m->chain, m->index), x, y, w, h, g_scene_w, g_scene_h, batch());
-    if (r == 0 && g_batch) g_batch_buffers |= 1u << slot;
+    if (r == 0 && up != VKU_TAKEN && g_batch) g_batch_buffers |= 1u << slot;
     if (r != 0) {
-        send_release(m->chain, m->index, -1);
+        vortek_present_release(m->chain, m->index, -1);
         if (fresh) {
             /* Not on the screen: the slot stays free, or keeps the window it had. */
             if (before.chain) g_show[slot] = before;
@@ -319,11 +346,10 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         return;
     }
     g_stat_frames++;
-    if (g_spatial && !c->spatial_said) {
-        c->spatial_said = 1;
-        droiddeck_log("effects", "zero-copy layer: spatial filter skipped for swapchain %u (%ux%u shown as is; "
-                      "scene effects would switch zero-copy off)", c->id, c->w, c->h);
-    }
+    if (up == VKU_DIRECT && why && why != c->direct_said)
+        droiddeck_log("effects", "zero-copy layer: swapchain %u (%ux%u) shown without the scaling filter: %s", c->id,
+                      c->w, c->h, why);
+    if (up == VKU_DIRECT) c->direct_said = why;
     /* The frame-rate counters follow the biggest window on a layer (the game, or Steam's main view). */
     int64_t area = (int64_t)m->w * m->h, biggest = 0;
     for (int i = 0; i < VP_LAYERS; i++)
@@ -345,8 +371,6 @@ void vortek_present_set_accept(int accept) {
     send_simple(VP_MSG_MODE, 0, (uint32_t)accept);
     droiddeck_log("vortek", "zero-copy %s", accept ? "resumed" : "paused: scene effects, frame generation or cardboard need the composited scene");
 }
-
-void vortek_present_set_spatial(int on) { g_spatial = on ? 1 : 0; }
 
 static double now_s(void) {
     struct timespec ts;
@@ -389,6 +413,7 @@ static void on_msg(int fd, const struct vp_msg *m, int got_fd) {
         case VP_MSG_CHAIN_DESTROY: {
             if (got_fd >= 0) close(got_fd);
             hide_chain(m->chain);
+            vku_chain_gone(m->chain);
             struct vp_chain *c = chain_of(m->chain);
             if (c) chain_free(c);
             break;
@@ -452,6 +477,7 @@ void vortek_present_init(struct wl_event_loop *loop) {
         return;
     }
     g_loop = loop;
+    vku_init(loop);
     g_listen_fd = fd;
     g_listen_src = wl_event_loop_add_fd(loop, fd, WL_EVENT_READABLE, on_listen, NULL);
 }

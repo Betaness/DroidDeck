@@ -151,6 +151,24 @@ int vkp_effects_spatial_active(void) {
     return spatial_mode(g_cur.scaling) || cas_active(&g_cur);
 }
 
+const uint32_t *vkp_effects_shader(int which, size_t *size) {
+    switch (which) {
+    case VKP_SHADER_UPSCALE_VERT: *size = sizeof(upscale_vert_code); return upscale_vert_code;
+    case VKP_SHADER_SGSR: *size = sizeof(sgsr_code); return sgsr_code;
+    case VKP_SHADER_SGSR_HQ: *size = sizeof(sgsr_quality_code); return sgsr_quality_code;
+    case VKP_SHADER_EASU: *size = sizeof(fsr_easu_code); return fsr_easu_code;
+    case VKP_SHADER_RCAS: *size = sizeof(fsr_rcas_code); return fsr_rcas_code;
+    default: *size = 0; return NULL;
+    }
+}
+
+int vkp_effects_scaling(int *sharp_pct, int *cas_on) {
+    vkp_effects_sync();
+    if (sharp_pct) *sharp_pct = g_cur.sharp_pct;
+    if (cas_on) *cas_on = cas_active(&g_cur);
+    return g_cur.scaling;
+}
+
 int vkp_effects_scene_active(void) {
     vkp_effects_sync();
     return effect_count(&g_cur) - cas_active(&g_cur) > 0;

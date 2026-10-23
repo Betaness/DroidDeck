@@ -8,6 +8,7 @@ add_library(droiddeckwayland SHARED
         src/sc_layer.c
         src/ahb_swapchain.c
         src/vortek_present.c
+        src/vortek_upscale.c
         src/waylandcomp_jni.c
         src/droiddeck_ext.c
         src/wl_dmabuf.c

@@ -50,6 +50,19 @@ struct ASurfaceTransaction *sc_layer_tx_begin(void);
 void sc_layer_tx_apply(struct ASurfaceTransaction *batch);
 int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
                             int x, int y, int w, int h, int scene_w, int scene_h, struct ASurfaceTransaction *batch);
+/* [mali-g2] Zero-copy upscaling: Vortek layer `slot` shows buffers of its own pool (SC_VORTEK_POOL,
+ * allocated on first use) that the upscaler renders into. pool_take reserves a free buffer of w x h
+ * and returns its index, with the display's release fence for it in *wait_fd (-1: none) to wait for
+ * on the GPU; -1: none free, -2: allocation failed. A reserved buffer goes back with pool_put (with
+ * the fence that must signal before its next use) unless present_vortek_pooled shows it: r[0..3] is
+ * the part of the buffer to show, r[4..7] where on the screen; z < 0 keeps the layer's z. pool_trim
+ * frees the buffers that are neither shown nor reserved and returns how many are left. */
+#define SC_VORTEK_POOL 3
+int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, int *wait_fd);
+void sc_layer_vortek_pool_put(int slot, int idx, int release_fd);
+int sc_layer_vortek_pool_trim(int slot);
+int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
+                                   struct ASurfaceTransaction *batch);
 void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch);
 void sc_layer_vortek_z(int slot, int z, struct ASurfaceTransaction *batch);
 int sc_layer_base_black(int width, int height);

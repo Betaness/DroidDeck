@@ -4,6 +4,7 @@
 #include "droiddeck_color.h"
 #include "vk_present.h"
 #include "vortek_present.h"
+#include "vortek_upscale.h"
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <android/rect.h>
@@ -865,13 +866,108 @@ int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, in
     apply_frame_rate(tx, l);
     if (!l->shown) api.setVisibility(tx, l->sc, ASC_VISIBILITY_SHOW);
     if (old) retire_ops(tx, old);
-    attach_complete(tx, ctx, l, old ? old : l->sc, -1, l->cur_token == token ? NULL : l->cur_token, old ? 1 : 0);
+    attach_complete(tx, ctx, l, old ? old : l->sc, l->cur_slot, l->cur_token == token ? NULL : l->cur_token,
+                    old ? 1 : 0);
     if (!batch) {
         api.txApply(tx);
         api.txDelete(tx);
     }
     l->z = z;
+    l->cur_slot = -1;
     l->cur_token = token;
+    if (!l->shown) { l->shown = 1; droiddeck_log("layer", "%s: layer shown", l->name); }
+    vkp_signal_first_frame();
+    return 0;
+unavailable:
+    if (acquire_fd >= 0) close(acquire_fd);
+    return -1;
+}
+
+int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, int *wait_fd) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    *img = NULL;
+    *wait_fd = -1;
+    if (!l || w <= 0 || h <= 0 || ensure_sc(l) != 0) return -1;
+    if (!l->pool_n) l->pool_n = SC_VORTEK_POOL;
+    g_alloc_failed = 0;
+    int idx = take_free_slot(l, w, h, AHB_RGBA8, wait_fd);
+    if (idx < 0) {
+        if (g_alloc_failed) return -2;
+        log_drop(l);
+        return -1;
+    }
+    pthread_mutex_lock(&g_lock);
+    l->slots[idx].busy = 1;
+    pthread_mutex_unlock(&g_lock);
+    *img = l->slots[idx].img;
+    return idx;
+}
+
+void sc_layer_vortek_pool_put(int slot, int idx, int release_fd) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (!l || idx < 0 || idx >= POOL_MAX || idx == l->cur_slot) {
+        if (release_fd >= 0) close(release_fd);
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    struct slot *s = &l->slots[idx];
+    if (s->release_fd >= 0) close(s->release_fd);
+    s->release_fd = release_fd;
+    s->busy = 0;
+    pthread_mutex_unlock(&g_lock);
+}
+
+int sc_layer_vortek_pool_trim(int slot) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (!l) return 0;
+    int left = 0, freed = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < POOL_MAX; i++) {
+        struct slot *s = &l->slots[i];
+        if (!s->ahb) continue;
+        if (s->busy || i == l->cur_slot) { left++; continue; }
+        if (s->release_fd >= 0) close(s->release_fd);
+        vkp_image_destroy(s->img);
+        AHardwareBuffer_release(s->ahb);
+        memset(s, 0, sizeof(*s));
+        s->release_fd = -1;
+        freed++;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (freed) {
+        droiddeck_log("layer", "%s: %d upscaling buffer%s freed (no upscaled frame for a while)%s", l->name, freed,
+                   freed == 1 ? "" : "s", left ? "; the one on screen goes later" : "");
+        l->logged_w = l->logged_h = 0;
+    }
+    return left;
+}
+
+int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
+                                   struct ASurfaceTransaction *batch) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (!l || idx < 0 || idx >= l->pool_n || !l->slots[idx].ahb || ensure_sc(l) != 0) goto unavailable;
+    if (z < 0) z = l->z;
+    int restack = l->z != z;
+    struct complete_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) goto unavailable;
+    ASurfaceTransaction *tx = batch ? batch : api.txCreate();
+    if (!tx) { free(ctx); goto unavailable; }
+    ASurfaceControl *old = swap_sc_begin(l);
+    if (old || restack) api.setZOrder(tx, l->sc, z);
+    api.setBuffer(tx, l->sc, l->slots[idx].ahb, acquire_fd);
+    api.setBufferTransparency(tx, l->sc, ASC_TRANSPARENCY_OPAQUE);
+    apply_geometry(tx, l, r);
+    apply_frame_rate(tx, l);
+    if (!l->shown) api.setVisibility(tx, l->sc, ASC_VISIBILITY_SHOW);
+    if (old) retire_ops(tx, old);
+    attach_complete(tx, ctx, l, old ? old : l->sc, l->cur_slot, l->cur_token, old ? 1 : 0);
+    if (!batch) {
+        api.txApply(tx);
+        api.txDelete(tx);
+    }
+    l->z = z;
+    l->cur_slot = idx;
+    l->cur_token = NULL;
     if (!l->shown) { l->shown = 1; droiddeck_log("layer", "%s: layer shown", l->name); }
     vkp_signal_first_frame();
     return 0;
@@ -1090,6 +1186,7 @@ void sc_layer_window_gone(void) {
     base_hide(1); /* the backdrop belongs to the old window, just like GAME and OVERLAY */
     if (api.state != 1) return;
     layers_init();
+    vku_idle(); /* its passes may still be writing pool buffers */
     for (int i = SC_LAYER_COUNT - 1; i >= 0; i--) retire_sc(&g_layers[i]);
     drain_and_free_pools();
 }

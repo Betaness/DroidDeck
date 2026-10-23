@@ -37,10 +37,10 @@ void vortek_present_init(struct wl_event_loop *loop);
 void vortek_present_scene_size(int w, int h);
 /* Scene effects, frame generation and cardboard need the composited scene: pause zero-copy. */
 void vortek_present_set_accept(int accept);
-/* Scaling filters and CAS stay on the copy path only: zero-copy layers show the frames as they are. */
-void vortek_present_set_spatial(int on);
 unsigned vortek_present_stats_take(void);
 /* From sc_layer's transaction-complete callback (a binder thread). */
 void vortek_present_released(void *token, int release_fd);
+/* VP_MSG_RELEASE for a game image with its release fence (consumed; -1: none). Any thread. */
+void vortek_present_release(uint32_t chain, uint32_t index, int fence_fd);
 
 #endif

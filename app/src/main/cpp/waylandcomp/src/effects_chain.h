@@ -13,6 +13,11 @@ int vkp_effects_active(void);
  * scene effects (colour, FXAA, toon, CRT, NTSC, deband, HDR effect) change the look of the whole picture. */
 int vkp_effects_spatial_active(void);
 int vkp_effects_scene_active(void);
+/* The scaling mode (0 None .. 8 SGSR HQ, as vkp_effects_set_scaling), its sharpness and whether CAS is on. */
+int vkp_effects_scaling(int *sharp_pct, int *cas_on);
+/* The chain's SPIR-V, for the zero-copy upscaler's own pipelines. */
+enum { VKP_SHADER_UPSCALE_VERT, VKP_SHADER_SGSR, VKP_SHADER_SGSR_HQ, VKP_SHADER_EASU, VKP_SHADER_RCAS };
+const uint32_t *vkp_effects_shader(int which, size_t *size);
 
 VkFilter vkp_effects_blit_filter(void);
 

@@ -23,6 +23,7 @@
 #include "sc_layer.h"
 #include "ahb_swapchain.h"
 #include "vortek_present.h"
+#include "vortek_upscale.h"
 #include "viewporter-server-protocol.h"
 #include "banner-desktop-v1-server-protocol.h"
 #include "presentation-time-server-protocol.h"
@@ -1947,10 +1948,9 @@ static void render_scene(void) {
     int fx_on = vkp_effects_active();
     int framegen = vkp_framegen_active();
     const int cardboard = vkp_cardboard_active();
-    /* [mali-g2] Scaling filters and CAS keep Vortek zero-copy (its layers skip them); only effects
-     * that change the whole picture need every window composited. */
+    /* [mali-g2] Scaling filters and CAS keep Vortek zero-copy (vortek_upscale filters the main window
+     * itself); only effects that change the whole picture need every window composited. */
     vortek_present_set_accept(!vkp_effects_scene_active() && !framegen && !cardboard);
-    vortek_present_set_spatial(vkp_effects_spatial_active());
     struct hdr_scene hs;
     int hdr_route = hdr_plan(&dl, w, h, fx_on, framegen, &hs);
     const char *hdr_copy = NULL;
@@ -3250,13 +3250,16 @@ static int on_stats_timer(void *data) {
         struct vkp_perf vp;
         vkp_perf_take(&vp);
         const unsigned drops = sc_layer_drops_take();
+        char upscale[240];
+        vku_tick();
+        vku_perf_take(upscale, sizeof(upscale));
 #define PERF_MS(sum, n) ((n) ? (double)(sum) / 1e6 / (double)(n) : 0.0)
-        if (g_perf.scenes || vp.presents || g_perf.releases || drops || vp.uploads)
+        if (g_perf.scenes || vp.presents || g_perf.releases || drops || vp.uploads || upscale[0])
             droiddeck_log("perf", "last 10 s: %u ticks, %u scenes, %u on screen (copy %u, zero-copy %u, layer copy %u) | "
                        "render_scene %.2f/%.2f ms | base %u black kept, %u presented | acquire %.2f/%.2f ms | "
                        "present %.2f/%.2f ms (%u) | fence wait %.2f/%.2f ms (%u, %u GPU release waits) | "
                        "shm upload %.1f MB %.2f/%.2f ms (%u, %u damage only, %u waited for a frame) | "
-                       "release %.2f/%.2f ms (%u, %u held) | %u pool drops",
+                       "release %.2f/%.2f ms (%u, %u held) | %u pool drops%s",
                        g_perf.ticks, g_perf.scenes, g_stat_frames, g_perf.copy_scenes, zero_copy, layer_frames,
                        PERF_MS(g_perf.scene_ns, g_perf.scenes), (double)g_perf.scene_max_ns / 1e6,
                        vp.base_kept, vp.base_presents,
@@ -3267,7 +3270,7 @@ static int on_stats_timer(void *data) {
                        PERF_MS(vp.upload_ns, vp.uploads), (double)vp.upload_max_ns / 1e6,
                        vp.uploads, vp.uploads_partial, vp.upload_waits,
                        PERF_MS(g_perf.release_ns, g_perf.releases), (double)g_perf.release_max_ns / 1e6,
-                       g_perf.releases, g_perf.releases_held, drops);
+                       g_perf.releases, g_perf.releases_held, drops, upscale);
 #undef PERF_MS
         memset(&g_perf, 0, sizeof(g_perf));
     }
