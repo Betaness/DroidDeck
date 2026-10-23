@@ -33,7 +33,7 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
-typedef struct { uint32_t type, chain, index, imageCount, width, height; int32_t x, y, w, h; uint32_t rootW, rootH, keyHi, keyLo; } Msg;
+typedef struct { uint32_t type, chain, index, imageCount, width, height; int32_t x, y, w, h; uint32_t rootW, rootH, keyHi, keyLo, topLevel; } Msg;
 
 #define CHAINS 64
 #define IMAGES 8

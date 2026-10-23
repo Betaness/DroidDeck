@@ -112,6 +112,7 @@ typedef struct X11Swapchain {
     xcb_window_t blocker;
     int16_t blockerRect[4];
     int lastPath;
+    const char* x11Why;        /* why frames take the X11 path while the layer is not available */
     bool suboptimalLogged;
     /* X stacking position, root level first: each level's index among its siblings + 1 */
     uint64_t stackKey;
@@ -658,6 +659,12 @@ static bool findAncestors(X11Swapchain* sc) {
     return true;
 }
 
+/* The top-level window holding the window (the root's child), sent with the stacking key: the
+ * compositor orders different top-level windows that claim the same root-level place by recency. */
+static uint64_t topLevelOf(const xcb_window_t* chain, int chainLength) {
+    return chainLength > 0 ? chain[chainLength - 1] : 0;
+}
+
 /* At every level from the window up to its top-level window, a mapped sibling stacked above it
  * that overlaps the window hides part of it (Steam's menus are such siblings inside its own
  * top-level window), and so does a mapped child of the window. Two round trips per frame. */
@@ -814,10 +821,26 @@ static void updateCoverage(X11Swapchain* sc) {
     free(geo);
 }
 
+/* Whether the root's children are no longer `before` (the WM raised or lowered a top-level window,
+ * or one came or went). One round trip. */
+static bool rootRestacked(xcb_connection_t* conn, xcb_window_t root, const xcb_query_tree_reply_t* before) {
+    xcb_query_tree_reply_t* now = xcb_query_tree_reply(conn, xcb_query_tree(conn, root), NULL);
+    if (!now) return false;
+    int count = xcb_query_tree_children_length(now);
+    bool changed = count != xcb_query_tree_children_length(before) ||
+                   memcmp(xcb_query_tree_children(now), xcb_query_tree_children(before), count * sizeof(xcb_window_t)) != 0;
+    free(now);
+    return changed;
+}
+
 /* A hidden window's frame: its semaphores are waited for and nothing is copied or drawn, at most
  * COVERED_FPS a second. Windows hidden behind a game (a launcher left running, the Steam client)
- * otherwise render as fast as the GPU allows and take it from the game. */
+ * otherwise render as fast as the GPU allows and take it from the game. The wait is cut into
+ * COVERED_SLICE slices and ends early when the root's children were restacked: a game raised back
+ * over a closed menu is checked again on its next frame instead of up to 100 ms later, while the
+ * screen shows Xwayland's stale copy of it. */
 #define COVERED_FPS 10
+#define COVERED_SLICE 0.008
 static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentInfoKHR* presentInfo, bool* waitedSemaphores) {
     VkPipelineStageFlags waitStages[presentInfo->waitSemaphoreCount + 1];
     for (uint32_t s = 0; s < presentInfo->waitSemaphoreCount; s++) waitStages[s] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -834,10 +857,18 @@ static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentI
     if (result == VK_SUCCESS) vk.ResetFences(sc->device, 1, &sc->fence);
     double now = nowSeconds(), next = sc->lastCoveredFrame + 1.0 / COVERED_FPS;
     if (now < next) {
-        double wait = next - now;
-        struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
-        nanosleep(&ts, NULL);
-        now = next;
+        xcb_connection_t* conn = sc->surface->conn;
+        xcb_query_tree_reply_t* before = sc->root ? xcb_query_tree_reply(conn, xcb_query_tree(conn, sc->root), NULL) : NULL;
+        bool early = false;
+        while (now < next && !early) {
+            double wait = next - now < COVERED_SLICE ? next - now : COVERED_SLICE;
+            struct timespec ts = {(time_t)wait, (long)((wait - (time_t)wait) * 1e9)};
+            nanosleep(&ts, NULL);
+            now = nowSeconds();
+            early = before && now < next && rootRestacked(conn, sc->root, before);
+        }
+        free(before);
+        if (!early) now = next;
     }
     sc->lastCoveredFrame = now;
     return result;
@@ -847,7 +878,12 @@ static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentI
  * the frame must take the X11 path, the semaphores are untouched. */
 static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain, uint32_t imageIndex,
                                       const VkSemaphore* waits, uint32_t waitCount, bool* suboptimal) {
-    if (sc->zeroCopy < 0 || waitCount > 16) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (sc->zeroCopy < 0) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (waitCount > 16) {
+        sc->x11Why = "more than 16 wait semaphores";
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    sc->x11Why = "a window query failed";
     xcb_connection_t* conn = sc->surface->conn;
     xcb_get_geometry_cookie_t geoCookie = xcb_get_geometry(conn, sc->surface->window);
     xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, geoCookie, NULL);
@@ -864,6 +900,7 @@ static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain
         free(pos);
         free(geo);
         sc->zeroCopy = -1;
+        sc->x11Why = "the window has alpha";
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     int x = pos->dst_x, y = pos->dst_y, w = geo->width, h = geo->height;
@@ -885,7 +922,7 @@ static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain
     sc->occluded = checkOccluded(sc, x, y, w, h) || sc->covered;
     if (sc->occluded) return VK_NOT_READY;
 
-    char payload[sizeof(DDPresentZeroCopy) + 17 * sizeof(uint64_t)];
+    char payload[sizeof(DDPresentZeroCopy) + 18 * sizeof(uint64_t)];
     DDPresentZeroCopy request = {0};
     request.swapchainId = VkObject_fromHandle(swapchain)->id;
     request.imageIndex = imageIndex;
@@ -895,19 +932,22 @@ static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain
     request.h = h;
     request.rootW = sc->rootW;
     request.rootH = sc->rootH;
-    request.waitCount = waitCount | DD_ZC_FLAG_STACK_KEY;
+    request.waitCount = waitCount | DD_ZC_FLAG_STACK_KEY | DD_ZC_FLAG_TOPLEVEL;
     memcpy(payload, &request, sizeof(request));
     memcpy(payload + sizeof(request), &sc->stackKey, sizeof(uint64_t));
     for (uint32_t i = 0; i < waitCount; i++) {
         uint64_t id = VkObject_fromHandle(waits[i])->id;
         memcpy(payload + sizeof(request) + (i + 1) * sizeof(uint64_t), &id, sizeof(id));
     }
+    uint64_t topLevel = topLevelOf(sc->chain, sc->chainLength);
+    memcpy(payload + sizeof(request) + (waitCount + 1) * sizeof(uint64_t), &topLevel, sizeof(topLevel));
     VkResult result = (VkResult)droiddeck_request(REQUEST_CODE_DD_PRESENT_ZERO_COPY, payload,
-                                                  (int)(sizeof(request) + (waitCount + 1) * sizeof(uint64_t)));
+                                                  (int)(sizeof(request) + (waitCount + 2) * sizeof(uint64_t)));
     if (result == VK_SUCCESS) publishLayer(sc, true, x, y, w, h);
     if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
         if (sc->zeroCopy == 1) fprintf(stderr, "vortek-x11: zero-copy stopped, presenting through X11\n");
         sc->zeroCopy = -1;
+        sc->x11Why = "the server or compositor declined it";
     }
     else if (result == VK_SUCCESS && sc->zeroCopy == 0) {
         sc->zeroCopy = 1;
@@ -925,7 +965,9 @@ static VkResult presentZeroCopy(X11Swapchain* sc, VkSwapchainKHR swapchain, uint
     return result;
 }
 
-static void notePath(X11Swapchain* sc, int path) {
+/* depth: the window's, for the X11 path (0 elsewhere). Path changes carry a CLOCK_MONOTONIC time,
+ * to line them up with the compositor's VORTEK_PRESENT_TRACE lines. */
+static void notePath(X11Swapchain* sc, int path, int depth) {
     if (path == sc->lastPath) return;
     sc->lastPath = path;
     /* Off the layer: the server takes it down when it sees this frame's present. */
@@ -934,13 +976,17 @@ static void notePath(X11Swapchain* sc, int path) {
                      : path == PATH_COVERED   ? "hidden, frames paced"
                      : path == PATH_OCCLUDED  ? "through X11, partly covered"
                                               : "through X11, the compositor's layer is not available";
+    double t = nowSeconds();
     if (path == PATH_OCCLUDED && sc->blocker)
-        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s by 0x%x at %d,%d %dx%d\n", sc->surface->window,
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s by 0x%x at %d,%d %dx%d (t=%.3f)\n", sc->surface->window,
                 sc->extent.width, sc->extent.height, what, sc->blocker, sc->blockerRect[0], sc->blockerRect[1],
-                sc->blockerRect[2], sc->blockerRect[3]);
+                sc->blockerRect[2], sc->blockerRect[3], t);
+    else if (path == PATH_X11)
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s: %s, depth %d (t=%.3f)\n", sc->surface->window,
+                sc->extent.width, sc->extent.height, what, sc->x11Why ? sc->x11Why : "zero-copy not tried", depth, t);
     else
-        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s\n", sc->surface->window, sc->extent.width,
-                sc->extent.height, what);
+        fprintf(stderr, "vortek-x11: window 0x%x %ux%u now %s (t=%.3f)\n", sc->surface->window, sc->extent.width,
+                sc->extent.height, what, t);
 }
 
 static void countFrame(X11Swapchain* sc) {
@@ -982,15 +1028,22 @@ static bool stackKeyOf(xcb_connection_t* conn, const xcb_window_t* chain, int le
     return ok;
 }
 
-static void sendLayerRequest(X11Swapchain* sc, uint32_t flags, uint64_t key) {
-    char payload[sizeof(DDPresentZeroCopy) + sizeof(uint64_t)];
+static void sendLayerRequest(X11Swapchain* sc, uint32_t flags, uint64_t key, uint64_t topLevel) {
+    char payload[sizeof(DDPresentZeroCopy) + 2 * sizeof(uint64_t)];
     DDPresentZeroCopy request = {0};
     request.swapchainId = VkObject_fromHandle(sc->handle)->id;
     request.waitCount = flags;
     memcpy(payload, &request, sizeof(request));
-    memcpy(payload + sizeof(request), &key, sizeof(key));
-    droiddeck_request(REQUEST_CODE_DD_PRESENT_ZERO_COPY, payload,
-                      (int)(sizeof(request) + ((flags & DD_ZC_FLAG_STACK_KEY) ? sizeof(key) : 0)));
+    size_t size = sizeof(request);
+    if (flags & DD_ZC_FLAG_STACK_KEY) {
+        memcpy(payload + size, &key, sizeof(key));
+        size += sizeof(key);
+    }
+    if (flags & DD_ZC_FLAG_TOPLEVEL) {
+        memcpy(payload + size, &topLevel, sizeof(topLevel));
+        size += sizeof(topLevel);
+    }
+    droiddeck_request(REQUEST_CODE_DD_PRESENT_ZERO_COPY, payload, (int)size);
 }
 
 /* Windows on compositor layers that are idle (Chromium presents only on damage) are kept right
@@ -1017,14 +1070,15 @@ static void sweepLayers(void) {
         free(a);
         uint64_t key;
         if (!viewable) {
-            sendLayerRequest(other, DD_ZC_FLAG_HIDE, 0);
+            sendLayerRequest(other, DD_ZC_FLAG_HIDE, 0, 0);
             other->pub.shown = false;
-            fprintf(stderr, "vortek-x11: window 0x%x %ux%u is no longer viewable, its layer was taken down\n",
-                    other->surface->window, other->extent.width, other->extent.height);
+            fprintf(stderr, "vortek-x11: window 0x%x %ux%u is no longer viewable, its layer was taken down (t=%.3f)\n",
+                    other->surface->window, other->extent.width, other->extent.height, nowSeconds());
         }
         else if (restack && stackKeyOf(conn, other->pub.chain, other->pub.chainLength, other->pub.root, &key) &&
                  key != other->pub.key) {
-            sendLayerRequest(other, DD_ZC_FLAG_RESTACK | DD_ZC_FLAG_STACK_KEY, key);
+            sendLayerRequest(other, DD_ZC_FLAG_RESTACK | DD_ZC_FLAG_STACK_KEY | DD_ZC_FLAG_TOPLEVEL, key,
+                             topLevelOf(other->pub.chain, other->pub.chainLength));
             other->pub.key = key;
         }
         pthread_mutex_unlock(&other->presentLock);
@@ -1040,6 +1094,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
     for (uint32_t i = 0; i < presentInfo->swapchainCount; i++) {
         VkResult result = VK_SUCCESS;
         X11Swapchain* sc = VkObject_fromHandle(presentInfo->pSwapchains[i])->tag;
+        if (sc && waitedSemaphores && sc->zeroCopy >= 0) sc->x11Why = "another swapchain of this present took the semaphores";
         if (sc && !waitedSemaphores && sc->zeroCopy >= 0) {
             bool suboptimal = false;
             VkResult zc = presentZeroCopy(sc, presentInfo->pSwapchains[i], presentInfo->pImageIndices[i],
@@ -1047,7 +1102,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
             if (zc != VK_ERROR_FEATURE_NOT_PRESENT && zc != VK_NOT_READY) {
                 if (zc == VK_SUCCESS) {
                     waitedSemaphores = true;
-                    notePath(sc, PATH_ZERO_COPY);
+                    notePath(sc, PATH_ZERO_COPY, 0);
                     countFrame(sc);
                     if (suboptimal) zc = VK_SUBOPTIMAL_KHR;
                 }
@@ -1071,8 +1126,8 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
             if (sc->zeroCopy < 0 || sc->occluded) {
                 if (sc->zeroCopy < 0) updateCoverage(sc);
                 if (sc->covered) {
+                    notePath(sc, PATH_COVERED, 0); /* first: its time is when the window went hidden */
                     result = presentCovered(sc, queue, presentInfo, &waitedSemaphores);
-                    notePath(sc, PATH_COVERED);
                     countFrame(sc);
                     if (results) results[i] = result;
                     if (result < 0 || (overall == VK_SUCCESS && result != VK_SUCCESS)) {
@@ -1115,7 +1170,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
                     vk.InvalidateMappedMemoryRanges(sc->device, 1, &range);
                 }
                 putFrame(sc, geometry->depth);
-                notePath(sc, sc->zeroCopy >= 0 && sc->occluded ? PATH_OCCLUDED : PATH_X11);
+                notePath(sc, sc->zeroCopy >= 0 && sc->occluded ? PATH_OCCLUDED : PATH_X11, geometry->depth);
                 if (geometry->width != sc->extent.width || geometry->height != sc->extent.height) {
                     result = VK_SUBOPTIMAL_KHR;
                     if (!sc->suboptimalLogged) {

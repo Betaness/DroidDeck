@@ -140,9 +140,10 @@ bool ZeroCopy_accepting(void) {
 }
 
 bool ZeroCopy_present(uint32_t chain, uint32_t index, int32_t x, int32_t y, int32_t w, int32_t h,
-                      uint32_t rootW, uint32_t rootH, uint64_t stackKey, int acquireFd) {
+                      uint32_t rootW, uint32_t rootH, uint64_t stackKey, uint32_t topLevel, int acquireFd) {
     ZeroCopyMsg msg = {.type = ZC_MSG_PRESENT, .chain = chain, .index = index, .x = x, .y = y, .w = w, .h = h,
-                       .rootW = rootW, .rootH = rootH, .keyHi = (uint32_t)(stackKey >> 32), .keyLo = (uint32_t)stackKey};
+                       .rootW = rootW, .rootH = rootH, .keyHi = (uint32_t)(stackKey >> 32), .keyLo = (uint32_t)stackKey,
+                       .topLevel = topLevel};
     pthread_mutex_lock(&lock);
     bool ok = connFd >= 0 && sendMsg(connFd, &msg, acquireFd) == 0;
     if (!ok) disconnectLocked();
@@ -162,8 +163,9 @@ void ZeroCopy_hide(uint32_t chain) {
     sendSimple(ZC_MSG_HIDE, chain);
 }
 
-void ZeroCopy_restack(uint32_t chain, uint64_t stackKey) {
-    ZeroCopyMsg msg = {.type = ZC_MSG_RESTACK, .chain = chain, .keyHi = (uint32_t)(stackKey >> 32), .keyLo = (uint32_t)stackKey};
+void ZeroCopy_restack(uint32_t chain, uint64_t stackKey, uint32_t topLevel) {
+    ZeroCopyMsg msg = {.type = ZC_MSG_RESTACK, .chain = chain, .keyHi = (uint32_t)(stackKey >> 32), .keyLo = (uint32_t)stackKey,
+                       .topLevel = topLevel};
     pthread_mutex_lock(&lock);
     if (connFd >= 0 && sendMsg(connFd, &msg, -1) != 0) disconnectLocked();
     pthread_mutex_unlock(&lock);
