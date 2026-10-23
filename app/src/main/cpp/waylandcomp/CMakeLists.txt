@@ -13,6 +13,7 @@ add_library(droiddeckwayland SHARED
         src/wl_dmabuf.c
         src/wl_clipboard.c
         src/wl_text_input.c
+        src/wl_x11_type.c
         src/wl_toplevel_icon.c
         src/wl_single_pixel.c
         src/wl_color_mgmt.c

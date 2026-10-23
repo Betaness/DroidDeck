@@ -3012,13 +3012,7 @@ static int update_modifiers(uint32_t evdev, int pressed) {
     return 1;
 }
 
-static void key_event(uint32_t evdev, int pressed) {
-    if (evdev < 0x300) {
-        uint8_t bit = (uint8_t)(1u << (evdev & 7));
-        if (pressed && (g_keys_down[evdev >> 3] & bit)) return;
-        if (pressed) g_keys_down[evdev >> 3] |= bit; else g_keys_down[evdev >> 3] &= (uint8_t)~bit;
-    }
-    int mods_changed = update_modifiers(evdev, pressed);
+static struct surface *key_target(void) {
     struct surface *target = NULL;
     struct wl_resource *ime = droiddeck_ime_target();
     if (ime) target = wl_resource_get_user_data(ime);
@@ -3028,6 +3022,18 @@ static void key_event(uint32_t evdev, int pressed) {
         struct surface *s;
         wl_list_for_each_reverse(s, &g_toplevels, toplevel_link) { target = s; break; }
     }
+    return target;
+}
+
+static void key_event(uint32_t evdev, int pressed) {
+    if (evdev < 0x300) {
+        uint8_t bit = (uint8_t)(1u << (evdev & 7));
+        if (pressed && (g_keys_down[evdev >> 3] & bit)) return;
+        if (pressed) g_keys_down[evdev >> 3] |= bit; else g_keys_down[evdev >> 3] &= (uint8_t)~bit;
+    }
+    if (pressed) x11_type_key_pressed(evdev);
+    int mods_changed = update_modifiers(evdev, pressed);
+    struct surface *target = key_target();
     if (!target) return;
     struct wl_client *client = wl_resource_get_client(target->resource);
     struct seat_keyboard *sk;
@@ -3177,6 +3183,45 @@ void droiddeck_surface_scene_origin(struct wl_resource *surface, int *x, int *y)
 }
 
 void droiddeck_inject_key(uint32_t evdev, int pressed) { key_event(evdev, pressed); }
+
+/* [mali-g2] Seat access for wl_x11_type.c, which types text into Xwayland under its own keymap. */
+struct wl_client *droiddeck_key_target_client(int focus) {
+    struct surface *target = key_target();
+    if (!target) return NULL;
+    struct wl_client *client = wl_resource_get_client(target->resource);
+    if (!keyboard_for(client)) return NULL;
+    if (focus) keyboard_focus(target->resource);
+    return client;
+}
+
+int droiddeck_client_keyboards(struct wl_client *client, struct wl_resource **out, int max) {
+    struct seat_keyboard *sk;
+    int n = 0;
+    for_each_keyboard_of(client, sk) if (n < max) out[n++] = sk->kb;
+    return n;
+}
+
+uint32_t droiddeck_locked_mods(void) { return g_mods_locked; }
+
+/* Keys still down would repeat, or be released, under the other keymap. */
+void droiddeck_release_keys(void) {
+    int any = 0;
+    for (uint32_t k = 0; k < 0x300; k++) {
+        if (!(g_keys_down[k >> 3] & (1u << (k & 7)))) continue;
+        any = 1;
+        for (int i = 0; i < g_nkbs; i++)
+            if (g_kbs[i].focus)
+                wl_keyboard_send_key(g_kbs[i].kb, wl_display_next_serial(g_display), now_ms(), k,
+                                     WL_KEYBOARD_KEY_STATE_RELEASED);
+    }
+    if (!any && !g_mods_depressed) return;
+    memset(g_keys_down, 0, sizeof(g_keys_down));
+    g_mod_keys_held = 0;
+    g_mods_depressed = 0;
+    for (int i = 0; i < g_nkbs; i++)
+        if (g_kbs[i].focus)
+            wl_keyboard_send_modifiers(g_kbs[i].kb, wl_display_next_serial(g_display), 0, 0, g_mods_locked, 0);
+}
 
 
 static struct wl_event_source *g_stats_timer;
