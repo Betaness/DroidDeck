@@ -63,6 +63,7 @@ void sc_layer_vortek_pool_put(int slot, int idx, int release_fd);
 int sc_layer_vortek_pool_trim(int slot);
 int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
                                    struct ASurfaceTransaction *batch);
+void sc_layer_hide_all_vortek(void);
 void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch);
 void sc_layer_vortek_z(int slot, int z, struct ASurfaceTransaction *batch);
 int sc_layer_base_black(int width, int height);

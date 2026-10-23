@@ -984,6 +984,19 @@ void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch) {
     if (l->shown) hide_layer_on(batch, l);
 }
 
+/* The Vortek server is gone: every Vortek layer leaves the screen, also one the presenter's
+ * bookkeeping lost track of (a stale full-screen frame stayed over Steam after the server
+ * restarted, and the screen looked black). */
+void sc_layer_hide_all_vortek(void) {
+    layers_init();
+    for (int slot = 0; slot < SC_VORTEK_LAYERS; slot++) {
+        struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
+        if (!l->sc) continue;
+        l->shown = 1;
+        hide_layer_on(NULL, l);
+    }
+}
+
 void sc_layer_vortek_z(int slot, int z, struct ASurfaceTransaction *batch) {
     layers_init();
     if (slot < 0 || slot >= SC_VORTEK_LAYERS) return;

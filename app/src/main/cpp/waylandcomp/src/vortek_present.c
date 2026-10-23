@@ -225,6 +225,7 @@ static int restack(int slot) {
 
 static void drop_connection(void) {
     hide();
+    if (!g_batching) sc_layer_hide_all_vortek();
     if (g_conn_src) wl_event_source_remove(g_conn_src);
     g_conn_src = NULL;
     pthread_mutex_lock(&g_conn_lock);
@@ -443,6 +444,7 @@ static int on_conn(int fd, uint32_t mask, void *data) {
     g_batching = 0;
     if (g_trace && g_batch) droiddeck_log("vortek", "trace t=%.4f applied %d message%s", now_s(), n, n == 1 ? "" : "s");
     batch_apply();
+    if (g_conn_fd < 0) sc_layer_hide_all_vortek(); /* dropped in the loop: after its batch */
     return 0;
 }
 
