@@ -198,7 +198,12 @@ struct surface {
     int pending_dst[2];
     struct wl_list pending_frames;
     struct wl_list pending_feedback;
-
+    /* Damage of the next commit (x0, y0, x1, y1 in buffer pixels): an shm commit uploads only these. */
+#define DAMAGE_RECTS 8
+    int pending_damage[DAMAGE_RECTS][4];
+    int pending_damage_n, pending_damage_surface;
+    int buffer_scale, buffer_transform;   /* last asked for; damage in surface coordinates needs identity */
+    int shm_whole;   /* the content went away (no buffer): the next shm commit uploads all of it */
 
     struct vkp_image *shm_img;
     struct wl_resource *dmabuf;
@@ -587,6 +592,8 @@ static void unmap_toplevel(struct surface *s) {
 static void drop_dmabuf(struct surface *s, int paced) {
     if (s->dmabuf) {
         wl_list_remove(&s->dmabuf_destroy.link);
+        /* Released, the client draws into it again: a frame in flight that reads it finishes first. */
+        if (s->dmabuf_buf) vkp_image_wait_idle(s->dmabuf_buf->img);
         if (!ahb_swapchain_defer_release(s->dmabuf_buf, s->dmabuf, s, paced)) {
             if (paced) release_buffer(s, s->dmabuf, now_ns());
             else wl_buffer_send_release(s->dmabuf);
@@ -622,6 +629,31 @@ static void fire_frames(struct wl_list *frames) {
     }
 }
 
+/* How many of the commit's damage rectangles to upload, clipped to the buffer; 0: the whole buffer
+ * (no damage or too much of it, or damage in surface coordinates that a viewport, scale or transform
+ * would map differently). The image already holds the previous commit, so the rest of it is current. */
+static int shm_damage_rects(struct surface *s, int w, int h) {
+    if (!s->pending_damage_n) return 0;
+    if (s->pending_damage_surface && (s->src_set || s->dst_set || (s->buffer_scale && s->buffer_scale != 1) ||
+                                      s->buffer_transform != WL_OUTPUT_TRANSFORM_NORMAL))
+        return 0;
+    int n = 0, bx0 = w, by0 = h, bx1 = 0, by1 = 0;
+    for (int i = 0; i < s->pending_damage_n; i++) {
+        int *r = s->pending_damage[i];
+        int x0 = r[0] < 0 ? 0 : r[0], y0 = r[1] < 0 ? 0 : r[1];
+        int x1 = r[2] > w ? w : r[2], y1 = r[3] > h ? h : r[3];
+        if (x1 <= x0 || y1 <= y0) continue;
+        int *o = s->pending_damage[n++];
+        o[0] = x0; o[1] = y0; o[2] = x1; o[3] = y1;
+        if (x0 < bx0) bx0 = x0;
+        if (y0 < by0) by0 = y0;
+        if (x1 > bx1) bx1 = x1;
+        if (y1 > by1) by1 = y1;
+    }
+    if (!n || (int64_t)(bx1 - bx0) * (by1 - by0) * 2 > (int64_t)w * h) return 0;
+    return n;
+}
+
 static void take_shm(struct surface *s, struct wl_shm_buffer *shm, struct wl_resource *buffer) {
     int32_t w = wl_shm_buffer_get_width(shm), h = wl_shm_buffer_get_height(shm);
     int32_t stride = wl_shm_buffer_get_stride(shm);
@@ -630,10 +662,17 @@ static void take_shm(struct surface *s, struct wl_shm_buffer *shm, struct wl_res
         vkp_image_destroy(s->shm_img);
         s->shm_img = NULL;
     }
+    const int fresh = !s->shm_img || s->shm_whole;
+    s->shm_whole = 0;
     if (!s->shm_img) s->shm_img = vkp_image_create_shm(w, h);
     if (s->shm_img) {
+        const int n = fresh ? 0 : shm_damage_rects(s, w, h);
         wl_shm_buffer_begin_access(shm);
-        vkp_image_upload_shm(s->shm_img, wl_shm_buffer_get_data(shm), stride);
+        if (n > 0)
+            vkp_image_upload_shm_rects(s->shm_img, wl_shm_buffer_get_data(shm), stride,
+                                       (const int (*)[4])s->pending_damage, n);
+        else
+            vkp_image_upload_shm(s->shm_img, wl_shm_buffer_get_data(shm), stride);
         wl_shm_buffer_end_access(shm);
     }
     wl_buffer_send_release(buffer);
@@ -789,8 +828,28 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
         wl_resource_add_destroy_listener(buffer, &s->pending_buffer_destroy);
     }
 }
+static void damage_add(struct surface *s, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (w <= 0 || h <= 0) return;
+    /* Clients damage "everything" with INT32_MAX sizes. */
+    const int64_t x1 = (int64_t)x + w, y1 = (int64_t)y + h;
+    const int r[4] = {x, y, x1 > INT32_MAX ? INT32_MAX : (int)x1, y1 > INT32_MAX ? INT32_MAX : (int)y1};
+    if (s->pending_damage_n < DAMAGE_RECTS) {
+        memcpy(s->pending_damage[s->pending_damage_n++], r, sizeof(r));
+        return;
+    }
+    int *u = s->pending_damage[DAMAGE_RECTS - 1];
+    if (r[0] < u[0]) u[0] = r[0];
+    if (r[1] < u[1]) u[1] = r[1];
+    if (r[2] > u[2]) u[2] = r[2];
+    if (r[3] > u[3]) u[3] = r[3];
+}
+
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
-                           int32_t x, int32_t y, int32_t w, int32_t h) {}
+                           int32_t x, int32_t y, int32_t w, int32_t h) {
+    struct surface *s = wl_resource_get_user_data(r);
+    s->pending_damage_surface = 1;
+    damage_add(s, x, y, w, h);
+}
 static void frame_callback_destroy(struct wl_resource *r) {
     wl_list_remove(wl_resource_get_link(r));
 }
@@ -1022,9 +1081,12 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         } else {
             drop_dmabuf(s, 1);
             s->has_content = 0;
+            s->shm_whole = 1;
             if (buffer) wl_buffer_send_release(buffer);
         }
     }
+    s->pending_damage_n = 0;
+    s->pending_damage_surface = 0;
 
     wl_list_for_each(child, &s->children, child_link) {
         if (child->sub_pending) {
@@ -1047,10 +1109,18 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     }
     schedule_render();
 }
-static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {}
-static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t s) {}
+static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
+    struct surface *s = wl_resource_get_user_data(r);
+    s->buffer_transform = t;
+}
+static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t scale) {
+    struct surface *s = wl_resource_get_user_data(r);
+    s->buffer_scale = scale;
+}
 static void surface_damage_buffer(struct wl_client *c, struct wl_resource *r,
-                                  int32_t x, int32_t y, int32_t w, int32_t h) {}
+                                  int32_t x, int32_t y, int32_t w, int32_t h) {
+    damage_add(wl_resource_get_user_data(r), x, y, w, h);
+}
 static void surface_offset(struct wl_client *c, struct wl_resource *r, int32_t x, int32_t y) {}
 
 static const struct wl_surface_interface surface_impl = {
@@ -1877,7 +1947,10 @@ static void render_scene(void) {
     int fx_on = vkp_effects_active();
     int framegen = vkp_framegen_active();
     const int cardboard = vkp_cardboard_active();
-    vortek_present_set_accept(!fx_on && !framegen && !cardboard);
+    /* [mali-g2] Scaling filters and CAS keep Vortek zero-copy (its layers skip them); only effects
+     * that change the whole picture need every window composited. */
+    vortek_present_set_accept(!vkp_effects_scene_active() && !framegen && !cardboard);
+    vortek_present_set_spatial(vkp_effects_spatial_active());
     struct hdr_scene hs;
     int hdr_route = hdr_plan(&dl, w, h, fx_on, framegen, &hs);
     const char *hdr_copy = NULL;
@@ -3133,10 +3206,11 @@ static int on_stats_timer(void *data) {
         vkp_perf_take(&vp);
         const unsigned drops = sc_layer_drops_take();
 #define PERF_MS(sum, n) ((n) ? (double)(sum) / 1e6 / (double)(n) : 0.0)
-        if (g_perf.scenes || vp.presents || g_perf.releases || drops)
+        if (g_perf.scenes || vp.presents || g_perf.releases || drops || vp.uploads)
             droiddeck_log("perf", "last 10 s: %u ticks, %u scenes, %u on screen (copy %u, zero-copy %u, layer copy %u) | "
                        "render_scene %.2f/%.2f ms | base %u black kept, %u presented | acquire %.2f/%.2f ms | "
                        "present %.2f/%.2f ms (%u) | fence wait %.2f/%.2f ms (%u, %u GPU release waits) | "
+                       "shm upload %.1f MB %.2f/%.2f ms (%u, %u damage only, %u waited for a frame) | "
                        "release %.2f/%.2f ms (%u, %u held) | %u pool drops",
                        g_perf.ticks, g_perf.scenes, g_stat_frames, g_perf.copy_scenes, zero_copy, layer_frames,
                        PERF_MS(g_perf.scene_ns, g_perf.scenes), (double)g_perf.scene_max_ns / 1e6,
@@ -3144,6 +3218,9 @@ static int on_stats_timer(void *data) {
                        PERF_MS(vp.acquire_ns, vp.acquires), (double)vp.acquire_max_ns / 1e6,
                        PERF_MS(vp.present_ns, vp.presents), (double)vp.present_max_ns / 1e6, vp.presents,
                        PERF_MS(vp.wait_ns, vp.waits), (double)vp.wait_max_ns / 1e6, vp.waits, vp.gpu_release_waits,
+                       (double)vp.upload_bytes / (1024.0 * 1024.0),
+                       PERF_MS(vp.upload_ns, vp.uploads), (double)vp.upload_max_ns / 1e6,
+                       vp.uploads, vp.uploads_partial, vp.upload_waits,
                        PERF_MS(g_perf.release_ns, g_perf.releases), (double)g_perf.release_max_ns / 1e6,
                        g_perf.releases, g_perf.releases_held, drops);
 #undef PERF_MS

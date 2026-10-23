@@ -20,6 +20,7 @@ struct vp_chain {
     uint32_t id;
     uint32_t n, w, h;
     AHardwareBuffer *ahb[VP_MAX_IMAGES];
+    int spatial_said;
 };
 
 static struct vp_chain g_chains[VP_MAX_CHAINS];
@@ -45,6 +46,7 @@ static struct vp_shown g_show[VP_LAYERS];
 static uint32_t g_show_seq;
 static int g_first_logged;
 static int g_accept = 1;
+static int g_spatial;
 
 /* sc_layer only compares tokens, and its completion callback may run after the chain is gone,
  * so a token encodes chain and image instead of pointing at them. */
@@ -264,6 +266,11 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         return;
     }
     g_stat_frames++;
+    if (g_spatial && !c->spatial_said) {
+        c->spatial_said = 1;
+        droiddeck_log("effects", "zero-copy layer: spatial filter skipped for swapchain %u (%ux%u shown as is; "
+                      "scene effects would switch zero-copy off)", c->id, c->w, c->h);
+    }
     /* The frame-rate counters follow the biggest window on a layer (the game, or Steam's main view). */
     int64_t area = (int64_t)m->w * m->h, biggest = 0;
     for (int i = 0; i < VP_LAYERS; i++)
@@ -283,8 +290,10 @@ void vortek_present_set_accept(int accept) {
     g_accept = accept;
     if (!accept) hide();
     send_simple(VP_MSG_MODE, 0, (uint32_t)accept);
-    droiddeck_log("vortek", "zero-copy %s", accept ? "resumed" : "paused: screen effects, frame generation or cardboard need the composited scene");
+    droiddeck_log("vortek", "zero-copy %s", accept ? "resumed" : "paused: scene effects, frame generation or cardboard need the composited scene");
 }
+
+void vortek_present_set_spatial(int on) { g_spatial = on ? 1 : 0; }
 
 static int on_conn(int fd, uint32_t mask, void *data) {
     (void)data;

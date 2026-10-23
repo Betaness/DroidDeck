@@ -9,6 +9,10 @@ void vkp_effects_bind_device(VkDevice dev, VkPhysicalDevice pd,
 int vkp_effects_sync(void);
 
 int vkp_effects_active(void);
+/* [mali-g2] Scaling filters and CAS work per window, so a Vortek zero-copy layer can do without them;
+ * scene effects (colour, FXAA, toon, CRT, NTSC, deband, HDR effect) change the look of the whole picture. */
+int vkp_effects_spatial_active(void);
+int vkp_effects_scene_active(void);
 
 VkFilter vkp_effects_blit_filter(void);
 

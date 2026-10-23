@@ -35,6 +35,11 @@ int vkp_image_is_dmabuf(const struct vkp_image *img);
 
 struct vkp_image *vkp_image_create_shm(int w, int h);
 void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride);
+/* Only the rectangles (x0, y0, x1, y1 in buffer pixels) the client damaged; the rest of img keeps
+ * the previous commit's pixels. */
+void vkp_image_upload_shm_rects(struct vkp_image *img, const void *data, int stride, const int (*rects)[4], int n);
+/* Waits for the frames still in flight that read img (before its buffer goes back to the client). */
+void vkp_image_wait_idle(struct vkp_image *img);
 
 int vkp_image_width(const struct vkp_image *img);
 int vkp_image_height(const struct vkp_image *img);
@@ -66,6 +71,9 @@ struct vkp_perf {
     unsigned base_presents;
     unsigned base_kept;
     unsigned gpu_release_waits;
+    unsigned uploads, uploads_partial, upload_waits;
+    uint64_t upload_bytes;
+    int64_t upload_ns, upload_max_ns;
 };
 void vkp_perf_take(struct vkp_perf *out);
 int vkp_can_wait_sync_fd(void);
