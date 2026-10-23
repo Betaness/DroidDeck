@@ -98,11 +98,219 @@ static bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name
     return found;
 }
 
+/* Newer than the client's Vulkan headers; as vortek_serializer.h defines them. */
+#ifndef VK_KHR_unified_image_layouts
+#define VK_KHR_unified_image_layouts 1
+#endif
+#ifndef VK_KHR_UNIFIED_IMAGE_LAYOUTS_SPEC_VERSION
+#define VK_KHR_UNIFIED_IMAGE_LAYOUTS_SPEC_VERSION 1
+#endif
+#ifndef VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME
+#define VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME "VK_KHR_unified_image_layouts"
+#endif
+#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR ((VkStructureType)1000527000)
+#endif
+
+/* ---- pNext chains the serializer cannot carry ----
+ * Vortek's generated serializer knows a fixed set of extension structures per call (the lists below,
+ * taken from vortek_serializer.h's vt_sizeof_VkPhysicalDeviceProperties2 / Features2 /
+ * VkDeviceCreateInfo). A structure it does not know garbles the ones after it: with zink's full
+ * extension list the Vulkan 1.2 properties came back empty and zink saw "Driver Unknown". Such
+ * structures are unlinked for the call and put back after it, left as the application set them
+ * (zero: not supported), except where filled in here. */
+static const VkStructureType knownPropertyStructs[] = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES,
+};
+static const VkStructureType knownFeatureStructs[] = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES,
+};
+static const VkStructureType knownDeviceCreateStructs[] = {
+    VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO,
+    VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES,
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES,
+};
+
+static bool knownStruct(VkStructureType t, const VkStructureType* known, size_t n) {
+    for (size_t i = 0; i < n; i++) if (known[i] == t) return true;
+    return false;
+}
+
+typedef struct { VkBaseOutStructure* node; VkBaseOutStructure* next; } SavedLink;
+
+/* Unlinks unknown structures from the chain after `head`; returns how many links were saved. */
+static int unlinkUnknown(VkBaseOutStructure* head, const VkStructureType* known, size_t n, SavedLink* saved, int max) {
+    int count = 0;
+    VkBaseOutStructure* prev = head;
+    for (VkBaseOutStructure* s = head->pNext; s && count < max; s = s->pNext) {
+        if (knownStruct(s->sType, known, n)) {
+            if (prev->pNext != s) { saved[count++] = (SavedLink){prev, prev->pNext}; prev->pNext = s; }
+            prev = s;
+        }
+    }
+    if (prev->pNext && count < max) { saved[count++] = (SavedLink){prev, prev->pNext}; prev->pNext = NULL; }
+    return count;
+}
+
+static void relink(SavedLink* saved, int count) {
+    for (int i = count - 1; i >= 0; i--) saved[i].node->pNext = saved[i].next;
+}
+
 /* ---- feature / property queries ---- */
 
 static void dd_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures) {
     traceChain("GetPhysicalDeviceFeatures2", pFeatures->pNext);
+    SavedLink saved[64];
+    int unlinked = unlinkUnknown((VkBaseOutStructure*)pFeatures, knownFeatureStructs,
+                                 sizeof(knownFeatureStructs) / sizeof(knownFeatureStructs[0]), saved, 64);
     vt_call_vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
+    relink(saved, unlinked);
     VkPhysicalDeviceMaintenance5FeaturesKHR* m5 = findInChain(pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
     VkPhysicalDeviceMaintenance6FeaturesKHR* m6 = findInChain(pFeatures->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR);
     if (m5) m5->maintenance5 = deviceHasExtension(physicalDevice, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -111,7 +319,14 @@ static void dd_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkP
 
 static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties) {
     traceChain("GetPhysicalDeviceProperties2", pProperties->pNext);
+    SavedLink saved[64];
+    int unlinked = unlinkUnknown((VkBaseOutStructure*)pProperties, knownPropertyStructs,
+                                 sizeof(knownPropertyStructs) / sizeof(knownPropertyStructs[0]), saved, 64);
     vt_call_vkGetPhysicalDeviceProperties2(physicalDevice, pProperties);
+    relink(saved, unlinked);
+    VkPhysicalDeviceLayeredApiPropertiesListKHR* layered =
+        findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_PROPERTIES_LIST_KHR);
+    if (layered) layered->layeredApiCount = 0;
     trace("  -> apiVersion %u.%u.%u type %d", VK_API_VERSION_MAJOR(pProperties->properties.apiVersion), VK_API_VERSION_MINOR(pProperties->properties.apiVersion), VK_API_VERSION_PATCH(pProperties->properties.apiVersion), pProperties->properties.deviceType);
     /* Conservative values; on Mali-G2 the driver reports 1,1,1,0,0,0 and 1,1,1. */
     VkPhysicalDeviceMaintenance5PropertiesKHR* p5 = findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR);
@@ -128,6 +343,15 @@ static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, V
         p6->blockTexelViewCompatibleMultipleLayers = VK_FALSE;
         p6->maxCombinedImageSamplerDescriptorCount = 1;
         p6->fragmentShadingRateClampCombinerInputs = VK_FALSE;
+    }
+    /* VK_EXT_vertex_attribute_divisor stands in for the driver's KHR one (divisorAsExt): its limit. */
+    VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT* divExt =
+        findInChain(pProperties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT);
+    if (divExt) {
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR khr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 query = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &khr};
+        vt_call_vkGetPhysicalDeviceProperties2(physicalDevice, &query);
+        divExt->maxVertexAttribDivisor = khr.maxVertexAttribDivisor;
     }
 }
 
@@ -548,18 +772,91 @@ static void dd_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd, VkFormat
     vt_call_vkGetPhysicalDeviceFormatProperties(pd, f, p);
     trace("FormatProperties %d -> opt 0x%x", f, p->optimalTilingFeatures);
 }
+/* Mali reports only VK_KHR_vertex_attribute_divisor; zink (Mesa 26) looks for the EXT name alone and
+ * without it leaves out GL_ARB_instanced_arrays, which holds its OpenGL at 3.2 / GLSL 1.50. The EXT
+ * extension is listed beside the KHR one (same feature and create-info structures), and turned
+ * back into the KHR one when a device is created. */
+static const char* const DIVISOR_EXT = "VK_EXT_vertex_attribute_divisor";
+static const char* const DIVISOR_KHR = "VK_KHR_vertex_attribute_divisor";
+
+static VkResult enumerateWithDivisorExt(VkPhysicalDevice pd, uint32_t* c, VkExtensionProperties* p) {
+    uint32_t n = 0;
+    VkResult r = vt_call_vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
+    if (r < 0) return r;
+    VkExtensionProperties* all = calloc(n + 1, sizeof(*all));
+    if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    r = vt_call_vkEnumerateDeviceExtensionProperties(pd, NULL, &n, all);
+    if (r < 0) { free(all); return r; }
+    bool khr = false, ext = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!strcmp(all[i].extensionName, DIVISOR_KHR)) khr = true;
+        if (!strcmp(all[i].extensionName, DIVISOR_EXT)) ext = true;
+    }
+    if (khr && !ext) {
+        strcpy(all[n].extensionName, DIVISOR_EXT);
+        all[n].specVersion = 3;
+        n++;
+    }
+    if (!p) *c = n;
+    else {
+        uint32_t copied = *c < n ? *c : n;
+        memcpy(p, all, copied * sizeof(*p));
+        *c = copied;
+        r = copied < n ? VK_INCOMPLETE : VK_SUCCESS;
+    }
+    free(all);
+    return r;
+}
+
 static VkResult dd_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* c, VkExtensionProperties* p) {
     quietLookups++;
-    VkResult r = vt_call_vkEnumerateDeviceExtensionProperties(pd, layer, c, p);
+    VkResult r = layer ? vt_call_vkEnumerateDeviceExtensionProperties(pd, layer, c, p) : enumerateWithDivisorExt(pd, c, p);
     quietLookups--;
     trace("EnumerateDeviceExtensionProperties(%s) -> %d count %u", layer ? layer : "-", r, c ? *c : 0);
     if (p && r >= 0 && traceOn > 0) for (uint32_t i = 0; i < *c; i++) trace("  %s", p[i].extensionName);
     return r;
 }
+/* VORTEK_ZINK_ALL_EXTENSIONS=1 (experiment): zink names itself to the server under another engine
+ * name, so the server does not cut its device extensions down to Winlator's zink list (49 of the
+ * Mali's 175; that list holds zink's OpenGL at 3.2 and turns dynamic state off). */
+VkResult vt_call_vkCreateInstance(const VkInstanceCreateInfo*, const VkAllocationCallbacks*, VkInstance*);
+static VkResult dd_vkCreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* instance) {
+    const char* all = getenv("VORTEK_ZINK_ALL_EXTENSIONS");
+    if (all && *all == '1' && ci->pApplicationInfo && ci->pApplicationInfo->pEngineName &&
+        !strcmp(ci->pApplicationInfo->pEngineName, "mesa zink")) {
+        VkApplicationInfo app = *ci->pApplicationInfo;
+        app.pEngineName = "mesa zink (all extensions)";
+        VkInstanceCreateInfo copy = *ci;
+        copy.pApplicationInfo = &app;
+        return vt_call_vkCreateInstance(&copy, a, instance);
+    }
+    return vt_call_vkCreateInstance(ci, a, instance);
+}
+
 static VkResult dd_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, const VkAllocationCallbacks* a, VkDevice* d) {
     traceChain("CreateDevice", ci->pNext);
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) trace("  ext %s", ci->ppEnabledExtensionNames[i]);
-    VkResult r = vt_call_vkCreateDevice(pd, ci, a, d);
+    /* The EXT divisor extension is ours (enumerateWithDivisorExt): the driver gets the KHR one. */
+    const char* names[ci->enabledExtensionCount + 1];
+    uint32_t count = 0;
+    bool khr = false, ext = false;
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
+        const char* name = ci->ppEnabledExtensionNames[i];
+        if (!strcmp(name, DIVISOR_EXT)) { ext = true; continue; }
+        if (!strcmp(name, DIVISOR_KHR)) khr = true;
+        names[count++] = name;
+    }
+    VkDeviceCreateInfo mapped = *ci;
+    if (ext) {
+        if (!khr) names[count++] = DIVISOR_KHR;
+        mapped.enabledExtensionCount = count;
+        mapped.ppEnabledExtensionNames = names;
+    }
+    SavedLink saved[64];
+    int unlinked = unlinkUnknown((VkBaseOutStructure*)&mapped, knownDeviceCreateStructs,
+                                 sizeof(knownDeviceCreateStructs) / sizeof(knownDeviceCreateStructs[0]), saved, 64);
+    VkResult r = vt_call_vkCreateDevice(pd, &mapped, a, d);
+    relink(saved, unlinked);
     trace("CreateDevice -> %d", r);
     return r;
 }
@@ -610,6 +907,7 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkGetPhysicalDeviceFormatProperties", dd_vkGetPhysicalDeviceFormatProperties},
     {"vkEnumerateDeviceExtensionProperties", dd_vkEnumerateDeviceExtensionProperties},
     {"vkCreateDevice", dd_vkCreateDevice},
+    {"vkCreateInstance", dd_vkCreateInstance},
     {"vkCreateSemaphore", dd_vkCreateSemaphore},
     {"vkQueueSubmit", dd_vkQueueSubmit},
     {"vkCmdBindIndexBuffer2KHR", dd_vkCmdBindIndexBuffer2KHR},
