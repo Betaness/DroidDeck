@@ -344,6 +344,15 @@ def frame_rate_limit(command, env):
     return result
 
 
+def zink_all_extensions(command, env):
+    """[mali-g2] Games get zink with every device extension the Mali has (OpenGL 4.6, GLES 3.2): the
+    Vortek server otherwise cuts zink down to Winlator's list, which holds it at OpenGL 3.2. Steam's
+    web views keep that list (with all extensions the client shut down at start); they never come here."""
+    if env.get("BL_GPU_MODE") != "vortek" or "VORTEK_ZINK_ALL_EXTENSIONS" in env:
+        return env
+    return dict(env, VORTEK_ZINK_ALL_EXTENSIONS="1")
+
+
 EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
 
 
@@ -511,6 +520,7 @@ def main():
     if app_id and len(command) > 1 and command[1] == "waitforexitandrun":
         command = offline_without_anticheat(command, env)
     env = frame_rate_limit(command, env)
+    env = zink_all_extensions(command, env)
     if mic_enabled == "0":
         env["BANNER_AUDIO_DIRECT_MIC"] = "0"
     env = force_ssbs(command, env)
