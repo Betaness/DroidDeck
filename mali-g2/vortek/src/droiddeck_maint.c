@@ -100,6 +100,9 @@ static bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name
 
 /* ---- feature / property queries ---- */
 
+    return hidden;
+}
+
 static void dd_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures) {
     traceChain("GetPhysicalDeviceFeatures2", pFeatures->pNext);
     vt_call_vkGetPhysicalDeviceFeatures2(physicalDevice, pFeatures);
@@ -181,7 +184,69 @@ static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
 
 /* ---- 64-bit flag structs folded into the legacy fields ---- */
 
+/* VORTEK_DUMP_SPIRV=<dir>: every shader module and every inline stage of a pipeline is written to
+ * <dir> before the call, and pipelines.log gets a line per pipeline (synced), so the last line names
+ * the pipeline the driver was compiling when it crashed. */
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+static const char* dumpDir(void) {
+    static const char* dir = (const char*)1;
+    if (dir == (const char*)1) { dir = getenv("VORTEK_DUMP_SPIRV"); if (dir && !*dir) dir = NULL; }
+    return dir;
+}
+static pthread_mutex_t dumpLock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned dumpSeq;
+static void dumpWrite(const char* name, const void* data, size_t size) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dumpDir(), name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    if (write(fd, data, size) != (ssize_t)size) {}
+    close(fd);
+}
+static void dumpLog(const char* line) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/pipelines.log", dumpDir());
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    if (write(fd, line, strlen(line)) < 0) {}
+    fsync(fd);
+    close(fd);
+}
+static void dumpPipeline(const char* kind, const VkPipelineShaderStageCreateInfo* stages, uint32_t stageCount, uint32_t flags) {
+    pthread_mutex_lock(&dumpLock);
+    unsigned seq = ++dumpSeq;
+    char line[1024];
+    int n = snprintf(line, sizeof(line), "%s %u pid %d flags 0x%x:", kind, seq, getpid(), flags);
+    for (uint32_t s = 0; s < stageCount && n < (int)sizeof(line) - 96; s++) {
+        const VkShaderModuleCreateInfo* inl = findInChain(stages[s].pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+        if (inl) {
+            char name[96];
+            snprintf(name, sizeof(name), "p%05u-%d-s%x.spv", seq, getpid(), (unsigned)stages[s].stage);
+            dumpWrite(name, inl->pCode, inl->codeSize);
+            n += snprintf(line + n, sizeof(line) - n, " stage 0x%x %s", (unsigned)stages[s].stage, name);
+        }
+        else n += snprintf(line + n, sizeof(line) - n, " stage 0x%x module %p", (unsigned)stages[s].stage, (void*)stages[s].module);
+    }
+    snprintf(line + n, sizeof(line) - n, "\n");
+    dumpLog(line);
+    pthread_mutex_unlock(&dumpLock);
+}
+
+VkResult vt_call_vkCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule*);
+static VkResult dd_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* alloc, VkShaderModule* module) {
+    VkResult r = vt_call_vkCreateShaderModule(device, info, alloc, module);
+    if (dumpDir() && r == VK_SUCCESS) {
+        char name[96];
+        snprintf(name, sizeof(name), "m%p.spv", (void*)*module);
+        dumpWrite(name, info->pCode, info->codeSize);
+    }
+    return r;
+}
+
 static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* pipelines) {
+    for (uint32_t i = 0; dumpDir() && i < count; i++) dumpPipeline("graphics", infos[i].pStages, infos[i].stageCount, infos[i].flags);
     VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
     if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memcpy(copy, infos, count * sizeof(*copy));
@@ -371,6 +436,7 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkGetPhysicalDeviceProperties2", dd_vkGetPhysicalDeviceProperties2},
     {"vkGetPhysicalDeviceProperties2KHR", dd_vkGetPhysicalDeviceProperties2},
     {"vkCreateGraphicsPipelines", dd_vkCreateGraphicsPipelines},
+    {"vkCreateShaderModule", dd_vkCreateShaderModule},
     {"vkCreateComputePipelines", dd_vkCreateComputePipelines},
     {"vkCreateBuffer", dd_vkCreateBuffer},
     {"vkEnumeratePhysicalDevices", dd_vkEnumeratePhysicalDevices},
