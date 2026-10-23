@@ -1,0 +1,390 @@
+#!/usr/bin/python3
+"""Bring the Steam client's menus over a game in Vortek sessions, which run without gamescope.
+
+Under gamescope the Steam menu (Steam button) and Quick Access panel are composited over the game.
+Here every X window is a plain top-level window and the last one mapped stays on top, so the menus,
+which the client opens as child windows of its own window, stayed under the game. While such a
+menu is open the Steam window is raised; when it closes, the app that was on top before goes back.
+
+Steam's Resume and its launch path ask for the game window through _NET_ACTIVE_WINDOW, which it
+only sends when a window manager publishes _NET_SUPPORTING_WM_CHECK and _NET_CLIENT_LIST. This helper
+publishes those (it does not take SubstructureRedirect, so windows still map and configure
+themselves) and raises the window asked for. Having seen a window manager, the client asks it for
+fullscreen (_NET_WM_STATE) and waits: without an answer its window stayed 1280x800 and drew
+nothing. So fullscreen requests are honoured too, with the root window's size.
+The focus properties gamescope publishes (GAMESCOPE_FOCUSABLE_APPS and _WINDOWS, GAMESCOPE_FOCUSED_APP,
+_APP_GFX and _WINDOW) follow the window on top, so the client and the session know a game is in front.
+
+Wine takes the announcement seriously too: with _NET_ACTIVE_WINDOW in _NET_SUPPORTED it waits for
+the window manager to set WM_STATE after mapping a window and to confirm activations by updating
+the root's _NET_ACTIVE_WINDOW, and only then makes the window foreground. Without that a Unity game
+stayed inactive behind its own picture at under 1 fps. So the helper keeps WM_STATE (Normal while
+mapped, Withdrawn after unmapping, iconify requests answered with Normal as gamescope does) and
+rewrites _NET_ACTIVE_WINDOW on every activation, giving the window input focus the ICCCM way.
+
+Wine also leaves room for the frame it expects a window manager to draw: a 1280x720 game window
+with a caption sat at 3,22, a black band above it. Game windows as large as the screen are moved
+to its corner, as gamescope shows them.
+"""
+import ctypes as c
+import select
+import sys
+
+IDLE_S = 2.0  # recheck this often without X events, in case one was missed
+STEAM_APP = 769
+XA_ATOM, XA_CARDINAL, XA_WINDOW = 4, 6, 33
+CLIENT_MESSAGE, MAP_NOTIFY, UNMAP_NOTIFY, PROPERTY_NOTIFY = 33, 19, 18, 28
+WITHDRAWN, NORMAL, ICONIC = 0, 1, 3
+PROPERTY_CHANGE, SUBSTRUCTURE_NOTIFY = 1 << 22, 1 << 19
+
+
+class X:
+    def __init__(self):
+        x = c.CDLL('libX11.so.6')
+        self.x = x
+        D, W, A = c.c_void_p, c.c_ulong, c.c_ulong
+        x.XOpenDisplay.argtypes = [c.c_char_p]
+        x.XOpenDisplay.restype = D
+        x.XDefaultRootWindow.argtypes = [D]
+        x.XDefaultRootWindow.restype = W
+        x.XInternAtom.argtypes = [D, c.c_char_p, c.c_int]
+        x.XInternAtom.restype = A
+        x.XQueryTree.argtypes = [D, W, c.POINTER(W), c.POINTER(W), c.POINTER(c.POINTER(W)), c.POINTER(c.c_uint)]
+        x.XGetWindowProperty.argtypes = [D, W, A, c.c_long, c.c_long, c.c_int, A, c.POINTER(A), c.POINTER(c.c_int),
+                                         c.POINTER(c.c_ulong), c.POINTER(c.c_ulong), c.POINTER(c.POINTER(c.c_ubyte))]
+        x.XChangeProperty.argtypes = [D, W, A, A, c.c_int, c.c_int, c.c_void_p, c.c_int]
+        x.XDeleteProperty.argtypes = [D, W, A]
+        x.XRaiseWindow.argtypes = [D, W]
+        x.XSetInputFocus.argtypes = [D, W, c.c_int, c.c_ulong]
+        x.XFree.argtypes = [c.c_void_p]
+        x.XSync.argtypes = [D, c.c_int]
+        x.XFlush.argtypes = [D]
+        x.XSetErrorHandler.argtypes = [c.c_void_p]
+        x.XSelectInput.argtypes = [D, W, c.c_long]
+        x.XPending.argtypes = [D]
+        x.XNextEvent.argtypes = [D, c.c_void_p]
+        x.XConnectionNumber.argtypes = [D]
+        x.XCreateWindow.argtypes = [D, W, c.c_int, c.c_int, c.c_uint, c.c_uint, c.c_uint, c.c_int, c.c_uint,
+                                    c.c_void_p, c.c_ulong, c.c_void_p]
+        x.XCreateWindow.restype = W
+        x.XMoveResizeWindow.argtypes = [D, W, c.c_int, c.c_int, c.c_uint, c.c_uint]
+        x.XMoveWindow.argtypes = [D, W, c.c_int, c.c_int]
+        x.XSendEvent.argtypes = [D, W, c.c_int, c.c_long, c.c_void_p]
+        x.XWindowEvent.argtypes = [D, W, c.c_long, c.c_void_p]
+        x.XGetWMHints.argtypes = [D, W]
+        x.XGetWMHints.restype = c.POINTER(c.c_long * 9)
+        self.handler = c.CFUNCTYPE(c.c_int, c.c_void_p, c.c_void_p)(lambda d, e: 0)
+        x.XSetErrorHandler(c.cast(self.handler, c.c_void_p))
+        self.dpy = x.XOpenDisplay(None)
+        if not self.dpy:
+            raise RuntimeError('no X display')
+        self.root = x.XDefaultRootWindow(self.dpy)
+        self.atoms = {}
+
+    def atom(self, name):
+        if name not in self.atoms:
+            self.atoms[name] = self.x.XInternAtom(self.dpy, name.encode(), False)
+        return self.atoms[name]
+
+    def cardinals(self, window, name):
+        t, f, n, left = c.c_ulong(), c.c_int(), c.c_ulong(), c.c_ulong()
+        data = c.POINTER(c.c_ubyte)()
+        if self.x.XGetWindowProperty(self.dpy, window, self.atom(name), 0, 64, False, 0, c.byref(t), c.byref(f),
+                                     c.byref(n), c.byref(left), c.byref(data)) != 0 or not data:
+            return []
+        try:
+            if f.value != 32:
+                return []
+            return [c.cast(data, c.POINTER(c.c_ulong))[i] & 0xffffffff for i in range(n.value)]
+        finally:
+            self.x.XFree(data)
+
+    def set_cardinals(self, name, values, window=None, kind=XA_CARDINAL):
+        window = window or self.root
+        if values:
+            arr = (c.c_ulong * len(values))(*values)
+            self.x.XChangeProperty(self.dpy, window, self.atom(name), kind, 32, 0, arr, len(values))
+        else:
+            self.x.XDeleteProperty(self.dpy, window, self.atom(name))
+
+    def children(self, window):
+        r, p, n = c.c_ulong(), c.c_ulong(), c.c_uint()
+        kids = c.POINTER(c.c_ulong)()
+        if not self.x.XQueryTree(self.dpy, window, c.byref(r), c.byref(p), c.byref(kids), c.byref(n)):
+            return []
+        try:
+            return [kids[i] for i in range(n.value)]
+        finally:
+            if kids:
+                self.x.XFree(kids)
+
+
+class Attrs(c.Structure):
+    _fields_ = [('x', c.c_int), ('y', c.c_int), ('width', c.c_int), ('height', c.c_int), ('border_width', c.c_int),
+                ('depth', c.c_int), ('visual', c.c_void_p), ('root', c.c_ulong), ('class_', c.c_int),
+                ('bit_gravity', c.c_int), ('win_gravity', c.c_int), ('backing_store', c.c_int),
+                ('backing_planes', c.c_ulong), ('backing_pixel', c.c_ulong), ('save_under', c.c_int),
+                ('colormap', c.c_ulong), ('map_installed', c.c_int), ('map_state', c.c_int),
+                ('all_event_masks', c.c_long), ('your_event_mask', c.c_long), ('do_not_propagate_mask', c.c_long),
+                ('override_redirect', c.c_int), ('screen', c.c_void_p)]
+
+
+def main():
+    x = X()
+    x.x.XGetWindowAttributes.argtypes = [c.c_void_p, c.c_ulong, c.POINTER(Attrs)]
+
+    def attrs(w):
+        a = Attrs()
+        return a if x.x.XGetWindowAttributes(x.dpy, w, c.byref(a)) else None
+
+    def menu_open(steam):
+        """A mapped child of the Steam window that is one of its side panels: the Steam menu and the
+        Quick Access panel run the window's full height and are narrower than it. Notification
+        toasts are children too, but short; raising the whole client for one hid the game."""
+        top = attrs(steam)
+        if not top:
+            return False
+        for child in x.children(steam):
+            a = attrs(child)
+            if a and a.map_state == 2 and a.width < top.width and a.height >= top.height * 9 // 10:
+                return True
+        return False
+
+    # The window manager check: an unmapped window of ours, named, pointing at itself.
+    check = x.x.XCreateWindow(x.dpy, x.root, -10, -10, 1, 1, 0, 0, 2, None, 0, None)
+    for w in (x.root, check):
+        x.set_cardinals('_NET_SUPPORTING_WM_CHECK', [check], w, XA_WINDOW)
+    name = b'droiddeck-vortek-focus'
+    x.x.XChangeProperty(x.dpy, check, x.atom('_NET_WM_NAME'), x.atom('UTF8_STRING'), 8, 0, name, len(name))
+    x.set_cardinals('_NET_SUPPORTED', [x.atom(n) for n in ('_NET_ACTIVE_WINDOW', '_NET_CLIENT_LIST',
+                                                             '_NET_CLIENT_LIST_STACKING')], kind=XA_ATOM)
+    x.x.XSelectInput(x.dpy, x.root, SUBSTRUCTURE_NOTIFY)
+    active_atom = x.atom('_NET_ACTIVE_WINDOW')
+    state_atom = x.atom('_NET_WM_STATE')
+    fullscreen_atom = x.atom('_NET_WM_STATE_FULLSCREEN')
+    root_attrs = attrs(x.root)
+    saved = {}  # window -> (x, y, width, height) before fullscreen
+
+    def set_fullscreen(w, on):
+        a = attrs(w)
+        if not a:
+            return
+        states = [s for s in x.cardinals(w, '_NET_WM_STATE') if s != fullscreen_atom]
+        if on:
+            saved.setdefault(w, (a.x, a.y, a.width, a.height))
+            geometry = (0, 0, root_attrs.width, root_attrs.height)
+            states.append(fullscreen_atom)
+        else:
+            geometry = saved.pop(w, None)
+        x.set_cardinals('_NET_WM_STATE', states, w, XA_ATOM)
+        if geometry and geometry != (a.x, a.y, a.width, a.height):
+            x.x.XMoveResizeWindow(x.dpy, w, *geometry)
+            print('droiddeck-vortek-focus: window 0x%x %s, %dx%d' % (w, 'fullscreen' if on else 'restored',
+                                                                     geometry[2], geometry[3]), flush=True)
+    event = (c.c_ulong * 24)()
+    fd = x.x.XConnectionNumber(x.dpy)
+
+    wm_state_atom = x.atom('WM_STATE')
+    change_state_atom = x.atom('WM_CHANGE_STATE')
+    protocols_atom = x.atom('WM_PROTOCOLS')
+    take_focus_atom = x.atom('WM_TAKE_FOCUS')
+    x.x.XSelectInput(x.dpy, check, PROPERTY_CHANGE)
+
+    def wm_state(w):
+        t, f, n, left = c.c_ulong(), c.c_int(), c.c_ulong(), c.c_ulong()
+        data = c.POINTER(c.c_ubyte)()
+        if x.x.XGetWindowProperty(x.dpy, w, wm_state_atom, 0, 2, False, wm_state_atom, c.byref(t), c.byref(f),
+                                  c.byref(n), c.byref(left), c.byref(data)) != 0 or not data:
+            return None
+        try:
+            return c.cast(data, c.POINTER(c.c_ulong))[0] if n.value else None
+        finally:
+            x.x.XFree(data)
+
+    def set_wm_state(w, state):
+        arr = (c.c_ulong * 2)(state, 0)
+        x.x.XChangeProperty(x.dpy, w, wm_state_atom, wm_state_atom, 32, 0, arr, 2)
+
+    def server_time():
+        """A timestamp from the X server: the time of a property change on our own window."""
+        x.x.XChangeProperty(x.dpy, check, x.atom('_DROIDDECK_TIME'), XA_CARDINAL, 32, 2, None, 0)
+        ev = (c.c_ulong * 24)()
+        x.x.XWindowEvent(x.dpy, check, PROPERTY_CHANGE, ev)
+        return ev[6]  # XPropertyEvent: type, serial, send_event, display, window, atom, time
+
+    def activate(w):
+        """Raise w, give it input focus and publish it as the active window."""
+        if wm_state(w) != NORMAL:
+            set_wm_state(w, NORMAL)
+        x.x.XRaiseWindow(x.dpy, w)
+        # ICCCM: a window that takes no input itself but speaks WM_TAKE_FOCUS (wine) is asked to.
+        hints = x.x.XGetWMHints(x.dpy, w)
+        accepts = True
+        if hints:
+            flags, input_ = hints.contents[0], hints.contents[1]
+            accepts = not (flags & 1) or bool(input_)
+            x.x.XFree(hints)
+        if accepts:
+            x.x.XSetInputFocus(x.dpy, w, 2, 0)
+        if take_focus_atom in x.cardinals(w, 'WM_PROTOCOLS'):
+            msg = (c.c_ulong * 24)()
+            msg[0], msg[4], msg[5], msg[6] = CLIENT_MESSAGE, w, protocols_atom, 32
+            msg[7], msg[8] = take_focus_atom, server_time()
+            x.x.XSendEvent(x.dpy, w, False, 0, msg)
+        # Rewritten even when unchanged: wine waits for this property change to confirm.
+        x.set_cardinals('_NET_ACTIVE_WINDOW', [w], kind=XA_WINDOW)
+
+    # Windows mapped before we started.
+    for w in x.children(x.root):
+        a = attrs(w)
+        if a and a.map_state == 2 and not a.override_redirect and wm_state(w) is None:
+            set_wm_state(w, NORMAL)
+
+    moved = {}  # window -> times moved to the corner; a client that keeps moving it back wins
+
+    def to_corner(w, a):
+        if (a.x, a.y) == (0, 0) or a.width < root_attrs.width or a.height < root_attrs.height:
+            return
+        if moved.get(w, 0) >= 5:
+            return
+        moved[w] = moved.get(w, 0) + 1
+        x.x.XMoveWindow(x.dpy, w, 0, 0)
+        print('droiddeck-vortek-focus: window 0x%x %dx%d moved from %d,%d to the corner'
+              % (w, a.width, a.height, a.x, a.y), flush=True)
+
+    tags = {}  # window -> (app, pid), read once the client has tagged it
+    watched = {}  # window -> event mask we selected on it
+    restore = None
+    last_focus = None
+    last_lists = None
+    print('droiddeck-vortek-focus: raising Steam menus over games', flush=True)
+    while True:
+        # _NET_ACTIVE_WINDOW requests, from Steam (Resume, launches) or from games.
+        while x.x.XPending(x.dpy):
+            x.x.XNextEvent(x.dpy, event)
+            kind = c.cast(event, c.POINTER(c.c_int))[0]
+            # XMapEvent/XUnmapEvent: type, serial, send_event, display, event, window, override_redirect
+            if kind == MAP_NOTIFY and event[4] == x.root and not c.cast(event, c.POINTER(c.c_int * 14))[0][12]:
+                set_wm_state(event[5], NORMAL)
+                continue
+            if kind == UNMAP_NOTIFY and event[4] == x.root and event[5] != check:
+                if wm_state(event[5]) not in (None, WITHDRAWN):
+                    set_wm_state(event[5], WITHDRAWN)
+                continue
+            if kind == CLIENT_MESSAGE and event[5] == change_state_atom and event[7] == ICONIC:
+                # No minimizing here, as under gamescope: the window stays up and is told so.
+                set_wm_state(event[4], NORMAL)
+                print('droiddeck-vortek-focus: window 0x%x asked to be iconified, kept up' % event[4], flush=True)
+                continue
+            if kind == CLIENT_MESSAGE and event[5] == state_atom and fullscreen_atom in (event[8], event[9]):
+                # data: action (0 remove, 1 add, 2 toggle), first and second property.
+                w = event[4]
+                action = event[7]
+                on = action == 1 or (action == 2 and fullscreen_atom not in x.cardinals(w, '_NET_WM_STATE'))
+                set_fullscreen(w, on)
+                continue
+            if kind == CLIENT_MESSAGE and event[5] == active_atom:
+                w = event[4]
+                a = attrs(w)
+                # Steam asking for its own window while a menu is open is the menu logic's business.
+                if tags.get(w, (0,))[0] == STEAM_APP and menu_open(w):
+                    continue
+                if a and a.map_state == 2 and w in x.children(x.root):
+                    activate(w)
+                    last_focus = None
+                    restore = None
+                    print('droiddeck-vortek-focus: activated window 0x%x' % w, flush=True)
+
+        # Bottom to top: mapped, managed top-level windows with their app and pid.
+        stack = []
+        for w in x.children(x.root):
+            a = attrs(w)
+            if not a or a.map_state != 2 or a.override_redirect or (a.width <= 1 and a.height <= 1):
+                continue
+            if w not in tags and w not in watched and w not in saved:
+                # First sight of this window: a client may set the state itself before mapping.
+                if fullscreen_atom in x.cardinals(w, '_NET_WM_STATE') and \
+                        (a.x, a.y, a.width, a.height) != (0, 0, root_attrs.width, root_attrs.height):
+                    set_fullscreen(w, True)
+            if w not in tags:
+                app = x.cardinals(w, 'STEAM_GAME')
+                pid = x.cardinals(w, '_NET_WM_PID')
+                if not app:
+                    # Wake up when the client tags it.
+                    if watched.get(w) != PROPERTY_CHANGE:
+                        x.x.XSelectInput(x.dpy, w, PROPERTY_CHANGE)
+                        watched[w] = PROPERTY_CHANGE
+                    stack.append((w, 0, pid[0] if pid else 0))
+                    continue
+                tags[w] = (app[0], pid[0] if pid else 0)
+            if tags[w][0] != STEAM_APP:
+                to_corner(w, a)
+            # The Steam window's children are its menus: wake up when they map or unmap.
+            mask = SUBSTRUCTURE_NOTIFY if tags[w][0] == STEAM_APP else 0
+            if watched.get(w) != mask:
+                x.x.XSelectInput(x.dpy, w, mask)
+                watched[w] = mask
+            stack.append((w,) + tags[w])
+        for w in set(tags) - {e[0] for e in stack}:
+            del tags[w]
+        for w in set(watched) - {e[0] for e in stack}:
+            del watched[w]
+        for w in set(saved) - {e[0] for e in stack}:
+            del saved[w]
+        for w in set(moved) - {e[0] for e in stack}:
+            del moved[w]
+        steam = next((w for w, app, _ in stack if app == STEAM_APP), 0)
+        steam_index = next((i for i, (w, _, _) in enumerate(stack) if w == steam), -1)
+
+        if steam and menu_open(steam):
+            above = [w for w, _, _ in stack[steam_index + 1:]]
+            if above:
+                # Remember what was over Steam, also windows that map while the menu is open.
+                restore = (restore or []) + [w for w in above if w not in (restore or [])]
+                # Input focus stays with the game, as under gamescope: the menus take the pad themselves.
+                x.x.XRaiseWindow(x.dpy, steam)
+                stack = [e for e in stack if e[0] != steam] + [stack[steam_index]]
+                print('droiddeck-vortek-focus: Steam menu over %s' % ' '.join('0x%x' % w for w in above), flush=True)
+        elif restore is not None:
+            back = [e for w in restore for e in stack if e[0] == w]
+            for w, _, _ in back:
+                x.x.XRaiseWindow(x.dpy, w)
+            if back:
+                stack = [e for e in stack if e not in back] + back
+                print('droiddeck-vortek-focus: menu closed, back to %s' % ' '.join('0x%x' % e[0] for e in back),
+                      flush=True)
+            restore = None
+
+        apps, windows = [], []
+        for w, app, pid in stack:
+            if app and app not in apps:
+                apps.append(app)
+            windows += [w, app, pid]
+        if (apps, windows) != last_lists:
+            x.set_cardinals('GAMESCOPE_FOCUSABLE_APPS', apps)
+            x.set_cardinals('GAMESCOPE_FOCUSABLE_WINDOWS', windows)
+            x.set_cardinals('_NET_CLIENT_LIST', windows[0::3], kind=XA_WINDOW)
+            x.set_cardinals('_NET_CLIENT_LIST_STACKING', windows[0::3], kind=XA_WINDOW)
+            last_lists = (apps, windows)
+        top = stack[-1] if stack else None
+        if top and (top[0], top[1]) != last_focus:
+            app = [top[1]] if top[1] else []
+            x.set_cardinals('GAMESCOPE_FOCUSED_APP', app)
+            x.set_cardinals('GAMESCOPE_FOCUSED_APP_GFX', app)
+            x.set_cardinals('GAMESCOPE_FOCUSED_WINDOW', [top[0]])
+            # A new window on top gets focus; the Steam menus leave it with the game (restore is set).
+            if restore is None:
+                activate(top[0])
+            last_focus = (top[0], top[1])
+        # Sleep until the X server has something: a window mapped, unmapped, restacked or tagged,
+        # a menu opened or closed, an activation request.
+        x.x.XFlush(x.dpy)
+        if not x.x.XPending(x.dpy):
+            select.select([fd], [], [], IDLE_S)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

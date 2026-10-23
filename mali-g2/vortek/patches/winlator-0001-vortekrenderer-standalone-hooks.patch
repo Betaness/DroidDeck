@@ -1,0 +1,140 @@
+diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+index 6112461..a3b4886 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
++++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+@@ -54,8 +54,21 @@ typedef struct ExtraDataRequest {
+     int size;
+ } ExtraDataRequest;
+ 
++#ifdef VORTEK_STANDALONE
++typedef struct VortekOptions {
++    int vkMaxVersion;
++    short maxDeviceMemory;
++    short imageCacheSize;
++    uint8_t resourceMemoryType;
++    ArrayList* exposedDeviceExtensions; /* NULL = expose all */
++} VortekOptions;
++
++extern VkContext* createVkContext(int clientFd, const VortekOptions* options);
++extern void destroyVkContext(VkContext* context);
++#else
+ extern VkContext* createVkContext(JNIEnv *env, jobject obj, int clientFd, jobject options);
+ extern void destroyVkContext(JNIEnv *env, VkContext* context);
++#endif
+ extern bool handleExtraDataRequest(VkContext* context, uint16_t requestId, int requestLength);
+ 
+ #endif
+diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+index 3fed461..fc2802f 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
++++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+@@ -3,8 +3,11 @@
+ #include "request_handler.h"
+ #include "sysvshared_memory.h"
+ #include "string_utils.h"
++#ifndef VORTEK_STANDALONE
+ #include "jni_utils.h"
++#endif
+ 
++#ifndef VORTEK_STANDALONE
+ static void loadJMethods(JMethods* jmethods) {
+     JNIEnv* env;
+     (*jmethods->jvm)->AttachCurrentThread(jmethods->jvm, &env, NULL);
+@@ -16,6 +19,7 @@ static void loadJMethods(JMethods* jmethods) {
+     jmethods->getWindowHardwareBuffer = (*env)->GetMethodID(env, cls, "getWindowHardwareBuffer", "(IZ)J");
+     jmethods->updateWindowContent = (*env)->GetMethodID(env, cls, "updateWindowContent", "(I)V");
+ }
++#endif
+ 
+ static ExtraDataRequest* waitForExtraDataRequest(VkContext* context, uint16_t requestId) {
+     ExtraDataRequest* result = NULL;
+@@ -43,7 +47,9 @@ static ExtraDataRequest* waitForExtraDataRequest(VkContext* context, uint16_t re
+ 
+ static void* requestHandlerThread(void* param) {
+     VkContext* context = param;
++#ifndef VORTEK_STANDALONE
+     loadJMethods(&context->jmethods);
++#endif
+     ExtraDataRequest* extraDataRequest = NULL;
+ 
+     while (context->status >= 0) {
+@@ -77,7 +83,9 @@ static void* requestHandlerThread(void* param) {
+         context->inputBufferSize = 0;
+     }
+ 
++#ifndef VORTEK_STANDALONE
+     (*context->jmethods.jvm)->DetachCurrentThread(context->jmethods.jvm);
++#endif
+     vt_free(&context->memoryPool);
+     return NULL;
+ }
+@@ -103,6 +111,29 @@ static bool setupRingBuffers(VkContext* context) {
+     return true;
+ }
+ 
++#ifdef VORTEK_STANDALONE
++VkContext* createVkContext(int clientFd, const VortekOptions* options) {
++    VkContext* context = calloc(1, sizeof(VkContext));
++    context->clientFd = clientFd;
++    context->vkMaxVersion = options->vkMaxVersion;
++    context->maxDeviceMemory = options->maxDeviceMemory;
++    context->imageCacheSize = options->imageCacheSize;
++    context->resourceMemoryType = options->resourceMemoryType;
++    context->exposedDeviceExtensions = options->exposedDeviceExtensions ? ArrayList_fromStrings((const char**)options->exposedDeviceExtensions->elements, options->exposedDeviceExtensions->size) : NULL;
++
++    pthread_mutex_init(&context->extraDataRequestsMutex, NULL);
++
++    context->memoryPool.data = calloc(MEMORY_POOL_MAX_SIZE, 1);
++    context->threadPool = ThreadPool_init(THREAD_POOL_NUM_THREADS);
++
++    if (!setupRingBuffers(context)) {
++        destroyVkContext(context);
++        return NULL;
++    }
++
++    return context;
++}
++#else
+ VkContext* createVkContext(JNIEnv* env, jobject obj, int clientFd, jobject options) {
+     jobjectArray exposedDeviceExtensions = getJFieldByName(env, options, "exposedDeviceExtensions", JSIGNATURE_ARRAY_STRING).l;
+ 
+@@ -129,8 +160,13 @@ VkContext* createVkContext(JNIEnv* env, jobject obj, int clientFd, jobject optio
+ 
+     return context;
+ }
++#endif
+ 
++#ifdef VORTEK_STANDALONE
++void destroyVkContext(VkContext* context) {
++#else
+ void destroyVkContext(JNIEnv* env, VkContext* context) {
++#endif
+     context->status = VK_ERROR_DEVICE_LOST;
+ 
+     if (context->requestHandlerThread) {
+@@ -146,10 +182,12 @@ void destroyVkContext(JNIEnv* env, VkContext* context) {
+         RingBuffer_free(context->clientRing);
+     }
+ 
++#ifndef VORTEK_STANDALONE
+     if (context->jmethods.obj) {
+         (*env)->DeleteGlobalRef(env, context->jmethods.obj);
+         context->jmethods.obj = NULL;
+     }
++#endif
+ 
+     context->graphicsQueueIndex = 0;
+ 
+diff --git a/app/src/main/cpp/winlator/include/winlator.h b/app/src/main/cpp/winlator/include/winlator.h
+index 2314314..bd63e4f 100644
+--- a/app/src/main/cpp/winlator/include/winlator.h
++++ b/app/src/main/cpp/winlator/include/winlator.h
+@@ -46,7 +46,7 @@ static inline pid_t currentThreadId() {
+ #endif
+ }
+ 
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) && !defined(VORTEK_STANDALONE)
+ #include <android/log.h>
+ #define println(...) __android_log_print(ANDROID_LOG_DEBUG, "System.out", __VA_ARGS__)
+ #else

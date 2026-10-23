@@ -6,6 +6,17 @@
 #define WEBHELPER_DEFAULT "--no-zygote --in-process-gpu -AudioServiceOutOfProcess"
 #endif
 
+/* [mali-g2] steamwebhelper.sh exports LIBGL_KOPPER_DISABLE=true. Without kopper, zink needs DRI3,
+ * which the Vortek session's Xwayland (-shm, no render node) lacks, and zink then crashes in GLX
+ * setup: the web helper died at start and Steam showed a black screen. Drop it when OpenGL runs on
+ * zink over Vortek; Mesa reads the variable when GLX initializes, after this constructor. */
+__attribute__((constructor)) static void bl_webhelper_kopper(void) {
+  extern char *program_invocation_short_name;
+  const char *zink = getenv("BL_VORTEK_ZINK");
+  if (!zink || strcmp(zink, "1") || !program_invocation_short_name) return;
+  if (!strcmp(program_invocation_short_name, "steamwebhelper")) unsetenv("LIBGL_KOPPER_DISABLE");
+}
+
 static int is_webhelper_browser(const char *path, char *const argv[]) {
   if (!path || !argv) return 0;
   const char *base = strrchr(path, '/');

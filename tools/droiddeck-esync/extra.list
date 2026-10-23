@@ -1,0 +1,7 @@
+# Extra droiddeck-esync packs shipped in the APK next to the signed bundle (release.env).
+# They are not in the signed index; the APK is their trust root. fetch-extra.sh verifies every
+# asset against the sha256 below and writes app/src/main/assets/droiddeck-esync-extra/.
+# Each pack needs both <id>.tzst and <id>.json (the index entry built with it).
+# repo	tag	asset	sha256
+Betaness/DroidDeck-Components	droiddeck-sempool-valve-r2	valve-experimental-11.0-20261014-arm64-1791970419-ccf9fc588e30-r2.tzst	f079da9fd6e01412f4717aa1e13527f6d709c9651b20bc74a90d91c07024a396
+Betaness/DroidDeck-Components	droiddeck-sempool-valve-r2	valve-experimental-11.0-20261014-arm64-1791970419-ccf9fc588e30-r2.json	296d974f3bf086e68bca6b7ffa006c8bd617df414bcc3bcb93a731632c70c7a1

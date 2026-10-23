@@ -1,0 +1,178 @@
+diff --git a/app/src/main/cpp/winlator/include/ring_buffer.h b/app/src/main/cpp/winlator/include/ring_buffer.h
+index d00e32c..1760103 100644
+--- a/app/src/main/cpp/winlator/include/ring_buffer.h
++++ b/app/src/main/cpp/winlator/include/ring_buffer.h
+@@ -10,6 +10,8 @@ typedef struct RingBuffer {
+     atomic_uint* head;
+     atomic_uint* tail;
+     atomic_uint* status;
++    atomic_uint* readWaiters;
++    atomic_uint* writeWaiters;
+     void* buffer;
+     void* sharedData;
+     uint32_t bufferSize;
+diff --git a/app/src/main/cpp/winlator/src/ring_buffer.c b/app/src/main/cpp/winlator/src/ring_buffer.c
+index 97c9155..93a568f 100644
+--- a/app/src/main/cpp/winlator/src/ring_buffer.c
++++ b/app/src/main/cpp/winlator/src/ring_buffer.c
+@@ -5,21 +5,37 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stddef.h>
++#include <errno.h>
++#include <limits.h>
++#include <time.h>
+ #include <pthread.h>
++#include <sched.h>
+ #include <sys/mman.h>
++#include <sys/syscall.h>
++#include <linux/futex.h>
+ 
+ #include "ring_buffer.h"
+ #include "time_utils.h"
+ #include "events.h"
+ 
++/* [mali-g2] Waits block in the kernel (futex on the shared head/tail words) after a short spin,
++ * instead of yielding and sleeping 100 us in a loop: idle connections no longer wake 10,000 times
++ * a second, and a waiting reader is woken as soon as the writer publishes. Writers only make the
++ * wake syscall when a waiter announced itself. Both sides of a ring must use this layout. */
+ #define STRUCT_OFFSETS() \
+     struct Offsets { \
+         uint32_t head; \
+         uint32_t tail; \
+         uint32_t status; \
++        uint32_t readWaiters; \
++        uint32_t writeWaiters; \
++        uint32_t reserved; \
+         void* buffer; \
+     }
+ 
++#define SPIN_NS 20000
++#define FUTEX_TIMEOUT_NS 50000000
++
+ #ifdef __ANDROID__
+ #include <android/log.h>
+ #define debug_printf(...) __android_log_print(ANDROID_LOG_DEBUG, "System.out", __VA_ARGS__)
+@@ -27,8 +43,32 @@
+ #define debug_printf(...) fprintf(stderr, __VA_ARGS__)
+ #endif
+ 
++static int64_t monotonicNs(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++static inline void cpuRelax(void) {
++#if defined(__aarch64__)
++    __asm__ volatile("yield" ::: "memory");
++#elif defined(__x86_64__) || defined(__i386__)
++    __asm__ volatile("pause" ::: "memory");
++#endif
++}
++
++static void futexWait(atomic_uint* word, uint32_t expected) {
++    struct timespec timeout = {0, FUTEX_TIMEOUT_NS};
++    syscall(SYS_futex, (uint32_t*)word, FUTEX_WAIT, expected, &timeout, NULL, 0);
++}
++
++static void futexWake(atomic_uint* word) {
++    syscall(SYS_futex, (uint32_t*)word, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
++}
++
+ void RingBuffer_setHead(RingBuffer* ring, uint32_t head) {
+-    atomic_store_explicit(ring->head, head, memory_order_release);
++    atomic_store_explicit(ring->head, head, memory_order_seq_cst);
++    if (atomic_load_explicit(ring->writeWaiters, memory_order_seq_cst)) futexWake(ring->head);
+ }
+ 
+ uint32_t RingBuffer_getHead(RingBuffer* ring) {
+@@ -36,7 +76,8 @@ uint32_t RingBuffer_getHead(RingBuffer* ring) {
+ }
+ 
+ void RingBuffer_setTail(RingBuffer* ring, uint32_t tail) {
+-    return atomic_store_explicit(ring->tail, tail, memory_order_release);
++    atomic_store_explicit(ring->tail, tail, memory_order_seq_cst);
++    if (atomic_load_explicit(ring->readWaiters, memory_order_seq_cst)) futexWake(ring->tail);
+ }
+ 
+ uint32_t RingBuffer_getTail(RingBuffer* ring) {
+@@ -45,6 +86,10 @@ uint32_t RingBuffer_getTail(RingBuffer* ring) {
+ 
+ void RingBuffer_setStatus(RingBuffer* ring, uint32_t status) {
+     atomic_fetch_or_explicit(ring->status, status, memory_order_seq_cst);
++    if (status & RING_STATUS_EXIT) {
++        futexWake(ring->tail);
++        futexWake(ring->head);
++    }
+ }
+ 
+ void RingBuffer_unsetStatus(RingBuffer* ring, uint32_t status) {
+@@ -68,6 +113,8 @@ RingBuffer* RingBuffer_create(int shmFd, uint32_t bufferSize) {
+     ring->head = sharedData + offsetof(struct Offsets, head);
+     ring->tail = sharedData + offsetof(struct Offsets, tail);
+     ring->status = sharedData + offsetof(struct Offsets, status);
++    ring->readWaiters = sharedData + offsetof(struct Offsets, readWaiters);
++    ring->writeWaiters = sharedData + offsetof(struct Offsets, writeWaiters);
+     ring->buffer = sharedData + offsetof(struct Offsets, buffer);
+     ring->bufferSize = bufferSize;
+ 
+@@ -147,24 +194,41 @@ void RingBuffer_free(RingBuffer* ring) {
+     free(ring);
+ }
+ 
+-bool RingBuffer_waitForRead(RingBuffer* ring, uint32_t size) {
+-    uint32_t busyWaitIter = 0;
+-    do {
+-        if (RingBuffer_size(ring) >= size) break;
+-        busyWait(&busyWaitIter);
++/* Spin briefly (most replies arrive within microseconds), then sleep on `word` until the other
++ * side changes it. Announcing the waiter before the final check pairs with the writer storing the
++ * word before reading the waiter count (both seq_cst), so a wakeup cannot be missed; the timeout
++ * only bounds how long an EXIT that raced the announcement goes unseen. */
++static bool waitUntil(RingBuffer* ring, atomic_uint* word, atomic_uint* waiters, bool (*ready)(RingBuffer*, uint32_t), uint32_t size) {
++    if (ready(ring, size)) return true;
++    int64_t spinUntil = monotonicNs() + SPIN_NS;
++    uint32_t iter = 0;
++    while (monotonicNs() < spinUntil) {
++        for (int i = 0; i < 32; i++) cpuRelax();
++        if (ready(ring, size)) return true;
++        if ((++iter & 63) == 0 && RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
++    }
++    for (;;) {
+         if (RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
++        uint32_t observed = atomic_load_explicit(word, memory_order_seq_cst);
++        atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
++        if (!ready(ring, size)) futexWait(word, observed);
++        atomic_fetch_sub_explicit(waiters, 1, memory_order_seq_cst);
++        if (ready(ring, size)) return true;
+     }
+-    while (1);
+-    return true;
++}
++
++static bool canRead(RingBuffer* ring, uint32_t size) {
++    return RingBuffer_size(ring) >= size;
++}
++
++static bool canWrite(RingBuffer* ring, uint32_t size) {
++    return RingBuffer_freeSpace(ring) >= size;
++}
++
++bool RingBuffer_waitForRead(RingBuffer* ring, uint32_t size) {
++    return waitUntil(ring, ring->tail, ring->readWaiters, canRead, size);
+ }
+ 
+ bool RingBuffer_waitForWrite(RingBuffer* ring, uint32_t size) {
+-    uint32_t busyWaitIter = 0;
+-    do {
+-        if (RingBuffer_freeSpace(ring) >= size) break;
+-        busyWait(&busyWaitIter);
+-        if (RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
+-    }
+-    while (1);
+-    return true;
+-}
+\ No newline at end of file
++    return waitUntil(ring, ring->head, ring->writeWaiters, canWrite, size);
++}

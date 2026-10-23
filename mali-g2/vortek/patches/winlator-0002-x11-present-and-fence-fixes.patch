@@ -1,0 +1,88 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 0e4b6e5..908fac5 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -5,11 +5,19 @@
+ 
+ #define MSG_DEBUG_UNIMPLEMENTED_FUNC "%s not implemented yet\n"
+ 
++#ifdef VORTEK_STANDALONE
++#include <sys/eventfd.h>
++#endif
++
+ void vt_handle_vkCreateInstance(VkContext* context) {
+     VkInstanceCreateInfo createInfo = {0};
+     vt_unserialize_vkCreateInstance(&createInfo, NULL, NULL, context->inputBuffer, &context->memoryPool);
+ 
++#ifdef VORTEK_STANDALONE
++    const char* skipExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface"};
++#else
+     const char* skipExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface"};
++#endif
+ 
+ #if ENABLE_VALIDATION_LAYER
+     createInfo.ppEnabledLayerNames = validationLayers;
+@@ -196,7 +204,11 @@ void vt_handle_vkEnumerateInstanceExtensionProperties(VkContext* context) {
+     VkExtensionProperties* exposedExtensions = vt_alloc(&context->memoryPool, propertyCount * sizeof(VkExtensionProperties));
+     result = vulkanWrapper.vkEnumerateInstanceExtensionProperties(NULL, &exposedExtensionCount, exposedExtensions);
+ 
++#ifdef VORTEK_STANDALONE
++    const char* extraExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface"};
++#else
+     const char* extraExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface"};
++#endif
+     const char* skipExtensions[] = {"VK_KHR_android_surface"};
+     injectExtensions2(context, &exposedExtensions, &exposedExtensionCount,
+                       extraExtensions, ARRAY_SIZE(extraExtensions),
+@@ -556,13 +568,38 @@ void vt_handle_vkWaitForFences(VkContext* context) {
+         VkResult result = VK_SUCCESS;
+         int fds[fenceCount];
+         for (int i = 0; i < fenceCount; i++) {
++#ifdef VORTEK_STANDALONE
++            /* A signaled fence has no sync file to export: Mali fails with
++             * VK_ERROR_OUT_OF_HOST_MEMORY and resets the fence (export has
++             * reset semantics), and a -1 fd cannot travel over SCM_RIGHTS
++             * (sendmsg fails with EBADF, the client blocks forever). Hand out
++             * an already readable eventfd instead. */
++            if (vulkanWrapper.vkGetFenceStatus(device, fences[i]) == VK_SUCCESS) {
++                fds[i] = eventfd(1, EFD_CLOEXEC);
++                continue;
++            }
++#endif
+             VkFenceGetFdInfoKHR getFdInfo = {0};
+             getFdInfo.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR;
+             getFdInfo.fence = fences[i];
+             getFdInfo.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+ 
+             result = vulkanWrapper.vkGetFenceFd(device, &getFdInfo, &fds[i]);
++#ifdef VORTEK_STANDALONE
++            /* no pending signal operation yet: wait here instead */
++            if (result != VK_SUCCESS || fds[i] < 0) {
++                VkResult status = vulkanWrapper.vkWaitForFences(device, 1, &fences[i], VK_TRUE, timeout);
++                result = status == VK_TIMEOUT ? VK_SUCCESS : status;
++                fds[i] = result == VK_SUCCESS ? eventfd(status == VK_SUCCESS ? 1 : 0, EFD_CLOEXEC) : -1;
++            }
++            if (result != VK_SUCCESS) {
++                for (int j = 0; j < i; j++) CLOSEFD(fds[j]);
++                fenceCount = 0; /* client reports VK_ERROR_DEVICE_LOST */
++                break;
++            }
++#else
+             if (result != VK_SUCCESS) break;
++#endif
+         }
+ 
+         send_fds(context->clientFd, fds, fenceCount, &result, sizeof(VkResult));
+@@ -2020,7 +2057,12 @@ void vt_handle_vkCreateSwapchainKHR(VkContext* context) {
+     getWindowExtent(&context->jmethods, windowId, &windowSize);
+ 
+     XWindowSwapchain* swapchain = NULL;
++#ifdef VORTEK_STANDALONE
++    /* the client presents to its X window itself and knows the real window size */
++    if (createInfo.imageExtent.width > 0 && createInfo.imageExtent.height > 0) {
++#else
+     if (createInfo.imageExtent.width == windowSize.width && createInfo.imageExtent.height == windowSize.height) {
++#endif
+         swapchain = XWindowSwapchain_create(device, context->graphicsQueueIndex, &createInfo, &context->jmethods, windowId);
+         if (!swapchain) result = VK_ERROR_INITIALIZATION_FAILED;
+     }

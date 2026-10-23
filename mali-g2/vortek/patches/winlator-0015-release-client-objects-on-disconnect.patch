@@ -1,0 +1,1197 @@
+diff --git a/app/src/main/cpp/vortekrenderer/include/timeline_semaphore.h b/app/src/main/cpp/vortekrenderer/include/timeline_semaphore.h
+index 5fc3341..c79a54b 100644
+--- a/app/src/main/cpp/vortekrenderer/include/timeline_semaphore.h
++++ b/app/src/main/cpp/vortekrenderer/include/timeline_semaphore.h
+@@ -3,6 +3,7 @@
+ 
+ #include "vortek.h"
+ 
+-extern void TimelineSemaphore_asyncWait(int clientFd, ThreadPool* threadPool, char* inputBuffer, int inputBufferSize);
++/* [mali-g2] takes the context: the wait ends when its status turns negative (winlator-0015) */
++extern void TimelineSemaphore_asyncWait(VkContext* context);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+index f8d42cf..50cf1c2 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
++++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+@@ -47,6 +47,13 @@ typedef struct VkContext {
+     char* engineName;
+     uint32_t engineVersion;
+     VkDriverId driverID;
++
++    /* [mali-g2] What this connection created and has not destroyed yet (OwnedDevice*, VkInstance),
++     * released by destroyVkContext when the client is gone (winlator-0015). */
++    pthread_mutex_t ownedLock;
++    ArrayList ownedDevices;
++    ArrayList ownedInstances;
++    int untrackedLogged;
+ } VkContext;
+ 
+ typedef struct ExtraDataRequest {
+@@ -55,6 +62,75 @@ typedef struct ExtraDataRequest {
+     int size;
+ } ExtraDataRequest;
+ 
++/* [mali-g2] Objects of one VkDevice that the client has not destroyed (winlator-0015). The Mali
++ * driver does not reclaim children on vkDestroyDevice (fences keep imported sync files, pools and
++ * pipelines their GPU mappings), and the server keeps its own state for some (ResourceMemory fds,
++ * dma-bufs and AHardwareBuffers, swapchains, shader module SPIR-V), so when the client is gone they
++ * are destroyed one by one, in this order, before the device. Client processes have one connection
++ * each and ids are only valid on the connection that returned them, so ownership is per context.
++ * Command buffers and descriptor sets go with their pools. Guarded by ownedLock (pipelines are
++ * created on the thread pool). */
++typedef enum OwnedKind {
++    OWNED_FRAMEBUFFER,
++    OWNED_IMAGE_VIEW,
++    OWNED_BUFFER_VIEW,
++    OWNED_PIPELINE,
++    OWNED_SHADER_MODULE,
++    OWNED_PIPELINE_LAYOUT,
++    OWNED_DESCRIPTOR_POOL,
++    OWNED_DESCRIPTOR_SET_LAYOUT,
++    OWNED_SAMPLER,
++    OWNED_SAMPLER_YCBCR_CONVERSION,
++    OWNED_RENDER_PASS,
++    OWNED_PIPELINE_CACHE,
++    OWNED_QUERY_POOL,
++    OWNED_EVENT,
++    OWNED_SEMAPHORE,
++    OWNED_FENCE,
++    OWNED_COMMAND_POOL,
++    OWNED_SWAPCHAIN, /* after the views and framebuffers the client made of its images */
++    OWNED_BUFFER,
++    OWNED_IMAGE,
++    OWNED_MEMORY,
++    OWNED_KIND_COUNT
++} OwnedKind;
++
++typedef struct OwnedSet {
++    uint64_t* keys; /* open addressing, 0 = empty */
++    uint32_t capacity;
++    uint32_t size;
++} OwnedSet;
++
++typedef struct OwnedQueue {
++    uint32_t family;
++    uint32_t count;
++    VkDeviceQueueCreateFlags flags;
++} OwnedQueue;
++
++typedef struct OwnedDevice {
++    VkDevice device;
++    VkPhysicalDevice physicalDevice;
++    uint32_t queueInfoCount;
++    OwnedQueue* queueInfos;
++    OwnedSet objects[OWNED_KIND_COUNT];
++    OwnedSet timelineSemaphores; /* the timeline ones of objects[OWNED_SEMAPHORE] */
++    VkFence* idleFences;         /* pending fence-only submits while the device drains */
++    uint32_t idleFenceCount;
++    bool lost;
++} OwnedDevice;
++
++extern void VkContext_addInstance(VkContext* context, VkInstance instance);
++extern void VkContext_removeInstance(VkContext* context, VkInstance instance);
++extern void VkContext_addDevice(VkContext* context, VkPhysicalDevice physicalDevice, VkDevice device, const VkDeviceCreateInfo* createInfo);
++extern void VkContext_destroyDevice(VkContext* context, VkDevice device);
++extern void VkContext_track(VkContext* context, VkDevice device, OwnedKind kind, void* object);
++/* A semaphore created as VK_SEMAPHORE_TYPE_TIMELINE (tracked with OWNED_SEMAPHORE as well). */
++extern void VkContext_trackTimelineSemaphore(VkContext* context, VkDevice device, VkSemaphore semaphore);
++/* Forgets the object and returns the device it was created on, or VK_NULL_HANDLE (logged unless the
++ * handle is null) when this connection does not own it: the caller must then not destroy it
++ * (double destroy, a foreign or stale id would take the whole server down). */
++extern VkDevice VkContext_untrack(VkContext* context, VkDevice device, OwnedKind kind, void* object);
++
+ #ifdef VORTEK_STANDALONE
+ typedef struct VortekOptions {
+     int vkMaxVersion;
+diff --git a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
+index 6a0e2de..5364368 100644
+--- a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
++++ b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
+@@ -12,6 +12,7 @@ typedef struct PipelineCreateRequest {
+     ShaderInspector* shaderInspector;
+     MemoryPool memoryPool;
+     int notifyFd;
++    VkContext* context;
+ } PipelineCreateRequest;
+ 
+ /* Pipeline library lifetime (VK_KHR_pipeline_library). An application may destroy its
+@@ -136,7 +137,12 @@ static void pipelineCreateThread(void* param) {
+     VkPipeline pipelines[pipelineCreateRequest->pipelineCount];
+     VkResult result = VK_SUCCESS;
+ 
+-    if (pipelineCreateRequest->type == PIPELINE_TYPE_GRAPHICS) {
++    /* [mali-g2] the client is gone: nobody would get or destroy the pipelines (winlator-0015) */
++    if (__atomic_load_n(&pipelineCreateRequest->context->status, __ATOMIC_ACQUIRE) < 0) {
++        memset(pipelines, 0, sizeof(pipelines));
++        result = VK_ERROR_DEVICE_LOST;
++    }
++    else if (pipelineCreateRequest->type == PIPELINE_TYPE_GRAPHICS) {
+         VkGraphicsPipelineCreateInfo* createInfos = pipelineCreateRequest->pipelineInfos;
+ 
+         for (int i = 0; i < pipelineCreateRequest->pipelineCount; i++) {
+@@ -167,6 +173,11 @@ static void pipelineCreateThread(void* param) {
+ 
+     vt_free(&pipelineCreateRequest->memoryPool);
+ 
++    /* [mali-g2] owned by the connection before the client can see (and destroy) them (winlator-0015) */
++    for (int i = 0; i < pipelineCreateRequest->pipelineCount; i++) {
++        if (pipelines[i]) VkContext_track(pipelineCreateRequest->context, pipelineCreateRequest->device, OWNED_PIPELINE, pipelines[i]);
++    }
++
+     int bufferSize = sizeof(VkResult) + pipelineCreateRequest->pipelineCount * VK_HANDLE_BYTE_COUNT;
+     char outputBuffer[bufferSize];
+ 
+@@ -186,6 +197,7 @@ void AsyncPipelineCreator_create(VkContext* context, PipelineType type) {
+     PipelineCreateRequest* pipelineCreateRequest = calloc(1, sizeof(PipelineCreateRequest));
+     pipelineCreateRequest->type = type;
+     pipelineCreateRequest->shaderInspector = context->shaderInspector;
++    pipelineCreateRequest->context = context;
+ 
+     uint64_t deviceId = 0;
+     uint64_t pipelineCacheId = 0;
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index b548096..1eef8c6 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -35,6 +35,7 @@ void vt_handle_vkCreateInstance(VkContext* context) {
+     VkInstance instance;
+     VkResult result = vulkanWrapper.vkCreateInstance(&createInfo, NULL, &instance);
+     if (result == VK_SUCCESS) initVulkanInstance(context, instance, createInfo.pApplicationInfo);
++    if (result == VK_SUCCESS) VkContext_addInstance(context, instance);
+ 
+     VT_SERIALIZE_CMD(VkInstance, instance);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -52,6 +53,7 @@ void vt_handle_vkDestroyInstance(VkContext* context) {
+     }
+ #endif
+ 
++    VkContext_removeInstance(context, instance);
+     vulkanWrapper.vkDestroyInstance(instance, NULL);
+ }
+ 
+@@ -228,6 +230,7 @@ void vt_handle_vkCreateDevice(VkContext* context) {
+     VkDevice device;
+     VkResult result = vulkanWrapper.vkCreateDevice(physicalDevice, &createInfo, NULL, &device);
+     if (result == VK_SUCCESS) initVulkanDevice(context, physicalDevice, device);
++    if (result == VK_SUCCESS) VkContext_addDevice(context, physicalDevice, device, &createInfo);
+ 
+     VT_SERIALIZE_CMD(VkDevice, device);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -239,9 +242,9 @@ void vt_handle_vkDestroyDevice(VkContext* context) {
+     vt_unserialize_vkDestroyDevice((VkDevice)&deviceId, NULL, context->inputBuffer, &context->memoryPool);
+     VkDevice device = VkObject_fromId(deviceId);
+ 
+-    AsyncPipelineCreator_destroyDevice(device);
+-    if (context->nativeImages) ResourceMemory_untrackDevice(device);
+-    vulkanWrapper.vkDestroyDevice(device, NULL);
++    /* [mali-g2] with what the client left on it, the texture decoder and the pipeline library
++     * references; a device this connection does not own is left alone (winlator-0015) */
++    VkContext_destroyDevice(context, device);
+ }
+ 
+ void vt_handle_vkEnumerateInstanceVersion(VkContext* context) {
+@@ -365,6 +368,7 @@ void vt_handle_vkAllocateMemory(VkContext* context) {
+     VkResult result = resourceMemory ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+     if (result == VK_SUCCESS) {
++        VkContext_track(context, device, OWNED_MEMORY, resourceMemory);
+         VT_SERIALIZE_CMD(VkDeviceMemory, (VkDeviceMemory)resourceMemory);
+         vt_send(context->clientRing, result, outputBuffer, bufferSize);
+     }
+@@ -379,7 +383,9 @@ void vt_handle_vkFreeMemory(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     ResourceMemory* resourceMemory = VkObject_fromId(memoryId);
+ 
+-    ResourceMemory_free(context, device, resourceMemory);
++    /* [mali-g2] only memory this connection allocated and has not freed yet (winlator-0015) */
++    VkDevice owner = VkContext_untrack(context, device, OWNED_MEMORY, resourceMemory);
++    if (owner) ResourceMemory_free(context, owner, resourceMemory);
+ }
+ 
+ void vt_handle_vkMapMemory(VkContext* context) {
+@@ -581,6 +587,7 @@ void vt_handle_vkCreateFence(VkContext* context) {
+ 
+     VkFence fence;
+     VkResult result = vulkanWrapper.vkCreateFence(device, &createInfo, NULL, &fence);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_FENCE, fence);
+ 
+     VT_SERIALIZE_CMD(VkFence, fence);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -594,7 +601,7 @@ void vt_handle_vkDestroyFence(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkFence fence = VkObject_fromId(fenceId);
+ 
+-    vulkanWrapper.vkDestroyFence(device, fence, NULL);
++    if (VkContext_untrack(context, device, OWNED_FENCE, fence)) vulkanWrapper.vkDestroyFence(device, fence, NULL);
+ }
+ 
+ void vt_handle_vkResetFences(VkContext* context) {
+@@ -707,6 +714,12 @@ void vt_handle_vkCreateSemaphore(VkContext* context) {
+ 
+     VkSemaphore semaphore;
+     VkResult result = vulkanWrapper.vkCreateSemaphore(device, &createInfo, NULL, &semaphore);
++    if (result == VK_SUCCESS) {
++        VkContext_track(context, device, OWNED_SEMAPHORE, semaphore);
++        /* [mali-g2] signalled by the cleanup when the client left work waiting on it (winlator-0015) */
++        const VkSemaphoreTypeCreateInfo* typeInfo = findNextVkStructure((void*)createInfo.pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
++        if (typeInfo && typeInfo->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) VkContext_trackTimelineSemaphore(context, device, semaphore);
++    }
+ 
+     VT_SERIALIZE_CMD(VkSemaphore, semaphore);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -720,7 +733,7 @@ void vt_handle_vkDestroySemaphore(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkSemaphore semaphore = VkObject_fromId(semaphoreId);
+ 
+-    vulkanWrapper.vkDestroySemaphore(device, semaphore, NULL);
++    if (VkContext_untrack(context, device, OWNED_SEMAPHORE, semaphore)) vulkanWrapper.vkDestroySemaphore(device, semaphore, NULL);
+ }
+ 
+ void vt_handle_vkCreateEvent(VkContext* context) {
+@@ -732,6 +745,7 @@ void vt_handle_vkCreateEvent(VkContext* context) {
+ 
+     VkEvent event;
+     VkResult result = vulkanWrapper.vkCreateEvent(device, &createInfo, NULL, &event);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_EVENT, event);
+ 
+     VT_SERIALIZE_CMD(VkEvent, event);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -745,7 +759,7 @@ void vt_handle_vkDestroyEvent(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkEvent event = VkObject_fromId(eventId);
+ 
+-    vulkanWrapper.vkDestroyEvent(device, event, NULL);
++    if (VkContext_untrack(context, device, OWNED_EVENT, event)) vulkanWrapper.vkDestroyEvent(device, event, NULL);
+ }
+ 
+ void vt_handle_vkGetEventStatus(VkContext* context) {
+@@ -793,6 +807,7 @@ void vt_handle_vkCreateQueryPool(VkContext* context) {
+ 
+     VkQueryPool queryPool;
+     VkResult result = vulkanWrapper.vkCreateQueryPool(device, &createInfo, NULL, &queryPool);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_QUERY_POOL, queryPool);
+ 
+     VT_SERIALIZE_CMD(VkQueryPool, queryPool);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -806,7 +821,7 @@ void vt_handle_vkDestroyQueryPool(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkQueryPool queryPool = VkObject_fromId(queryPoolId);
+ 
+-    vulkanWrapper.vkDestroyQueryPool(device, queryPool, NULL);
++    if (VkContext_untrack(context, device, OWNED_QUERY_POOL, queryPool)) vulkanWrapper.vkDestroyQueryPool(device, queryPool, NULL);
+ }
+ 
+ void vt_handle_vkGetQueryPoolResults(VkContext* context) {
+@@ -851,6 +866,7 @@ void vt_handle_vkCreateBuffer(VkContext* context) {
+ 
+     VkBuffer buffer;
+     VkResult result = vulkanWrapper.vkCreateBuffer(device, &createInfo, NULL, &buffer);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_BUFFER, buffer);
+ 
+     VT_SERIALIZE_CMD(VkBuffer, buffer);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -865,7 +881,7 @@ void vt_handle_vkDestroyBuffer(VkContext* context) {
+     VkBuffer buffer = VkObject_fromId(bufferId);
+ 
+     if (context->textureDecoder) TextureDecoder_removeBoundBuffer(context->textureDecoder, buffer);
+-    vulkanWrapper.vkDestroyBuffer(device, buffer, NULL);
++    if (VkContext_untrack(context, device, OWNED_BUFFER, buffer)) vulkanWrapper.vkDestroyBuffer(device, buffer, NULL);
+ }
+ 
+ void vt_handle_vkCreateBufferView(VkContext* context) {
+@@ -877,6 +893,7 @@ void vt_handle_vkCreateBufferView(VkContext* context) {
+ 
+     VkBufferView view;
+     VkResult result = vulkanWrapper.vkCreateBufferView(device, &createInfo, NULL, &view);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_BUFFER_VIEW, view);
+ 
+     VT_SERIALIZE_CMD(VkBufferView, view);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -890,7 +907,7 @@ void vt_handle_vkDestroyBufferView(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkBufferView bufferView = VkObject_fromId(bufferViewId);
+ 
+-    vulkanWrapper.vkDestroyBufferView(device, bufferView, NULL);
++    if (VkContext_untrack(context, device, OWNED_BUFFER_VIEW, bufferView)) vulkanWrapper.vkDestroyBufferView(device, bufferView, NULL);
+ }
+ 
+ void vt_handle_vkCreateImage(VkContext* context) {
+@@ -909,6 +926,7 @@ void vt_handle_vkCreateImage(VkContext* context) {
+     else result = vulkanWrapper.vkCreateImage(device, &createInfo, NULL, &image);
+ 
+     if (result == VK_SUCCESS && context->nativeImages) ResourceMemory_trackImage(device, image, createInfo.tiling);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_IMAGE, image);
+ 
+     VT_SERIALIZE_CMD(VkImage, image);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -922,6 +940,7 @@ void vt_handle_vkDestroyImage(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkImage image = VkObject_fromId(imageId);
+ 
++    if (!VkContext_untrack(context, device, OWNED_IMAGE, image)) return;
+     if (context->nativeImages) ResourceMemory_untrackImage(image);
+ 
+     if (context->textureDecoder && TextureDecoder_containsImage(context->textureDecoder, image)) {
+@@ -959,6 +978,7 @@ void vt_handle_vkCreateImageView(VkContext* context) {
+ 
+     VkImageView view;
+     VkResult result = vulkanWrapper.vkCreateImageView(device, &createInfo, NULL, &view);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_IMAGE_VIEW, view);
+ 
+     VT_SERIALIZE_CMD(VkImageView, view);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -972,7 +992,7 @@ void vt_handle_vkDestroyImageView(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkImageView imageView = VkObject_fromId(imageViewId);
+ 
+-    vulkanWrapper.vkDestroyImageView(device, imageView, NULL);
++    if (VkContext_untrack(context, device, OWNED_IMAGE_VIEW, imageView)) vulkanWrapper.vkDestroyImageView(device, imageView, NULL);
+ }
+ 
+ void vt_handle_vkCreateShaderModule(VkContext* context) {
+@@ -984,6 +1004,11 @@ void vt_handle_vkCreateShaderModule(VkContext* context) {
+ 
+     ShaderModule* shaderModule;
+     VkResult result = ShaderInspector_createModule(context->shaderInspector, device, createInfo.pCode, createInfo.codeSize, &shaderModule);
++    if (result != VK_SUCCESS) {
++        destroyVkObject(VK_OBJECT_TYPE_SHADER_MODULE, device, shaderModule);
++        shaderModule = NULL;
++    }
++    else VkContext_track(context, device, OWNED_SHADER_MODULE, shaderModule);
+ 
+     VT_SERIALIZE_CMD(VkShaderModule, (VkShaderModule)shaderModule);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -997,7 +1022,8 @@ void vt_handle_vkDestroyShaderModule(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     ShaderModule* shaderModule = VkObject_fromId(shaderModuleId);
+ 
+-    destroyVkObject(VK_OBJECT_TYPE_SHADER_MODULE, device, shaderModule);
++    VkDevice owner = VkContext_untrack(context, device, OWNED_SHADER_MODULE, shaderModule);
++    if (owner) destroyVkObject(VK_OBJECT_TYPE_SHADER_MODULE, owner, shaderModule);
+ }
+ 
+ void vt_handle_vkCreatePipelineCache(VkContext* context) {
+@@ -1009,6 +1035,7 @@ void vt_handle_vkCreatePipelineCache(VkContext* context) {
+ 
+     VkPipelineCache pipelineCache;
+     VkResult result = vulkanWrapper.vkCreatePipelineCache(device, &createInfo, NULL, &pipelineCache);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_PIPELINE_CACHE, pipelineCache);
+ 
+     VT_SERIALIZE_CMD(VkPipelineCache, pipelineCache);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1022,7 +1049,7 @@ void vt_handle_vkDestroyPipelineCache(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkPipelineCache pipelineCache = VkObject_fromId(pipelineCacheId);
+ 
+-    vulkanWrapper.vkDestroyPipelineCache(device, pipelineCache, NULL);
++    if (VkContext_untrack(context, device, OWNED_PIPELINE_CACHE, pipelineCache)) vulkanWrapper.vkDestroyPipelineCache(device, pipelineCache, NULL);
+ }
+ 
+ void vt_handle_vkGetPipelineCacheData(VkContext* context) {
+@@ -1073,7 +1100,7 @@ void vt_handle_vkDestroyPipeline(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkPipeline pipeline = VkObject_fromId(pipelineId);
+ 
+-    AsyncPipelineCreator_destroyPipeline(device, pipeline);
++    if (VkContext_untrack(context, device, OWNED_PIPELINE, pipeline)) AsyncPipelineCreator_destroyPipeline(device, pipeline);
+ }
+ 
+ void vt_handle_vkCreatePipelineLayout(VkContext* context) {
+@@ -1092,6 +1119,7 @@ void vt_handle_vkCreatePipelineLayout(VkContext* context) {
+ 
+     VkPipelineLayout pipelineLayout;
+     VkResult result = vulkanWrapper.vkCreatePipelineLayout(device, &createInfo, NULL, &pipelineLayout);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_PIPELINE_LAYOUT, pipelineLayout);
+ 
+     VT_SERIALIZE_CMD(VkPipelineLayout, pipelineLayout);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1105,7 +1133,7 @@ void vt_handle_vkDestroyPipelineLayout(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkPipelineLayout pipelineLayout = VkObject_fromId(pipelineLayoutId);
+ 
+-    vulkanWrapper.vkDestroyPipelineLayout(device, pipelineLayout, NULL);
++    if (VkContext_untrack(context, device, OWNED_PIPELINE_LAYOUT, pipelineLayout)) vulkanWrapper.vkDestroyPipelineLayout(device, pipelineLayout, NULL);
+ }
+ 
+ void vt_handle_vkCreateSampler(VkContext* context) {
+@@ -1117,6 +1145,7 @@ void vt_handle_vkCreateSampler(VkContext* context) {
+ 
+     VkSampler sampler;
+     VkResult result = vulkanWrapper.vkCreateSampler(device, &createInfo, NULL, &sampler);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_SAMPLER, sampler);
+ 
+     VT_SERIALIZE_CMD(VkSampler, sampler);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1130,7 +1159,7 @@ void vt_handle_vkDestroySampler(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkSampler sampler = VkObject_fromId(samplerId);
+ 
+-    vulkanWrapper.vkDestroySampler(device, sampler, NULL);
++    if (VkContext_untrack(context, device, OWNED_SAMPLER, sampler)) vulkanWrapper.vkDestroySampler(device, sampler, NULL);
+ }
+ 
+ void vt_handle_vkCreateDescriptorSetLayout(VkContext* context) {
+@@ -1142,6 +1171,7 @@ void vt_handle_vkCreateDescriptorSetLayout(VkContext* context) {
+ 
+     VkDescriptorSetLayout setLayout;
+     VkResult result = vulkanWrapper.vkCreateDescriptorSetLayout(device, &createInfo, NULL, &setLayout);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_DESCRIPTOR_SET_LAYOUT, setLayout);
+ 
+     VT_SERIALIZE_CMD(VkDescriptorSetLayout, setLayout);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1155,7 +1185,7 @@ void vt_handle_vkDestroyDescriptorSetLayout(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkDescriptorSetLayout descriptorSetLayout = VkObject_fromId(descriptorSetLayoutId);
+ 
+-    vulkanWrapper.vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
++    if (VkContext_untrack(context, device, OWNED_DESCRIPTOR_SET_LAYOUT, descriptorSetLayout)) vulkanWrapper.vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
+ }
+ 
+ void vt_handle_vkCreateDescriptorPool(VkContext* context) {
+@@ -1167,6 +1197,7 @@ void vt_handle_vkCreateDescriptorPool(VkContext* context) {
+ 
+     VkDescriptorPool descriptorPool;
+     VkResult result = vulkanWrapper.vkCreateDescriptorPool(device, &createInfo, NULL, &descriptorPool);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_DESCRIPTOR_POOL, descriptorPool);
+ 
+     VT_SERIALIZE_CMD(VkDescriptorPool, descriptorPool);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1180,7 +1211,7 @@ void vt_handle_vkDestroyDescriptorPool(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkDescriptorPool descriptorPool = VkObject_fromId(descriptorPoolId);
+ 
+-    vulkanWrapper.vkDestroyDescriptorPool(device, descriptorPool, NULL);
++    if (VkContext_untrack(context, device, OWNED_DESCRIPTOR_POOL, descriptorPool)) vulkanWrapper.vkDestroyDescriptorPool(device, descriptorPool, NULL);
+ }
+ 
+ void vt_handle_vkResetDescriptorPool(VkContext* context) {
+@@ -1252,6 +1283,7 @@ void vt_handle_vkCreateFramebuffer(VkContext* context) {
+ 
+     VkFramebuffer framebuffer;
+     VkResult result = vulkanWrapper.vkCreateFramebuffer(device, &createInfo, NULL, &framebuffer);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_FRAMEBUFFER, framebuffer);
+ 
+     VT_SERIALIZE_CMD(VkFramebuffer, framebuffer);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1265,7 +1297,7 @@ void vt_handle_vkDestroyFramebuffer(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkFramebuffer framebuffer = VkObject_fromId(framebufferId);
+ 
+-    vulkanWrapper.vkDestroyFramebuffer(device, framebuffer, NULL);
++    if (VkContext_untrack(context, device, OWNED_FRAMEBUFFER, framebuffer)) vulkanWrapper.vkDestroyFramebuffer(device, framebuffer, NULL);
+ }
+ 
+ void vt_handle_vkCreateRenderPass(VkContext* context) {
+@@ -1277,6 +1309,7 @@ void vt_handle_vkCreateRenderPass(VkContext* context) {
+ 
+     VkRenderPass renderPass;
+     VkResult result = vulkanWrapper.vkCreateRenderPass(device, &createInfo, NULL, &renderPass);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_RENDER_PASS, renderPass);
+ 
+     VT_SERIALIZE_CMD(VkRenderPass, renderPass);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1290,7 +1323,7 @@ void vt_handle_vkDestroyRenderPass(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkRenderPass renderPass = VkObject_fromId(renderPassId);
+ 
+-    vulkanWrapper.vkDestroyRenderPass(device, renderPass, NULL);
++    if (VkContext_untrack(context, device, OWNED_RENDER_PASS, renderPass)) vulkanWrapper.vkDestroyRenderPass(device, renderPass, NULL);
+ }
+ 
+ void vt_handle_vkGetRenderAreaGranularity(VkContext* context) {
+@@ -1317,6 +1350,7 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
+ 
+     VkCommandPool commandPool;
+     VkResult result = vulkanWrapper.vkCreateCommandPool(device, &createInfo, NULL, &commandPool);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_COMMAND_POOL, commandPool);
+ 
+     VT_SERIALIZE_CMD(VkCommandPool, commandPool);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -1330,7 +1364,7 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkCommandPool commandPool = VkObject_fromId(commandPoolId);
+ 
+-    vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
++    if (VkContext_untrack(context, device, OWNED_COMMAND_POOL, commandPool)) vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
+ }
+ 
+ void vt_handle_vkResetCommandPool(VkContext* context) {
+@@ -2192,6 +2226,7 @@ void vt_handle_vkCreateSwapchainKHR(VkContext* context) {
+ #endif
+         swapchain = XWindowSwapchain_create(device, context->graphicsQueueIndex, &createInfo, &context->jmethods, windowId);
+         if (!swapchain) result = VK_ERROR_INITIALIZATION_FAILED;
++        else VkContext_track(context, device, OWNED_SWAPCHAIN, swapchain);
+     }
+     else result = VK_ERROR_SURFACE_LOST_KHR;
+ 
+@@ -2207,7 +2242,8 @@ void vt_handle_vkDestroySwapchainKHR(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     XWindowSwapchain* swapchain = VkObject_fromId(swapchainId);
+ 
+-    XWindowSwapchain_destroy(device, swapchain);
++    VkDevice owner = VkContext_untrack(context, device, OWNED_SWAPCHAIN, swapchain);
++    if (owner) XWindowSwapchain_destroy(owner, swapchain);
+ }
+ 
+ void vt_handle_vkGetSwapchainImagesKHR(VkContext* context) {
+@@ -2753,6 +2789,7 @@ void vt_handle_vkCreateSamplerYcbcrConversion(VkContext* context) {
+ 
+     VkSamplerYcbcrConversion ycbcrConversion;
+     VkResult result = vulkanWrapper.vkCreateSamplerYcbcrConversion(device, &createInfo, NULL, &ycbcrConversion);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_SAMPLER_YCBCR_CONVERSION, ycbcrConversion);
+ 
+     VT_SERIALIZE_CMD(VkSamplerYcbcrConversion, ycbcrConversion);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -2766,7 +2803,7 @@ void vt_handle_vkDestroySamplerYcbcrConversion(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkSamplerYcbcrConversion ycbcrConversion = VkObject_fromId(ycbcrConversionId);
+ 
+-    vulkanWrapper.vkDestroySamplerYcbcrConversion(device, ycbcrConversion, NULL);
++    if (VkContext_untrack(context, device, OWNED_SAMPLER_YCBCR_CONVERSION, ycbcrConversion)) vulkanWrapper.vkDestroySamplerYcbcrConversion(device, ycbcrConversion, NULL);
+ }
+ 
+ void vt_handle_vkGetDeviceQueue2(VkContext* context) {
+@@ -2838,6 +2875,7 @@ void vt_handle_vkCreateRenderPass2(VkContext* context) {
+ 
+     VkRenderPass renderPass;
+     VkResult result = vulkanWrapper.vkCreateRenderPass2(device, &createInfo, NULL, &renderPass);
++    if (result == VK_SUCCESS) VkContext_track(context, device, OWNED_RENDER_PASS, renderPass);
+ 
+     VT_SERIALIZE_CMD(VkRenderPass, renderPass);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+@@ -2895,7 +2933,7 @@ void vt_handle_vkGetSemaphoreCounterValue(VkContext* context) {
+ }
+ 
+ void vt_handle_vkWaitSemaphores(VkContext* context) {
+-    TimelineSemaphore_asyncWait(context->clientFd, context->threadPool, context->inputBuffer, context->inputBufferSize);
++    TimelineSemaphore_asyncWait(context);
+ }
+ 
+ void vt_handle_vkSignalSemaphore(VkContext* context) {
+diff --git a/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c b/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c
+index cd9c387..d20430b 100644
+--- a/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c
++++ b/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c
+@@ -4,14 +4,28 @@
+ #include "vortek_serializer.h"
+ #include "string_utils.h"
+ #include "vulkan_helper.h"
++#include "vk_context.h"
++
++/* [mali-g2] A wait is cut into slices so that it ends soon after the client is gone (context status
++ * < 0, winlator-0015): an infinite wait on a semaphore nobody signals any more kept the thread pool,
++ * and with it the connection's cleanup, waiting forever. */
++#define WAIT_SLICE_NS 100000000ull
+ 
+ typedef struct WaitSemaphoresRequest {
+     int notifyFd;
+     char* inputBuffer;
++    VkContext* context;
+ } WaitSemaphoresRequest;
+ 
++static uint64_t monotonicNs(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
+ static void waitSemaphoresThread(void* param) {
+     WaitSemaphoresRequest* waitSemaphoresRequest = param;
++    VkContext* context = waitSemaphoresRequest->context;
+ 
+     uint64_t deviceId;
+     VkSemaphoreWaitInfo waitInfo = {0};
+@@ -21,22 +35,33 @@ static void waitSemaphoresThread(void* param) {
+     vt_unserialize_vkWaitSemaphores((VkDevice)&deviceId, &waitInfo, &timeout, waitSemaphoresRequest->inputBuffer, &memoryPool);
+     VkDevice device = VkObject_fromId(deviceId);
+ 
+-    VkResult result = vulkanWrapper.vkWaitSemaphores(device, &waitInfo, timeout);
++    VkResult result = VK_ERROR_DEVICE_LOST;
++    uint64_t start = monotonicNs();
++    while (__atomic_load_n(&context->status, __ATOMIC_ACQUIRE) >= 0) {
++        uint64_t elapsed = monotonicNs() - start;
++        uint64_t remaining = timeout > elapsed ? timeout - elapsed : 0;
++        result = vulkanWrapper.vkWaitSemaphores(device, &waitInfo, remaining < WAIT_SLICE_NS ? remaining : WAIT_SLICE_NS);
++        if (result != VK_TIMEOUT || remaining <= WAIT_SLICE_NS) break;
++        result = VK_ERROR_DEVICE_LOST;
++    }
+ 
+     uint64_t value = result == VK_SUCCESS ? 1 : (result == VK_ERROR_DEVICE_LOST ? 2 : 3);
+     write(waitSemaphoresRequest->notifyFd, &value, sizeof(uint64_t));
+     CLOSEFD(waitSemaphoresRequest->notifyFd);
+ 
+     vt_free(&memoryPool);
++    MEMFREE(waitSemaphoresRequest->inputBuffer);
++    MEMFREE(waitSemaphoresRequest);
+ }
+ 
+-void TimelineSemaphore_asyncWait(int clientFd, ThreadPool* threadPool, char* inputBuffer, int inputBufferSize) {
++void TimelineSemaphore_asyncWait(VkContext* context) {
+     WaitSemaphoresRequest* waitSemaphoresRequest = calloc(1, sizeof(WaitSemaphoresRequest));
+-    waitSemaphoresRequest->inputBuffer = memdup(inputBuffer, inputBufferSize);
++    waitSemaphoresRequest->inputBuffer = memdup(context->inputBuffer, context->inputBufferSize);
++    waitSemaphoresRequest->context = context;
+ 
+     int fd = eventfd(0, 0);
+     waitSemaphoresRequest->notifyFd = fd;
+ 
+-    send_fds(clientFd, &fd, 1, NULL, 0);
+-    ThreadPool_run(threadPool, waitSemaphoresThread, waitSemaphoresRequest);
+-}
+\ No newline at end of file
++    send_fds(context->clientFd, &fd, 1, NULL, 0);
++    ThreadPool_run(context->threadPool, waitSemaphoresThread, waitSemaphoresRequest);
++}
+diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+index c160647..9f4684d 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
++++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+@@ -26,6 +26,8 @@ static ExtraDataRequest* waitForExtraDataRequest(VkContext* context, uint16_t re
+     uint32_t busyWaitIter = 0;
+ 
+     while (context->status >= 0) {
++        /* [mali-g2] the client is gone: what it sent is in the list already (winlator-0015) */
++        bool closing = RingBuffer_hasStatus(context->serverRing, RING_STATUS_EXIT);
+         result = NULL;
+         pthread_mutex_lock(&context->extraDataRequestsMutex);
+         for (int i = 0; i < context->extraDataRequests.size; i++) {
+@@ -38,7 +40,7 @@ static ExtraDataRequest* waitForExtraDataRequest(VkContext* context, uint16_t re
+         }
+         pthread_mutex_unlock(&context->extraDataRequestsMutex);
+ 
+-        if (result) break;
++        if (result || closing) break;
+         busyWait(&busyWaitIter);
+     }
+ 
+@@ -123,6 +125,7 @@ VkContext* createVkContext(int clientFd, const VortekOptions* options) {
+     context->exposedDeviceExtensions = options->exposedDeviceExtensions ? ArrayList_fromStrings((const char**)options->exposedDeviceExtensions->elements, options->exposedDeviceExtensions->size) : NULL;
+ 
+     pthread_mutex_init(&context->extraDataRequestsMutex, NULL);
++    pthread_mutex_init(&context->ownedLock, NULL);
+ 
+     context->memoryPool.data = calloc(MEMORY_POOL_MAX_SIZE, 1);
+     context->threadPool = ThreadPool_init(THREAD_POOL_NUM_THREADS);
+@@ -147,6 +150,7 @@ VkContext* createVkContext(JNIEnv* env, jobject obj, int clientFd, jobject optio
+     context->exposedDeviceExtensions = jstringArrayToCharArray(env, exposedDeviceExtensions);
+ 
+     pthread_mutex_init(&context->extraDataRequestsMutex, NULL);
++    pthread_mutex_init(&context->ownedLock, NULL);
+ 
+     context->memoryPool.data = calloc(MEMORY_POOL_MAX_SIZE, 1);
+     context->threadPool = ThreadPool_init(THREAD_POOL_NUM_THREADS);
+@@ -163,18 +167,460 @@ VkContext* createVkContext(JNIEnv* env, jobject obj, int clientFd, jobject optio
+ }
+ #endif
+ 
++/* ---- [mali-g2] objects owned by the connection (winlator-0015) ---- */
++
++static const char* const ownedKindNames[OWNED_KIND_COUNT] = {
++    [OWNED_FRAMEBUFFER] = "framebuffer", [OWNED_IMAGE_VIEW] = "image view", [OWNED_BUFFER_VIEW] = "buffer view",
++    [OWNED_PIPELINE] = "pipeline", [OWNED_SHADER_MODULE] = "shader module", [OWNED_PIPELINE_LAYOUT] = "pipeline layout",
++    [OWNED_DESCRIPTOR_POOL] = "descriptor pool", [OWNED_DESCRIPTOR_SET_LAYOUT] = "descriptor set layout",
++    [OWNED_SAMPLER] = "sampler", [OWNED_SAMPLER_YCBCR_CONVERSION] = "sampler ycbcr conversion",
++    [OWNED_RENDER_PASS] = "render pass", [OWNED_PIPELINE_CACHE] = "pipeline cache", [OWNED_QUERY_POOL] = "query pool",
++    [OWNED_EVENT] = "event", [OWNED_SEMAPHORE] = "semaphore", [OWNED_FENCE] = "fence", [OWNED_COMMAND_POOL] = "command pool",
++    [OWNED_SWAPCHAIN] = "swapchain", [OWNED_BUFFER] = "buffer", [OWNED_IMAGE] = "image", [OWNED_MEMORY] = "memory"
++};
++
++static uint32_t ownedHash(uint64_t key) {
++    key ^= key >> 33;
++    key *= 0xff51afd7ed558ccdull;
++    key ^= key >> 33;
++    return (uint32_t)key;
++}
++
++static uint32_t ownedSetFind(const OwnedSet* set, uint64_t key) {
++    uint32_t mask = set->capacity - 1;
++    uint32_t i = ownedHash(key) & mask;
++    while (set->keys[i] && set->keys[i] != key) i = (i + 1) & mask;
++    return i;
++}
++
++static void ownedSetAdd(OwnedSet* set, uint64_t key) {
++    if ((set->size + 1) * 4 > set->capacity * 3) {
++        OwnedSet grown = {calloc(set->capacity ? set->capacity * 2 : 16, sizeof(uint64_t)), set->capacity ? set->capacity * 2 : 16, set->size};
++        for (uint32_t i = 0; i < set->capacity; i++) {
++            if (set->keys[i]) grown.keys[ownedSetFind(&grown, set->keys[i])] = set->keys[i];
++        }
++        free(set->keys);
++        *set = grown;
++    }
++    uint32_t i = ownedSetFind(set, key);
++    if (!set->keys[i]) {
++        set->keys[i] = key;
++        set->size++;
++    }
++}
++
++static bool ownedSetRemove(OwnedSet* set, uint64_t key) {
++    if (set->size == 0) return false;
++    uint32_t mask = set->capacity - 1;
++    uint32_t i = ownedSetFind(set, key);
++    if (!set->keys[i]) return false;
++    set->keys[i] = 0;
++    set->size--;
++    /* backward shift: entries after the hole that probed past it move into it */
++    for (uint32_t j = (i + 1) & mask; set->keys[j]; j = (j + 1) & mask) {
++        uint32_t home = ownedHash(set->keys[j]) & mask;
++        bool reachable = i <= j ? (i < home && home <= j) : (i < home || home <= j);
++        if (reachable) continue;
++        set->keys[i] = set->keys[j];
++        set->keys[j] = 0;
++        i = j;
++    }
++    return true;
++}
++
++static void ownedSetFree(OwnedSet* set) {
++    MEMFREE(set->keys);
++    set->capacity = set->size = 0;
++}
++
++static OwnedDevice* findOwnedDevice(VkContext* context, VkDevice device, int* pIndex) {
++    for (int i = 0; i < context->ownedDevices.size; i++) {
++        OwnedDevice* owned = context->ownedDevices.elements[i];
++        if (owned->device == device) {
++            if (pIndex) *pIndex = i;
++            return owned;
++        }
++    }
++    return NULL;
++}
++
++/* A client bug (double destroy, a handle of another device or connection): never fatal, logged a
++ * few times per connection. Called with ownedLock held. */
++static void logNotOwned(VkContext* context, const char* what, void* object) {
++    if (context->untrackedLogged >= 8) return;
++    context->untrackedLogged++;
++    println("vortek: %s %p is not owned by this connection (fd=%d), not destroyed (untracked)", what, object, context->clientFd);
++}
++
++void VkContext_addInstance(VkContext* context, VkInstance instance) {
++    if (!instance) return;
++    pthread_mutex_lock(&context->ownedLock);
++    ArrayList_add(&context->ownedInstances, instance);
++    pthread_mutex_unlock(&context->ownedLock);
++}
++
++void VkContext_removeInstance(VkContext* context, VkInstance instance) {
++    pthread_mutex_lock(&context->ownedLock);
++    ArrayList_remove(&context->ownedInstances, instance);
++    pthread_mutex_unlock(&context->ownedLock);
++}
++
++void VkContext_addDevice(VkContext* context, VkPhysicalDevice physicalDevice, VkDevice device, const VkDeviceCreateInfo* createInfo) {
++    if (!device) return;
++    OwnedDevice* owned = calloc(1, sizeof(OwnedDevice));
++    owned->device = device;
++    owned->physicalDevice = physicalDevice;
++    if (createInfo->queueCreateInfoCount > 0 && createInfo->pQueueCreateInfos) {
++        owned->queueInfos = calloc(createInfo->queueCreateInfoCount, sizeof(OwnedQueue));
++        for (uint32_t i = 0; i < createInfo->queueCreateInfoCount; i++) {
++            owned->queueInfos[i].family = createInfo->pQueueCreateInfos[i].queueFamilyIndex;
++            owned->queueInfos[i].count = createInfo->pQueueCreateInfos[i].queueCount;
++            owned->queueInfos[i].flags = createInfo->pQueueCreateInfos[i].flags;
++        }
++        owned->queueInfoCount = createInfo->queueCreateInfoCount;
++    }
++    pthread_mutex_lock(&context->ownedLock);
++    ArrayList_add(&context->ownedDevices, owned);
++    pthread_mutex_unlock(&context->ownedLock);
++}
++
++void VkContext_track(VkContext* context, VkDevice device, OwnedKind kind, void* object) {
++    if (!object) return;
++    pthread_mutex_lock(&context->ownedLock);
++    OwnedDevice* owned = findOwnedDevice(context, device, NULL);
++    if (owned) ownedSetAdd(&owned->objects[kind], (uint64_t)object);
++    else logNotOwned(context, "device", device);
++    pthread_mutex_unlock(&context->ownedLock);
++}
++
++void VkContext_trackTimelineSemaphore(VkContext* context, VkDevice device, VkSemaphore semaphore) {
++    if (!semaphore) return;
++    pthread_mutex_lock(&context->ownedLock);
++    OwnedDevice* owned = findOwnedDevice(context, device, NULL);
++    if (owned) ownedSetAdd(&owned->timelineSemaphores, (uint64_t)semaphore);
++    pthread_mutex_unlock(&context->ownedLock);
++}
++
++VkDevice VkContext_untrack(VkContext* context, VkDevice device, OwnedKind kind, void* object) {
++    if (!object) return VK_NULL_HANDLE;
++    VkDevice owner = VK_NULL_HANDLE;
++    pthread_mutex_lock(&context->ownedLock);
++    OwnedDevice* owned = findOwnedDevice(context, device, NULL);
++    if (owned && ownedSetRemove(&owned->objects[kind], (uint64_t)object)) owner = owned->device;
++    for (int i = 0; !owner && i < context->ownedDevices.size; i++) {
++        owned = context->ownedDevices.elements[i];
++        if (ownedSetRemove(&owned->objects[kind], (uint64_t)object)) owner = owned->device;
++    }
++    if (!owner) logNotOwned(context, ownedKindNames[kind], object);
++    else if (kind == OWNED_SEMAPHORE) ownedSetRemove(&owned->timelineSemaphores, (uint64_t)object);
++    pthread_mutex_unlock(&context->ownedLock);
++    return owner;
++}
++
++typedef struct ReleaseStats {
++    int devices;
++    int busyDevices;
++    int instances;
++    int timelinesSignalled;
++    int objects[OWNED_KIND_COUNT];
++    uint64_t memoryBytes;
++} ReleaseStats;
++
++static const VkObjectType ownedObjectTypes[OWNED_KIND_COUNT] = {
++    [OWNED_FRAMEBUFFER] = VK_OBJECT_TYPE_FRAMEBUFFER,
++    [OWNED_IMAGE_VIEW] = VK_OBJECT_TYPE_IMAGE_VIEW,
++    [OWNED_BUFFER_VIEW] = VK_OBJECT_TYPE_BUFFER_VIEW,
++    [OWNED_PIPELINE] = VK_OBJECT_TYPE_PIPELINE,
++    [OWNED_SHADER_MODULE] = VK_OBJECT_TYPE_SHADER_MODULE,
++    [OWNED_PIPELINE_LAYOUT] = VK_OBJECT_TYPE_PIPELINE_LAYOUT,
++    [OWNED_DESCRIPTOR_POOL] = VK_OBJECT_TYPE_DESCRIPTOR_POOL,
++    [OWNED_DESCRIPTOR_SET_LAYOUT] = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
++    [OWNED_SAMPLER] = VK_OBJECT_TYPE_SAMPLER,
++    [OWNED_RENDER_PASS] = VK_OBJECT_TYPE_RENDER_PASS,
++    [OWNED_PIPELINE_CACHE] = VK_OBJECT_TYPE_PIPELINE_CACHE,
++    [OWNED_QUERY_POOL] = VK_OBJECT_TYPE_QUERY_POOL,
++    [OWNED_EVENT] = VK_OBJECT_TYPE_EVENT,
++    [OWNED_SEMAPHORE] = VK_OBJECT_TYPE_SEMAPHORE,
++    [OWNED_FENCE] = VK_OBJECT_TYPE_FENCE,
++    [OWNED_COMMAND_POOL] = VK_OBJECT_TYPE_COMMAND_POOL,
++    [OWNED_BUFFER] = VK_OBJECT_TYPE_BUFFER,
++    [OWNED_IMAGE] = VK_OBJECT_TYPE_IMAGE,
++};
++
++static void destroyOwned(VkContext* context, VkDevice device, OwnedKind kind, void* object, ReleaseStats* stats) {
++    switch (kind) {
++        case OWNED_SWAPCHAIN:
++            XWindowSwapchain_destroy(device, object);
++            break;
++        case OWNED_MEMORY:
++            if (stats) stats->memoryBytes += ((ResourceMemory*)object)->allocationSize;
++            ResourceMemory_free(context, device, object);
++            break;
++        case OWNED_SAMPLER_YCBCR_CONVERSION:
++            vulkanWrapper.vkDestroySamplerYcbcrConversion(device, object, NULL);
++            break;
++        default:
++            destroyVkObject(ownedObjectTypes[kind], device, object);
++            break;
++    }
++    if (stats) stats->objects[kind]++;
++}
++
++/* Destroys what the client left of the device, then the device; it must be idle and no other
++ * thread may use it any more. */
++static void releaseDevice(VkContext* context, OwnedDevice* owned, ReleaseStats* stats) {
++    VkDevice device = owned->device;
++
++    /* the texture decoder has a command pool, a fence and memory on its device, and points at
++     * ResourceMemory of it (bound buffers); its VkImages are tracked as the client's images */
++    if (context->textureDecoder && context->textureDecoder->device == device) {
++        TextureDecoder_destroy(context->textureDecoder);
++        context->textureDecoder = NULL;
++    }
++
++    for (int kind = 0; kind < OWNED_KIND_COUNT; kind++) {
++        OwnedSet* set = &owned->objects[kind];
++        for (uint32_t i = 0; i < set->capacity; i++) {
++            if (set->keys[i]) destroyOwned(context, device, kind, (void*)set->keys[i], stats);
++        }
++        ownedSetFree(set);
++    }
++    ownedSetFree(&owned->timelineSemaphores);
++    if (stats) stats->devices++;
++
++    /* library pipelines whose destruction was deferred, the native image set */
++    AsyncPipelineCreator_destroyDevice(device);
++    ResourceMemory_untrackDevice(device);
++    vulkanWrapper.vkDestroyDevice(device, NULL);
++}
++
++static void freeOwnedDevice(OwnedDevice* owned) {
++    for (int k = 0; k < OWNED_KIND_COUNT; k++) ownedSetFree(&owned->objects[k]);
++    ownedSetFree(&owned->timelineSemaphores);
++    MEMFREE(owned->idleFences);
++    MEMFREE(owned->queueInfos);
++    free(owned);
++}
++
++static int countOwnedObjects(const ReleaseStats* stats) {
++    int count = 0;
++    for (int k = 0; k < OWNED_KIND_COUNT; k++) count += stats->objects[k];
++    return count;
++}
++
++/* vkDestroyDevice from the client: what it left on the device goes with it (those handles are dead
++ * now). A device this connection does not own is left alone. */
++void VkContext_destroyDevice(VkContext* context, VkDevice device) {
++    int index;
++    pthread_mutex_lock(&context->ownedLock);
++    OwnedDevice* owned = findOwnedDevice(context, device, &index);
++    if (owned) ArrayList_removeAt(&context->ownedDevices, index);
++    else if (device) logNotOwned(context, "device", device);
++    pthread_mutex_unlock(&context->ownedLock);
++    if (!owned) return;
++
++    ReleaseStats stats = {0};
++    releaseDevice(context, owned, &stats);
++    freeOwnedDevice(owned);
++    int left = countOwnedObjects(&stats);
++    if (left > 0) {
++        println("vortek: vkDestroyDevice: also destroyed %d objects the client left on it, %d memory allocations (%.1f MiB), %d swapchains",
++                left, stats.objects[OWNED_MEMORY], stats.memoryBytes / 1048576.0, stats.objects[OWNED_SWAPCHAIN]);
++    }
++}
++
++static uint64_t releaseNowNs(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
++/* Submits a fence-only batch on every queue of the device: its fence signals after all earlier work
++ * on that queue. vkDeviceWaitIdle has no timeout, and work that waits for a semaphore nobody will
++ * signal any more never finishes. */
++static void submitIdleFences(OwnedDevice* owned) {
++    VkDevice device = owned->device;
++    uint32_t queueCount = 0;
++    for (uint32_t i = 0; i < owned->queueInfoCount; i++) queueCount += owned->queueInfos[i].count;
++
++    owned->idleFences = calloc(queueCount ? queueCount : 1, sizeof(VkFence));
++    owned->idleFenceCount = 0;
++    for (uint32_t i = 0; i < owned->queueInfoCount; i++) {
++        for (uint32_t q = 0; q < owned->queueInfos[i].count; q++) {
++            VkQueue queue = VK_NULL_HANDLE;
++            if (owned->queueInfos[i].flags && vulkanWrapper.vkGetDeviceQueue2) {
++                VkDeviceQueueInfo2 queueInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2, NULL, owned->queueInfos[i].flags, owned->queueInfos[i].family, q};
++                vulkanWrapper.vkGetDeviceQueue2(device, &queueInfo, &queue);
++            }
++            else if (!owned->queueInfos[i].flags) vulkanWrapper.vkGetDeviceQueue(device, owned->queueInfos[i].family, q, &queue);
++            if (!queue) continue;
++
++            VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++            VkFence fence = VK_NULL_HANDLE;
++            if (vulkanWrapper.vkCreateFence(device, &fenceInfo, NULL, &fence) != VK_SUCCESS) continue;
++            VkResult result = vulkanWrapper.vkQueueSubmit(queue, 0, NULL, fence);
++            if (result != VK_SUCCESS) {
++                vulkanWrapper.vkDestroyFence(device, fence, NULL);
++                if (result == VK_ERROR_DEVICE_LOST) owned->lost = true;
++                continue;
++            }
++            owned->idleFences[owned->idleFenceCount++] = fence;
++        }
++    }
++}
++
++/* Waits at most timeoutNs for the fences of submitIdleFences. VK_TIMEOUT: still busy, the fences
++ * stay pending with the device. Otherwise the device runs nothing any more (idle, or lost) and may
++ * be destroyed. */
++static VkResult pollDeviceIdle(OwnedDevice* owned, uint64_t timeoutNs) {
++    VkDevice device = owned->device;
++    VkResult result = owned->idleFenceCount > 0 ? vulkanWrapper.vkWaitForFences(device, owned->idleFenceCount, owned->idleFences, VK_TRUE, timeoutNs) : VK_SUCCESS;
++    if (result == VK_TIMEOUT) return result;
++    for (uint32_t i = 0; i < owned->idleFenceCount; i++) vulkanWrapper.vkDestroyFence(device, owned->idleFences[i], NULL);
++    owned->idleFenceCount = 0;
++    MEMFREE(owned->idleFences);
++    if (result != VK_SUCCESS) owned->lost = true;
++    if (!owned->lost) vulkanWrapper.vkDeviceWaitIdle(device);
++    return result;
++}
++
++/* Work the client left waiting for a timeline value it was going to signal from the host never
++ * runs once the client is gone. Signalling every timeline semaphore of the device by the largest
++ * step the driver allows (no valid wait is further away) lets that work run and the device drain.
++ * Only done after the device failed to drain on its own: a later device signal of a lower value is
++ * out of spec, and the client that could observe it is gone. Returns how many were signalled. */
++static int signalTimelineSemaphores(OwnedDevice* owned) {
++    if (owned->timelineSemaphores.size == 0 || !vulkanWrapper.vkSignalSemaphore || !vulkanWrapper.vkGetSemaphoreCounterValue) return 0;
++
++    VkPhysicalDeviceTimelineSemaphoreProperties timelineProperties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES};
++    VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &timelineProperties};
++    if (owned->physicalDevice && vulkanWrapper.vkGetPhysicalDeviceProperties2) vulkanWrapper.vkGetPhysicalDeviceProperties2(owned->physicalDevice, &properties);
++    uint64_t maxDifference = timelineProperties.maxTimelineSemaphoreValueDifference;
++    if (maxDifference == 0) maxDifference = INT32_MAX; /* the minimum the spec requires */
++
++    int signalled = 0;
++    OwnedSet* set = &owned->timelineSemaphores;
++    for (uint32_t i = 0; i < set->capacity; i++) {
++        VkSemaphore semaphore = (VkSemaphore)set->keys[i];
++        uint64_t value;
++        if (!semaphore || vulkanWrapper.vkGetSemaphoreCounterValue(owned->device, semaphore, &value) != VK_SUCCESS) continue;
++        uint64_t target = value > UINT64_MAX - maxDifference ? UINT64_MAX : value + maxDifference;
++        if (target == value) continue;
++        VkSemaphoreSignalInfo signalInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, NULL, semaphore, target};
++        if (vulkanWrapper.vkSignalSemaphore(owned->device, &signalInfo) == VK_SUCCESS) signalled++;
++    }
++    return signalled;
++}
++
++#define RELEASE_IDLE_TIMEOUT_NS 3000000000ull      /* the client's last work finishes on its own */
++#define RELEASE_UNBLOCKED_TIMEOUT_NS 1000000000ull /* after its timeline semaphores were signalled */
++
++static void logReleased(VkContext* context, const ReleaseStats* stats, const char* prefix, const char* suffix) {
++    char unblocked[64] = "";
++    if (stats->timelinesSignalled > 0) snprintf(unblocked, sizeof(unblocked), ", %d timeline semaphores signalled", stats->timelinesSignalled);
++    println("vortek-server: %s (fd=%d): released %d devices, %d memory allocations (%.1f MiB), %d swapchains, %d other objects, %d instances%s%s",
++            prefix, context->clientFd, stats->devices, stats->objects[OWNED_MEMORY], stats->memoryBytes / 1048576.0, stats->objects[OWNED_SWAPCHAIN],
++            countOwnedObjects(stats) - stats->objects[OWNED_MEMORY] - stats->objects[OWNED_SWAPCHAIN], stats->instances, unblocked, suffix);
++}
++
++static void destroyOwnedInstances(VkContext* context, ReleaseStats* stats) {
++    for (int i = 0; i < context->ownedInstances.size; i++) {
++        vulkanWrapper.vkDestroyInstance(context->ownedInstances.elements[i], NULL);
++        stats->instances++;
++    }
++    ArrayList_free(&context->ownedInstances, false);
++}
++
++/* The client is gone (exit, crash, SIGKILL) and its request thread and thread pool have ended:
++ * destroy every device it did not destroy with everything it left on them, then its instances.
++ * Devices still busy stay in context->ownedDevices (with their pending idle fences) and the
++ * instances with them; returns whether everything was released. */
++static bool releaseOwnedObjects(VkContext* context) {
++    ReleaseStats stats = {0};
++    ArrayList busy = {0};
++
++    for (int i = 0; i < context->ownedDevices.size; i++) submitIdleFences(context->ownedDevices.elements[i]);
++
++    uint64_t deadline = releaseNowNs() + RELEASE_IDLE_TIMEOUT_NS;
++    for (int i = 0; i < context->ownedDevices.size; i++) {
++        OwnedDevice* owned = context->ownedDevices.elements[i];
++        uint64_t now = releaseNowNs();
++        VkResult result = pollDeviceIdle(owned, deadline > now ? deadline - now : 0);
++        if (result == VK_TIMEOUT) {
++            int signalled = signalTimelineSemaphores(owned);
++            stats.timelinesSignalled += signalled;
++            if (signalled > 0) result = pollDeviceIdle(owned, RELEASE_UNBLOCKED_TIMEOUT_NS);
++        }
++        if (result == VK_TIMEOUT) {
++            println("vortek: client gone (fd=%d): device %p still busy after %llu ms (%u memory allocations, %u timeline semaphores), released in the background when it drains",
++                    context->clientFd, owned->device, RELEASE_IDLE_TIMEOUT_NS / 1000000, owned->objects[OWNED_MEMORY].size, owned->timelineSemaphores.size);
++            ArrayList_add(&busy, owned);
++            continue;
++        }
++        releaseDevice(context, owned, &stats);
++        freeOwnedDevice(owned);
++    }
++    ArrayList_free(&context->ownedDevices, false);
++    context->ownedDevices = busy;
++
++    if (busy.size == 0) destroyOwnedInstances(context, &stats);
++
++    char suffix[64] = "";
++    if (busy.size > 0) snprintf(suffix, sizeof(suffix), " (%d busy devices left to the background cleanup)", busy.size);
++    logReleased(context, &stats, "client gone", suffix);
++    return busy.size == 0;
++}
++
++static void freeVkContext(VkContext* context);
++
++/* A device of a gone client that did not drain in time (its last work runs long, waits for a GPU
++ * reset, or for a semaphore nobody signals): poll its idle fences until it drains or is lost, then
++ * release it like releaseOwnedObjects would have, and finally the instances and the context. */
++static void* releaseBusyDevicesThread(void* param) {
++    VkContext* context = param;
++    uint64_t start = releaseNowNs();
++    ReleaseStats stats = {0};
++
++    while (context->ownedDevices.size > 0) {
++        uint64_t sliceNs = releaseNowNs() - start < 60000000000ull ? 1000000000ull : 10000000000ull;
++        for (int i = context->ownedDevices.size - 1; i >= 0; i--) {
++            OwnedDevice* owned = context->ownedDevices.elements[i];
++            if (pollDeviceIdle(owned, sliceNs / context->ownedDevices.size) == VK_TIMEOUT) continue;
++            ArrayList_removeAt(&context->ownedDevices, i);
++            releaseDevice(context, owned, &stats);
++            freeOwnedDevice(owned);
++        }
++    }
++    ArrayList_free(&context->ownedDevices, false);
++    destroyOwnedInstances(context, &stats);
++
++    char prefix[64];
++    snprintf(prefix, sizeof(prefix), "client gone, busy devices drained after %.1f s", (releaseNowNs() - start) / 1e9);
++    logReleased(context, &stats, prefix, "");
++    freeVkContext(context);
++    return NULL;
++}
++
+ #ifdef VORTEK_STANDALONE
+ void destroyVkContext(VkContext* context) {
+ #else
+ void destroyVkContext(JNIEnv* env, VkContext* context) {
+ #endif
+-    context->status = VK_ERROR_DEVICE_LOST;
+-
++    /* [mali-g2] The request thread first handles what is still in the ring and ends when it is
++     * empty: a client that exits right after destroying its objects leaves those requests behind
++     * (winlator-0015). Only then the status turns negative. */
+     if (context->requestHandlerThread) {
+         RingBuffer_setStatus(context->serverRing, RING_STATUS_EXIT);
+         RingBuffer_setStatus(context->clientRing, RING_STATUS_EXIT);
+         pthread_join(context->requestHandlerThread, NULL);
++    }
++    __atomic_store_n(&context->status, VK_ERROR_DEVICE_LOST, __ATOMIC_RELEASE);
+ 
++    if (context->requestHandlerThread) {
++        /* [mali-g2] Let the queued tasks run: with status < 0 the timeline waits return within a
++         * slice and queued pipeline creations are skipped (ThreadPool_destroy would drop them with
++         * their fds). After this no thread of the connection uses its devices. */
++        ThreadPool_wait(context->threadPool);
+         ThreadPool_destroy(context->threadPool);
+         context->threadPool = NULL;
+ 
+@@ -190,12 +636,39 @@ void destroyVkContext(JNIEnv* env, VkContext* context) {
+     }
+ #endif
+ 
++    /* [mali-g2] destroys the texture decoder with its device (winlator-0015); a device that is
++     * still busy is left to a background thread, which frees the context when it is done */
++    if (!releaseOwnedObjects(context)) {
++        pthread_t thread;
++        if (pthread_create(&thread, NULL, releaseBusyDevicesThread, context) == 0) {
++            pthread_detach(thread);
++            return;
++        }
++        println("vortek: client gone (fd=%d): no background cleanup thread, busy devices kept", context->clientFd);
++        /* not destroyed with the context: it would use a busy device */
++        for (int i = 0; i < context->ownedDevices.size; i++) {
++            OwnedDevice* owned = context->ownedDevices.elements[i];
++            if (context->textureDecoder && context->textureDecoder->device == owned->device) context->textureDecoder = NULL;
++            freeOwnedDevice(owned);
++        }
++        ArrayList_free(&context->ownedDevices, false);
++        ArrayList_free(&context->ownedInstances, false);
++    }
++    freeVkContext(context);
++}
++
++static void freeVkContext(VkContext* context) {
+     context->graphicsQueueIndex = 0;
+ 
+     if (context->textureDecoder) {
+         TextureDecoder_destroy(context->textureDecoder);
+         context->textureDecoder = NULL;
+     }
++    MEMFREE(context->shaderInspector);
++    for (int i = 0; i < context->extraDataRequests.size; i++) {
++        ExtraDataRequest* extraDataRequest = context->extraDataRequests.elements[i];
++        MEMFREE(extraDataRequest->data);
++    }
+ 
+     ArrayList_free(context->exposedDeviceExtensions, true);
+     context->exposedDeviceExtensions = NULL;
+@@ -205,6 +678,7 @@ void destroyVkContext(JNIEnv* env, VkContext* context) {
+ 
+     ArrayList_free(&context->extraDataRequests, true);
+     pthread_mutex_destroy(&context->extraDataRequestsMutex);
++    pthread_mutex_destroy(&context->ownedLock);
+ 
+     MEMFREE(context->memoryPool.data);
+     MEMFREE(context->engineName);

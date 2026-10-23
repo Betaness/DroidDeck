@@ -249,6 +249,7 @@ if [[ -f "${repo_root}/tools/droiddeck-esync/release.env" ]]; then
 elif [[ -d "${sync_assets}" ]]; then
     echo "No tools/droiddeck-esync/release.env: the APK bundles the droiddeck-esync packs already in ${sync_assets}." >&2
 fi
+"${repo_root}/tools/droiddeck-esync/fetch-extra.sh" "${repo_root}"
 
 msi_pkgs="${staging_dir}/msi-pkgs"
 msi_dir="${linuxfs_dir}/usr/local/lib/droiddeck-msitools"

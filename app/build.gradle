@@ -120,6 +120,9 @@ android {
 
     defaultConfig {
         applicationId "com.droiddeck.launcher"
+        // [mali-g2] Installs beside upstream DroidDeck (test-key signed) as "DroidDeck G2".
+        applicationIdSuffix ".g2"
+        manifestPlaceholders = [appLabel: "DroidDeck G2"]
         minSdkVersion 26
         targetSdkVersion 28
         versionCode 15

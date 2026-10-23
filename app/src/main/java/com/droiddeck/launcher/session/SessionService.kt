@@ -58,6 +58,9 @@ class SessionService : Service() {
         super.attachBaseContext(com.droiddeck.launcher.core.AppLanguage.wrap(newBase))
 
     private val components = java.util.concurrent.CopyOnWriteArrayList<SessionPart>()
+    @Volatile private var vortekMode = false
+    @Volatile private var vortekEnv: List<String> = emptyList()
+    @Volatile private var maliBridge = false
     private var deckBinds: List<String> = emptyList()
     private var inputSysfs: InputSysfsComponent? = null
     private val stopLock = Any()
@@ -413,6 +416,7 @@ class SessionService : Service() {
         // Earlier sessions' reports still read the Steam logs and VAC marker this session replaces.
         SessionArtifacts.awaitCollections()
         SessionArtifacts.finishAbandoned(this)
+        SessionArtifacts.mirrorRecent(this) // [mali-g2]
         VacDiagnostics.arm(this)
         com.droiddeck.launcher.agent.AgentGuest.reset(this)
         com.droiddeck.launcher.stores.gog.GogComet.begin()
@@ -423,6 +427,7 @@ class SessionService : Service() {
 
         Log.i(TAG, GpuClockPin.start(this))
         Log.i(TAG, GameThreadHints.start(this))
+        Log.i(TAG, WineServerColocation.start(this))
 
         val size = SessionState.outputSize
         val guest = ArrayList<String>()
@@ -442,6 +447,16 @@ class SessionService : Service() {
             encoder.attach(this)
             components.add(encoder)
             guest.add("BL_VENC_SOCKET=" + encoder.socket.absolutePath)
+        }
+        if (vortekMode && maliBridge) {
+            val bridge = MaliBridgeComponent(File(runtimeDir, "vkbridge/S"), File(sessionDir, "vkbridge.log"),
+                vortekEnv.filter { it.startsWith("VKBRIDGE_") })
+            bridge.attach(this)
+            components.add(bridge)
+        } else if (vortekMode) {
+            val vortek = VortekServerComponent(File(runtimeDir, "vortek/V0"), File(sessionDir, "vortek.log"), vortekEnv)
+            vortek.attach(this)
+            components.add(vortek)
         }
 
         guest.add("BL_WIDTH=" + size.first)
@@ -683,6 +698,46 @@ class SessionService : Service() {
         )
         LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
             ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+        // [mali-g2] No Adreno: the guest's Vulkan goes through Vortek to the vendor driver (VortekServerComponent),
+        // and the session runs without gamescope. BL_GPU_MODE=<anything else> in droiddeck-env turns it off.
+        val userEnv = extraEnv()
+        vortekEnv = emptyList()
+        vortekMode = VortekServerComponent.available(this) &&
+            userEnv.lastOrNull { it.startsWith("BL_GPU_MODE=") }.let { it == null || it == "BL_GPU_MODE=" + VortekServerComponent.MODE }
+        if (vortekMode) {
+            guest.add("BL_GPU_MODE=" + VortekServerComponent.MODE)
+            guest.add("VORTEK_SERVER_PATH=" + VortekServerComponent.GUEST_SOCKET)
+            guest.add(LinuxVulkanDriver.ENV + "=" + VortekServerComponent.GUEST_ICD)
+            guest.add("VK_ICD_FILENAMES=" + VortekServerComponent.GUEST_ICD)
+            guest.add("VK_DRIVER_FILES=" + VortekServerComponent.GUEST_ICD)
+            // OpenGL starts on llvmpipe; droiddeck-session switches it to zink over Vortek when a probe
+            // shows zink starts (a failing zink makes Steam exit at glXChooseVisual). BL_VORTEK_GL overrides.
+            guest.removeAll { it.startsWith("MESA_LOADER_DRIVER_OVERRIDE=") || it.startsWith("GALLIUM_DRIVER=") || it.startsWith("LIBGL_KOPPER_DRI2=") }
+            guest.add("GALLIUM_DRIVER=llvmpipe")
+            guest.add("LIBGL_ALWAYS_SOFTWARE=1")
+            // Bring-up: Proton writes ~/steam-<appid>.log (DXVK output included); SessionArtifacts collects it.
+            if (userEnv.none { it.startsWith("PROTON_LOG=") }) guest.add("PROTON_LOG=1")
+            // Proton's default channels for PROTON_LOG add +seh,+unwind: a backtrace per exception, which
+            // slowed games that throw a lot (Lua in Richman 10) to a crawl. Errors and fixmes still show.
+            if (userEnv.none { it.startsWith("WINEDEBUG=") }) guest.add("WINEDEBUG=+timestamp,+pid,+tid,+threadname,+loaddll")
+            vortekEnv = userEnv.filter { it.startsWith("VORTEK_") && !it.startsWith("VORTEK_SERVER_PATH=") }
+            // BL_VK_BRIDGE=malibridge: the same session with MaliBridge instead of Vortek (for A/B runs).
+            val bridgeWanted = userEnv.lastOrNull { it.startsWith("BL_VK_BRIDGE=") } == MaliBridgeComponent.SWITCH
+            maliBridge = bridgeWanted && MaliBridgeComponent.available(this)
+            if (bridgeWanted && !maliBridge) Log.w(TAG, "BL_VK_BRIDGE=malibridge ignored: no ${MaliBridgeComponent.binary(this)}")
+            if (maliBridge) {
+                val icd = MaliBridgeComponent.GUEST_ICD
+                guest.removeAll { it.startsWith(LinuxVulkanDriver.ENV + "=") || it.startsWith("VK_ICD_FILENAMES=") ||
+                    it.startsWith("VK_DRIVER_FILES=") || it.startsWith("VORTEK_SERVER_PATH=") }
+                // droiddeck-session waits for VORTEK_SERVER_PATH before the display starts: the bridge's socket here.
+                guest.addAll(listOf(LinuxVulkanDriver.ENV + "=" + icd, "VK_ICD_FILENAMES=$icd", "VK_DRIVER_FILES=$icd",
+                    "VKBRIDGE_SOCKET=" + MaliBridgeComponent.GUEST_SOCKET, "VORTEK_SERVER_PATH=" + MaliBridgeComponent.GUEST_SOCKET))
+                vortekEnv = userEnv.filter { it.startsWith("VKBRIDGE_") }
+                Log.i(TAG, "gpu: MaliBridge instead of Vortek (BL_VK_BRIDGE)")
+            } else {
+                Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
+            }
+        }
         val tuOverride = tuDebugOverride()
         val tuDriver = sysmemDriver(linuxDriverId)
         (tuOverride ?: "sysmem".takeIf { tuDriver || SessionPrefs.tuSysmem(this) })?.let { guest.add("TU_DEBUG=$it") }
@@ -712,7 +767,7 @@ class SessionService : Service() {
         guest.add("BL_GAMESCOPE_REALTIME=" + (if (SessionPrefs.gamescopeRealtime(this)) "1" else "0"))
         if (com.droiddeck.launcher.core.ZramSupport.supported()) guest.add("BL_ZRAM=1")
         guest.add("BANNER_AUDIO_DIRECT_DECAY=0")
-        val extra = extraEnv() + com.droiddeck.launcher.agent.AgentEnv.beginSession(this)
+        val extra = userEnv + com.droiddeck.launcher.agent.AgentEnv.beginSession(this)
         if (extra.none { it.startsWith("TU_DEBUG=") }) guest.add("$GAME_TU_DEBUG=" + (tuOverride ?: if (tuDriver) "sysmem" else ""))
         extra.forEach { guest.add(it) }
         val clientPinned = steamHere && SessionPrefs.clientCpusOverride(this)
@@ -1633,6 +1688,7 @@ class SessionService : Service() {
         SessionEvents.record("guest.exited", mapOf("status" to status))
         GpuClockPin.stop(this)
         GameThreadHints.stop()
+        WineServerColocation.stop()
         SessionEvents.transition(SessionPhase.STOPPING, "session.stopping", mapOf("status" to status))
         suspendOperationPending = false
         freezePending = false
@@ -1707,6 +1763,7 @@ class SessionService : Service() {
     override fun onDestroy() {
         stopSession(0)
         GameThreadHints.stop() // also when the session never got as far as running
+        WineServerColocation.stop()
         if (screenReceiverRegistered) {
             unregisterReceiver(screenReceiver)
             screenReceiverRegistered = false
@@ -1918,7 +1975,8 @@ class SessionService : Service() {
         private const val ACTION_AUXILIARY_EXITED = "com.droiddeck.launcher.AUXILIARY_EXITED"
         private const val EXTRA_AUXILIARY_PID = "auxiliaryPid"
         private val STRAGGLERS = listOf("droiddeck-session", "gamescope", "Xwayland", "steamrtarm64",
-            "steamwebhelper", "linuxfs/opt/android-host/proot", "/libproot.so", "pulseaudio/libpulseaudio.so")
+            "steamwebhelper", "linuxfs/opt/android-host/proot", "/libproot.so", "pulseaudio/libpulseaudio.so",
+            "/" + VortekServerComponent.BINARY, "/" + MaliBridgeComponent.BINARY)
         private const val GRACE_MS = 1200L
         private const val STEAM_PICKUP_MS = 1500L
         private const val STEAM_EXIT_MS = 10_000L

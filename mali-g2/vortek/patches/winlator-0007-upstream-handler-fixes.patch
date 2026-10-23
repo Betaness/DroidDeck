@@ -1,0 +1,63 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index b22d147..63a19a8 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -221,7 +221,13 @@ void vt_handle_vkEnumerateInstanceExtensionProperties(VkContext* context) {
+     uint32_t exposedExtensionCount;
+     result = vulkanWrapper.vkEnumerateInstanceExtensionProperties(NULL, &exposedExtensionCount, NULL);
+ 
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] size the buffer by the driver's count: a count-only query sends 0, and the driver
++     * then wrote every extension into a 0-byte allocation. */
++    VkExtensionProperties* exposedExtensions = vt_alloc(&context->memoryPool, (exposedExtensionCount ? exposedExtensionCount : 1) * sizeof(VkExtensionProperties));
++#else
+     VkExtensionProperties* exposedExtensions = vt_alloc(&context->memoryPool, propertyCount * sizeof(VkExtensionProperties));
++#endif
+     result = vulkanWrapper.vkEnumerateInstanceExtensionProperties(NULL, &exposedExtensionCount, exposedExtensions);
+ 
+ #ifdef VORTEK_STANDALONE
+@@ -281,7 +287,7 @@ void vt_handle_vkQueueSubmit(VkContext* context) {
+     VkQueue queue = VkObject_fromId(queueId);
+     VkFence fence = VkObject_fromId(fenceId);
+ 
+-    VkSubmitInfo submits[submitCount];
++    VkSubmitInfo submits[submitCount ? submitCount : 1]; /* [mali-g2] no zero-length VLA for fence-only submits */
+     vt_unserialize_vkQueueSubmit(VK_NULL_HANDLE, NULL, submits, VK_NULL_HANDLE, context->inputBuffer, &context->memoryPool);
+ 
+     bool clientWaiting = RingBuffer_hasStatus(context->clientRing, RING_STATUS_WAIT);
+@@ -2764,7 +2770,13 @@ void vt_handle_vkGetSemaphoreCounterValue(VkContext* context) {
+ 
+     uint64_t value = 0;
+     VkResult result = vulkanWrapper.vkGetSemaphoreCounterValue(device, semaphore, &value);
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] upstream replied with the semaphore handle instead of its counter value, so every
++     * timeline semaphore looked signalled far ahead (DXVK/vkd3d/zink fence polling raced the GPU). */
++    vt_send(context->clientRing, result, &value, sizeof(uint64_t));
++#else
+     vt_send(context->clientRing, result, &semaphore, sizeof(uint64_t));
++#endif
+ }
+ 
+ void vt_handle_vkWaitSemaphores(VkContext* context) {
+@@ -3199,6 +3211,12 @@ void vt_handle_vkCmdSetSampleMaskEXT(VkContext* context) {
+     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
+ 
+     VkSampleMask sampleMask[samples];
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] pSampleMask's length is ceil(samples/32), which the serializer generator cannot
++     * express: the mask never crosses the wire and the driver read stack garbage. Until the
++     * protocol carries it, use the default mask (all samples enabled). */
++    for (uint32_t i = 0; i < (uint32_t)samples; i++) sampleMask[i] = 0xFFFFFFFFu;
++#endif
+     vt_unserialize_vkCmdSetSampleMaskEXT(VK_NULL_HANDLE, NULL, sampleMask, context->inputBuffer, &context->memoryPool);
+ 
+     vulkanWrapper.vkCmdSetSampleMask(commandBuffer, samples, sampleMask);
+@@ -3519,7 +3537,7 @@ void vt_handle_vkQueueSubmit2(VkContext* context) {
+         if (clientWaiting && !(clientWaiting = false)) vt_send(context->clientRing, VK_SUCCESS, NULL, 0);
+     }
+ 
+-    VkSubmitInfo2 submits[submitCount];
++    VkSubmitInfo2 submits[submitCount ? submitCount : 1]; /* [mali-g2] no zero-length VLA for fence-only submits */
+     vt_unserialize_vkQueueSubmit2(VK_NULL_HANDLE, NULL, submits, VK_NULL_HANDLE, context->inputBuffer, &context->memoryPool);
+ 
+     VkResult result = vulkanWrapper.vkQueueSubmit2(queue, submitCount, submits, fence);

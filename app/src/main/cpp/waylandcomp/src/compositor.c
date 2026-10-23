@@ -22,6 +22,7 @@
 #include "linux-dmabuf-v1-server-protocol.h"
 #include "sc_layer.h"
 #include "ahb_swapchain.h"
+#include "vortek_present.h"
 #include "viewporter-server-protocol.h"
 #include "banner-desktop-v1-server-protocol.h"
 #include "presentation-time-server-protocol.h"
@@ -751,6 +752,11 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
 }
 
 uint64_t droiddeck_game_frames(void) { return g_game_frames; }
+
+/* [mali-g2] A frame a game presented without a Wayland surface (Vortek's zero-copy layer): counted
+ * for the app (WaylandCompositor.gameFrameCount), not in g_game_frames, which frame generation reads
+ * as frames this compositor composites. */
+void droiddeck_count_game_frame(void) { droiddeck_on_game_frame(); }
 
 struct dmabuf_buffer *droiddeck_dmabuf_from_resource(struct wl_resource *buffer) { return get_dmabuf(buffer); }
 int droiddeck_dmabuf_fd(const struct dmabuf_buffer *b) { return b && b->n_planes > 0 ? b->fd[0] : -1; }
@@ -1853,6 +1859,7 @@ static void render_scene(void) {
     g_hdr_unimported = NULL;
     wl_list_for_each(s, &g_surfaces, link) s->drawn = 0;
     scene_size(&w, &h);
+    vortek_present_scene_size(w, h);
     if (w != g_scene_w || h != g_scene_h) {
         if (g_desktop) droiddeck_log("desktop", "size %dx%d", w, h);
         else droiddeck_log("desktop", "no desktop: showing %dx%d (largest window)", w, h);
@@ -1870,6 +1877,7 @@ static void render_scene(void) {
     int fx_on = vkp_effects_active();
     int framegen = vkp_framegen_active();
     const int cardboard = vkp_cardboard_active();
+    vortek_present_set_accept(!fx_on && !framegen && !cardboard);
     struct hdr_scene hs;
     int hdr_route = hdr_plan(&dl, w, h, fx_on, framegen, &hs);
     const char *hdr_copy = NULL;
@@ -3107,13 +3115,15 @@ static int on_stats_timer(void *data) {
     wl_list_for_each(s, &g_toplevels, toplevel_link) windows++;
     unsigned zero_copy = ahb_swapchain_stats_take();
     unsigned layer_frames = sc_layer_frames_take();
+    unsigned vortek_frames = vortek_present_stats_take();
     g_zero_copy_last = zero_copy;
     unsigned generated = vkp_framegen_stats_take();
-    if (g_stat_frames || g_stat_dmabuf || g_stat_shm || generated) {
+    if (g_stat_frames || g_stat_dmabuf || g_stat_shm || generated || vortek_frames) {
         char extra[160] = "";
         int off = 0;
         if (g_zero_copy || zero_copy) off += snprintf(extra + off, sizeof(extra) - (size_t)off, " | %u zero-copy frames", zero_copy);
         if (layer_frames) off += snprintf(extra + off, sizeof(extra) - (size_t)off, " | %u layer frames", layer_frames);
+        if (vortek_frames) off += snprintf(extra + off, sizeof(extra) - (size_t)off, " | %u Vortek zero-copy frames", vortek_frames);
         if (generated) snprintf(extra + off, sizeof(extra) - (size_t)off, " | %u generated frames", generated);
         droiddeck_log("stats", "last 10 s: %u frames on screen (%.1f fps) | %u GPU frames from games | %u window redraws | %d windows open%s",
                    g_stat_frames + generated, (g_stat_frames + generated) / 10.0, g_stat_dmabuf, g_stat_shm, windows, extra);
@@ -3275,6 +3285,7 @@ int droiddeck_wayland_run(void) {
     wl_global_create(display, &zwp_relative_pointer_manager_v1_interface, 1, NULL, bind_relative_pointer_manager);
     droiddeck_ext_init(display);
     ahb_swapchain_init(display);
+    vortek_present_init(wl_display_get_event_loop(display));
 
 
     droiddeck_color_init(display);

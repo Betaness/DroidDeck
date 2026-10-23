@@ -1,0 +1,27 @@
+diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
+index 56ae655..248d241 100644
+--- a/src/vulkan_calls.c
++++ b/src/vulkan_calls.c
+@@ -3562,10 +3562,22 @@ static const struct VulkanFunc vkDispatchTable[] = {
+     {"vkUnmapMemory2KHR", vt_call_vkUnmapMemory2KHR},
+ };
+ 
++#ifdef VORTEK_DROIDDECK
++extern void* droiddeck_find_override(const char* name);
++extern void droiddeck_trace_missing(const char* name);
++#endif
++
+ static void* findVkDispatchFuncWithName(const char* name) {
++#ifdef VORTEK_DROIDDECK
++    void* override = droiddeck_find_override(name);
++    if (override) return override;
++#endif
+     for (int i = 0; i < ARRAY_SIZE(vkDispatchTable); i++) {
+         if (strcmp(name, vkDispatchTable[i].name) == 0) return vkDispatchTable[i].func;
+     }
++#ifdef VORTEK_DROIDDECK
++    droiddeck_trace_missing(name);
++#endif
+     return NULL;
+ }
+ 

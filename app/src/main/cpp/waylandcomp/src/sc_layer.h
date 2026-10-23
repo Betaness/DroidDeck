@@ -8,7 +8,7 @@ struct vkp_image;
 struct vkp_draw;
 struct droiddeck_color;
 
-enum sc_layer_id { SC_LAYER_GAME = 0, SC_LAYER_OVERLAY = 1, SC_LAYER_COUNT = 2 };
+enum sc_layer_id { SC_LAYER_GAME = 0, SC_LAYER_OVERLAY = 1, SC_LAYER_VORTEK = 2, SC_LAYER_COUNT = 3 };
 
 int sc_layer_available(void);
 
@@ -36,6 +36,10 @@ int sc_layer_overlay_affordable(void);
 int sc_layer_present_overlay(struct vkp_image *src, const int geo[8], int translucent);
 
 void sc_layer_hide(void);
+/* [mali-g2] Vortek zero-copy: an AHB shown over the X window at x,y,w,h of the scene. */
+int sc_layer_present_vortek(AHardwareBuffer *ahb, int buf_w, int buf_h, int acquire_fd, void *token,
+                            int x, int y, int w, int h, int scene_w, int scene_h);
+void sc_layer_hide_vortek(void);
 int sc_layer_base_black(int width, int height);
 void sc_layer_hide_base(void);
 void sc_layer_hide_overlay(void);

@@ -1,0 +1,18 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c b/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
+index 1469232..bd2f6f6 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
++++ b/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
+@@ -57,6 +57,13 @@ static void setupExposedDeviceExtensions(VkContext* context) {
+         context->disabledDeviceExtensions = ArrayList_fromStrings(disabledDeviceExtensions, ARRAY_SIZE(disabledDeviceExtensions));
+         ArrayList_free(context->exposedDeviceExtensions, true);
+         context->exposedDeviceExtensions = ArrayList_fromStrings(globalExposedDeviceExtensions, ARRAY_SIZE(globalExposedDeviceExtensions));
++#ifdef VORTEK_STANDALONE
++        /* [mali-g2] zink in Mesa 26.x refuses devices without VK_KHR_maintenance5. The client
++         * emulates the maintenance5/6 entry points and the server enables both features
++         * (winlator-0003), so expose them on top of Winlator's zink list. */
++        ArrayList_add(context->exposedDeviceExtensions, strdup("VK_KHR_maintenance5"));
++        ArrayList_add(context->exposedDeviceExtensions, strdup("VK_KHR_maintenance6"));
++#endif
+     }
+ }
+ 

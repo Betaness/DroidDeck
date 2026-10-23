@@ -1,0 +1,485 @@
+diff --git a/include/vortek_serializer.h b/include/vortek_serializer.h
+index bb5315d..936a511 100644
+--- a/include/vortek_serializer.h
++++ b/include/vortek_serializer.h
+@@ -3,6 +3,20 @@
+ 
+ #include "vortek.h"
+ 
++/* [mali-g2] VK_KHR_unified_image_layouts is newer than the bundled Vulkan headers (1.4.302). */
++#ifndef VK_KHR_unified_image_layouts
++#define VK_KHR_unified_image_layouts 1
++#define VK_KHR_UNIFIED_IMAGE_LAYOUTS_SPEC_VERSION 1
++#define VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME "VK_KHR_unified_image_layouts"
++#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR ((VkStructureType)1000527000)
++typedef struct VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR {
++    VkStructureType    sType;
++    void*              pNext;
++    VkBool32           unifiedImageLayouts;
++    VkBool32           unifiedImageLayoutsVideo;
++} VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR;
++#endif
++
+ #ifdef VT_SERVER
+ extern bool vortekSerializerCastVkObject;
+ #endif
+@@ -12877,6 +12891,89 @@ static inline void vt_unserialize_VkPhysicalDeviceGraphicsPipelineLibraryFeature
+     bufferOffset += 4;
+ }
+ 
++static inline int vt_sizeof_VkPhysicalDeviceMaintenance7FeaturesKHR(VkPhysicalDeviceMaintenance7FeaturesKHR* val) {
++    int bufferSize = 0;
++    bufferSize += 4; // sType
++    bufferSize += 4; // maintenance7
++    return bufferSize;
++}
++
++static inline void vt_serialize_VkPhysicalDeviceMaintenance7FeaturesKHR(VkPhysicalDeviceMaintenance7FeaturesKHR* val, char* outputBuffer) {
++    int bufferOffset = 0;
++    *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
++    bufferOffset += 4;
++    *(VkBool32*)(outputBuffer + bufferOffset) = val->maintenance7;
++    bufferOffset += 4;
++}
++
++static inline void vt_unserialize_VkPhysicalDeviceMaintenance7FeaturesKHR(VkPhysicalDeviceMaintenance7FeaturesKHR* val, char* inputBuffer, MemoryPool* memoryPool) {
++    int bufferOffset = 0;
++    val->sType = *(VkStructureType*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++#ifdef VT_SERVER
++    val->pNext = NULL;
++#endif
++    val->maintenance7 = *(VkBool32*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++}
++
++static inline int vt_sizeof_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR(VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR* val) {
++    int bufferSize = 0;
++    bufferSize += 4; // sType
++    bufferSize += 4; // unifiedImageLayouts
++    bufferSize += 4; // unifiedImageLayoutsVideo
++    return bufferSize;
++}
++
++static inline void vt_serialize_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR(VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR* val, char* outputBuffer) {
++    int bufferOffset = 0;
++    *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
++    bufferOffset += 4;
++    *(VkBool32*)(outputBuffer + bufferOffset) = val->unifiedImageLayouts;
++    bufferOffset += 4;
++    *(VkBool32*)(outputBuffer + bufferOffset) = val->unifiedImageLayoutsVideo;
++    bufferOffset += 4;
++}
++
++static inline void vt_unserialize_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR(VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR* val, char* inputBuffer, MemoryPool* memoryPool) {
++    int bufferOffset = 0;
++    val->sType = *(VkStructureType*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++#ifdef VT_SERVER
++    val->pNext = NULL;
++#endif
++    val->unifiedImageLayouts = *(VkBool32*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->unifiedImageLayoutsVideo = *(VkBool32*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++}
++
++static inline int vt_sizeof_VkPhysicalDeviceShaderFloatControls2FeaturesKHR(VkPhysicalDeviceShaderFloatControls2FeaturesKHR* val) {
++    int bufferSize = 0;
++    bufferSize += 4; // sType
++    bufferSize += 4; // shaderFloatControls2
++    return bufferSize;
++}
++
++static inline void vt_serialize_VkPhysicalDeviceShaderFloatControls2FeaturesKHR(VkPhysicalDeviceShaderFloatControls2FeaturesKHR* val, char* outputBuffer) {
++    int bufferOffset = 0;
++    *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
++    bufferOffset += 4;
++    *(VkBool32*)(outputBuffer + bufferOffset) = val->shaderFloatControls2;
++    bufferOffset += 4;
++}
++
++static inline void vt_unserialize_VkPhysicalDeviceShaderFloatControls2FeaturesKHR(VkPhysicalDeviceShaderFloatControls2FeaturesKHR* val, char* inputBuffer, MemoryPool* memoryPool) {
++    int bufferOffset = 0;
++    val->sType = *(VkStructureType*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++#ifdef VT_SERVER
++    val->pNext = NULL;
++#endif
++    val->shaderFloatControls2 = *(VkBool32*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++}
++
+ static inline int vt_sizeof_VkPhysicalDeviceFeatures2(VkPhysicalDeviceFeatures2* val) {
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+@@ -12887,7 +12984,7 @@ static inline int vt_sizeof_VkPhysicalDeviceFeatures2(VkPhysicalDeviceFeatures2*
+         void* oldPNext = sBase->pNext;
+         sBase->pNext = NULL;
+ 
+-        switch (sBase->sType) {
++        switch ((int)sBase->sType) { /* [mali-g2] int: some sTypes are newer than the headers */
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES: {
+                 bufferSize += 4;
+                 bufferSize += vt_sizeof_VkPhysicalDevicePrivateDataFeatures((VkPhysicalDevicePrivateDataFeatures*)pNext);
+@@ -13153,6 +13250,21 @@ static inline int vt_sizeof_VkPhysicalDeviceFeatures2(VkPhysicalDeviceFeatures2*
+                 bufferSize += vt_sizeof_VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT((VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT*)pNext);
+                 break;
+             }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceMaintenance7FeaturesKHR((VkPhysicalDeviceMaintenance7FeaturesKHR*)pNext);
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR((VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)pNext);
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceShaderFloatControls2FeaturesKHR((VkPhysicalDeviceShaderFloatControls2FeaturesKHR*)pNext);
++                break;
++            }
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
+                 bufferSize += 4;
+                 bufferSize += vt_sizeof_VkPhysicalDeviceMapMemoryPlacedFeaturesEXT((VkPhysicalDeviceMapMemoryPlacedFeaturesEXT*)pNext);
+@@ -13185,7 +13297,7 @@ static inline void vt_serialize_VkPhysicalDeviceFeatures2(VkPhysicalDeviceFeatur
+             void* oldPNext = sBase->pNext;
+             sBase->pNext = NULL;
+ 
+-            switch (sBase->sType) {
++            switch ((int)sBase->sType) { /* [mali-g2] int: some sTypes are newer than the headers */
+                 case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES: {
+                     int itemSize = vt_sizeof_VkPhysicalDevicePrivateDataFeatures((VkPhysicalDevicePrivateDataFeatures*)pNext);
+                     *(int*)(outputBuffer + bufferOffset) = itemSize;
+@@ -13610,6 +13722,30 @@ static inline void vt_serialize_VkPhysicalDeviceFeatures2(VkPhysicalDeviceFeatur
+                     bufferOffset += itemSize;
+                     break;
+                 }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceMaintenance7FeaturesKHR((VkPhysicalDeviceMaintenance7FeaturesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceMaintenance7FeaturesKHR((VkPhysicalDeviceMaintenance7FeaturesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR((VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR((VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceShaderFloatControls2FeaturesKHR((VkPhysicalDeviceShaderFloatControls2FeaturesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceShaderFloatControls2FeaturesKHR((VkPhysicalDeviceShaderFloatControls2FeaturesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
+                 case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
+                     int itemSize = vt_sizeof_VkPhysicalDeviceMapMemoryPlacedFeaturesEXT((VkPhysicalDeviceMapMemoryPlacedFeaturesEXT*)pNext);
+                     *(int*)(outputBuffer + bufferOffset) = itemSize;
+@@ -14500,6 +14636,54 @@ static inline void vt_unserialize_VkPhysicalDeviceFeatures2(VkPhysicalDeviceFeat
+                 }
+                 break;
+             }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceMaintenance7FeaturesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceMaintenance7FeaturesKHR));
++                    vt_unserialize_VkPhysicalDeviceMaintenance7FeaturesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR));
++                    vt_unserialize_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceShaderFloatControls2FeaturesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceShaderFloatControls2FeaturesKHR));
++                    vt_unserialize_VkPhysicalDeviceShaderFloatControls2FeaturesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
+                 int itemSize = *(int*)(inputBuffer + bufferOffset);
+                 bufferOffset += 4;
+@@ -14561,6 +14745,67 @@ static inline void vt_unserialize_VkPhysicalDeviceGraphicsPipelineLibraryPropert
+     bufferOffset += 4;
+ }
+ 
++static inline int vt_sizeof_VkPhysicalDeviceMaintenance7PropertiesKHR(VkPhysicalDeviceMaintenance7PropertiesKHR* val) {
++    int bufferSize = 0;
++    bufferSize += 4; // sType
++    bufferSize += 4; // robustFragmentShadingRateAttachmentAccess
++    bufferSize += 4; // separateDepthStencilAttachmentAccess
++    bufferSize += 4; // maxDescriptorSetTotalUniformBuffersDynamic
++    bufferSize += 4; // maxDescriptorSetTotalStorageBuffersDynamic
++    bufferSize += 4; // maxDescriptorSetTotalBuffersDynamic
++    bufferSize += 4; // maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic
++    bufferSize += 4; // maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic
++    bufferSize += 4; // maxDescriptorSetUpdateAfterBindTotalBuffersDynamic
++    return bufferSize;
++}
++
++static inline void vt_serialize_VkPhysicalDeviceMaintenance7PropertiesKHR(VkPhysicalDeviceMaintenance7PropertiesKHR* val, char* outputBuffer) {
++    int bufferOffset = 0;
++    *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
++    bufferOffset += 4;
++    *(VkBool32*)(outputBuffer + bufferOffset) = val->robustFragmentShadingRateAttachmentAccess;
++    bufferOffset += 4;
++    *(VkBool32*)(outputBuffer + bufferOffset) = val->separateDepthStencilAttachmentAccess;
++    bufferOffset += 4;
++    *(uint32_t*)(outputBuffer + bufferOffset) = val->maxDescriptorSetTotalUniformBuffersDynamic;
++    bufferOffset += 4;
++    *(uint32_t*)(outputBuffer + bufferOffset) = val->maxDescriptorSetTotalStorageBuffersDynamic;
++    bufferOffset += 4;
++    *(uint32_t*)(outputBuffer + bufferOffset) = val->maxDescriptorSetTotalBuffersDynamic;
++    bufferOffset += 4;
++    *(uint32_t*)(outputBuffer + bufferOffset) = val->maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic;
++    bufferOffset += 4;
++    *(uint32_t*)(outputBuffer + bufferOffset) = val->maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic;
++    bufferOffset += 4;
++    *(uint32_t*)(outputBuffer + bufferOffset) = val->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic;
++    bufferOffset += 4;
++}
++
++static inline void vt_unserialize_VkPhysicalDeviceMaintenance7PropertiesKHR(VkPhysicalDeviceMaintenance7PropertiesKHR* val, char* inputBuffer, MemoryPool* memoryPool) {
++    int bufferOffset = 0;
++    val->sType = *(VkStructureType*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++#ifdef VT_SERVER
++    val->pNext = NULL;
++#endif
++    val->robustFragmentShadingRateAttachmentAccess = *(VkBool32*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->separateDepthStencilAttachmentAccess = *(VkBool32*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->maxDescriptorSetTotalUniformBuffersDynamic = *(uint32_t*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->maxDescriptorSetTotalStorageBuffersDynamic = *(uint32_t*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->maxDescriptorSetTotalBuffersDynamic = *(uint32_t*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic = *(uint32_t*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic = *(uint32_t*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++    val->maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = *(uint32_t*)(inputBuffer + bufferOffset);
++    bufferOffset += 4;
++}
++
+ static inline int vt_sizeof_VkPhysicalDeviceProperties2(VkPhysicalDeviceProperties2* val) {
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+@@ -14732,6 +14977,11 @@ static inline int vt_sizeof_VkPhysicalDeviceProperties2(VkPhysicalDeviceProperti
+                 bufferSize += vt_sizeof_VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT((VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT*)pNext);
+                 break;
+             }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceMaintenance7PropertiesKHR((VkPhysicalDeviceMaintenance7PropertiesKHR*)pNext);
++                break;
++            }
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT: {
+                 bufferSize += 4;
+                 bufferSize += vt_sizeof_VkPhysicalDeviceMapMemoryPlacedPropertiesEXT((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT*)pNext);
+@@ -15021,6 +15271,14 @@ static inline void vt_serialize_VkPhysicalDeviceProperties2(VkPhysicalDeviceProp
+                     bufferOffset += itemSize;
+                     break;
+                 }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceMaintenance7PropertiesKHR((VkPhysicalDeviceMaintenance7PropertiesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceMaintenance7PropertiesKHR((VkPhysicalDeviceMaintenance7PropertiesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
+                 case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT: {
+                     int itemSize = vt_sizeof_VkPhysicalDeviceMapMemoryPlacedPropertiesEXT((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT*)pNext);
+                     *(int*)(outputBuffer + bufferOffset) = itemSize;
+@@ -15575,6 +15833,22 @@ static inline void vt_unserialize_VkPhysicalDeviceProperties2(VkPhysicalDevicePr
+                 }
+                 break;
+             }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceMaintenance7PropertiesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceMaintenance7PropertiesKHR));
++                    vt_unserialize_VkPhysicalDeviceMaintenance7PropertiesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT: {
+                 int itemSize = *(int*)(inputBuffer + bufferOffset);
+                 bufferOffset += 4;
+@@ -20602,7 +20876,7 @@ static inline int vt_sizeof_VkDeviceCreateInfo(VkDeviceCreateInfo* val) {
+         void* oldPNext = sBase->pNext;
+         sBase->pNext = NULL;
+ 
+-        switch (sBase->sType) {
++        switch ((int)sBase->sType) { /* [mali-g2] int: some sTypes are newer than the headers */
+             case VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO: {
+                 bufferSize += 4;
+                 bufferSize += vt_sizeof_VkDevicePrivateDataCreateInfo((VkDevicePrivateDataCreateInfo*)pNext);
+@@ -20883,6 +21157,21 @@ static inline int vt_sizeof_VkDeviceCreateInfo(VkDeviceCreateInfo* val) {
+                 bufferSize += vt_sizeof_VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT((VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT*)pNext);
+                 break;
+             }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceMaintenance7FeaturesKHR((VkPhysicalDeviceMaintenance7FeaturesKHR*)pNext);
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR((VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)pNext);
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR: {
++                bufferSize += 4;
++                bufferSize += vt_sizeof_VkPhysicalDeviceShaderFloatControls2FeaturesKHR((VkPhysicalDeviceShaderFloatControls2FeaturesKHR*)pNext);
++                break;
++            }
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
+                 bufferSize += 4;
+                 bufferSize += vt_sizeof_VkPhysicalDeviceMapMemoryPlacedFeaturesEXT((VkPhysicalDeviceMapMemoryPlacedFeaturesEXT*)pNext);
+@@ -20944,7 +21233,7 @@ static inline void vt_serialize_VkDeviceCreateInfo(VkDeviceCreateInfo* val, char
+             void* oldPNext = sBase->pNext;
+             sBase->pNext = NULL;
+ 
+-            switch (sBase->sType) {
++            switch ((int)sBase->sType) { /* [mali-g2] int: some sTypes are newer than the headers */
+                 case VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO: {
+                     int itemSize = vt_sizeof_VkDevicePrivateDataCreateInfo((VkDevicePrivateDataCreateInfo*)pNext);
+                     *(int*)(outputBuffer + bufferOffset) = itemSize;
+@@ -21393,6 +21682,30 @@ static inline void vt_serialize_VkDeviceCreateInfo(VkDeviceCreateInfo* val, char
+                     bufferOffset += itemSize;
+                     break;
+                 }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceMaintenance7FeaturesKHR((VkPhysicalDeviceMaintenance7FeaturesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceMaintenance7FeaturesKHR((VkPhysicalDeviceMaintenance7FeaturesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR((VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR((VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
++                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR: {
++                    int itemSize = vt_sizeof_VkPhysicalDeviceShaderFloatControls2FeaturesKHR((VkPhysicalDeviceShaderFloatControls2FeaturesKHR*)pNext);
++                    *(int*)(outputBuffer + bufferOffset) = itemSize;
++                    bufferOffset += 4;
++                    vt_serialize_VkPhysicalDeviceShaderFloatControls2FeaturesKHR((VkPhysicalDeviceShaderFloatControls2FeaturesKHR*)pNext, outputBuffer + bufferOffset);
++                    bufferOffset += itemSize;
++                    break;
++                }
+                 case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
+                     int itemSize = vt_sizeof_VkPhysicalDeviceMapMemoryPlacedFeaturesEXT((VkPhysicalDeviceMapMemoryPlacedFeaturesEXT*)pNext);
+                     *(int*)(outputBuffer + bufferOffset) = itemSize;
+@@ -22400,6 +22713,54 @@ static inline void vt_unserialize_VkDeviceCreateInfo(VkDeviceCreateInfo* val, ch
+                 }
+                 break;
+             }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceMaintenance7FeaturesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceMaintenance7FeaturesKHR));
++                    vt_unserialize_VkPhysicalDeviceMaintenance7FeaturesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR));
++                    vt_unserialize_VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
++            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR: {
++                int itemSize = *(int*)(inputBuffer + bufferOffset);
++                bufferOffset += 4;
++                if (itemSize > 0) {
++                    VkPhysicalDeviceShaderFloatControls2FeaturesKHR* item = !pNextIsNULL ? findNextVkStructure(val->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES_KHR) : NULL;
++                    if (!item) item = vt_alloc(memoryPool, sizeof(VkPhysicalDeviceShaderFloatControls2FeaturesKHR));
++                    vt_unserialize_VkPhysicalDeviceShaderFloatControls2FeaturesKHR(item, inputBuffer + bufferOffset, memoryPool);
++                    bufferOffset += itemSize;
++
++                    if (pNextIsNULL) {
++                        item->pNext = pNext;
++                        pNext = item;
++                    }
++                }
++                break;
++            }
+             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT: {
+                 int itemSize = *(int*)(inputBuffer + bufferOffset);
+                 bufferOffset += 4;

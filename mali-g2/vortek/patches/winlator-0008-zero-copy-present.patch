@@ -1,0 +1,35 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 63a19a8..94faa5a 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -2157,7 +2157,14 @@ void vt_handle_vkQueuePresentKHR(VkContext* context) {
+     vt_unserialize_VkPresentInfoKHR(&presentInfo, context->inputBuffer, &context->memoryPool);
+ 
+     for (int i = 0; i < presentInfo.swapchainCount; i++) {
++#ifdef VORTEK_STANDALONE
++        /* [mali-g2] the presented image, not the last acquired one (zero-copy ownership) */
++        extern void XWindowSwapchain_presentImageIndex(XWindowSwapchain* swapchain, uint32_t index);
++        XWindowSwapchain_presentImageIndex((XWindowSwapchain*)presentInfo.pSwapchains[i],
++                                           presentInfo.pImageIndices ? presentInfo.pImageIndices[i] : UINT32_MAX);
++#else
+         XWindowSwapchain_presentImage((XWindowSwapchain*)presentInfo.pSwapchains[i]);
++#endif
+     }
+ }
+ 
+@@ -3864,7 +3871,15 @@ HandleRequestFunc handleRequestFuncs[] = {
+     vt_handle_vkGetShaderModuleCreateInfoIdentifierEXT,
+ };
+ 
++#ifdef VORTEK_STANDALONE
++/* [mali-g2] DroidDeck requests below the Vulkan range (mali-g2/vortek/src/droiddeck_requests.h). */
++extern void droiddeck_handlePresentZeroCopy(VkContext* context);
++#endif
++
+ HandleRequestFunc getHandleRequestFunc(short requestCode) {
++#ifdef VORTEK_STANDALONE
++    if (requestCode == 90) return droiddeck_handlePresentZeroCopy;
++#endif
+     int index = requestCode - REQUEST_CODE_VK_CALL_START;
+     return index >= 0 && index < REQUEST_CODE_VK_CALL_COUNT ? handleRequestFuncs[index] : NULL;
+ }

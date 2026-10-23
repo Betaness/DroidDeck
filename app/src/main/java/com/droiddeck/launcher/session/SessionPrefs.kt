@@ -432,6 +432,9 @@ object SessionPrefs {
     /** Whether the game's busiest threads are named to the power HAL for a boost (GameThreadHints). */
     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
 
+    /** Whether a Windows game's busiest thread may share a core with its wineserver (WineServerColocation). */
+    fun wineColocate(context: Context): Boolean = prefs(context).getBoolean("wineColocate", false)
+
     fun prootNoSeccomp(context: Context): Boolean = prefs(context).getBoolean("prootNoSeccomp", false)
 
     fun setProotNoSeccomp(context: Context, on: Boolean) {

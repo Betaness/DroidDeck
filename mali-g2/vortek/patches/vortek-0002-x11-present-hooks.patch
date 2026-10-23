@@ -1,0 +1,135 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b1dc60d..5325288 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,4 +16,12 @@ add_library(vulkan_vortek SHARED
+             src/vk_object_pool.c
+             src/arrays.c
+             src/descriptor_update_template.c
+-            src/ring_buffer.c)
+\ No newline at end of file
++            src/ring_buffer.c)
++# mali-v15-bringup: standalone build with software X11 presentation
++# (tools/vortek-standalone/build-client.sh passes the extra sources)
++if (VORTEK_STANDALONE_SOURCES)
++    target_sources(vulkan_vortek PRIVATE ${VORTEK_STANDALONE_SOURCES})
++    target_include_directories(vulkan_vortek PRIVATE ${VORTEK_STANDALONE_INCLUDE})
++    target_compile_definitions(vulkan_vortek PRIVATE VORTEK_STANDALONE=1 VK_USE_PLATFORM_XCB_KHR)
++    target_link_libraries(vulkan_vortek xcb xcb-shm dl)
++endif()
+diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
+index 0e7cab7..1e3eaa2 100644
+--- a/src/vulkan_calls.c
++++ b/src/vulkan_calls.c
+@@ -7,6 +7,9 @@
+ #include "vk_object_pool.h"
+ #include "vulkan/vk_icd.h"
+ #include "vulkan/vk_layer.h"
++#ifdef VORTEK_STANDALONE
++#include "client_x11_present.h"
++#endif
+ 
+ #define MSG_DEBUG_UNIMPLEMENTED_VKCALL "vortek: unimplemented call %s\n"
+ 
+@@ -184,6 +187,9 @@ VkResult vt_call_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceC
+     vt_unserialize_VkDevice((VkDevice)&deviceId, inputBuffer, &globalMemoryPool);
+     VkObject* deviceObject = VkObject_create(VK_OBJECT_TYPE_DEVICE, deviceId);
+     *pDevice = VkObject_toHandle(deviceObject);
++#ifdef VORTEK_STANDALONE
++    if (result == VK_SUCCESS) X11Present_onCreateDevice(physicalDevice, *pDevice);
++#endif
+ 
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+@@ -265,6 +271,9 @@ void vt_call_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32
+     vt_unserialize_VkQueue((VkQueue)&queueId, inputBuffer, &globalMemoryPool);
+     VkObject* queueObject = VkObject_create(VK_OBJECT_TYPE_QUEUE, queueId);
+     *pQueue = VkObject_toHandle(queueObject);
++#ifdef VORTEK_STANDALONE
++    X11Present_onGetDeviceQueue(*pQueue, queueFamilyIndex);
++#endif
+        
+     VT_CALL_UNLOCK();
+ }
+@@ -1761,6 +1770,9 @@ void vt_call_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t comman
+ 
+ void vt_call_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator) {
+     VkObject* surfaceObject = VkObject_fromHandle(surface);
++#ifdef VORTEK_STANDALONE
++    X11Present_destroySurface(surfaceObject);
++#endif
+     VkObject_free(surfaceObject);
+ }
+ 
+@@ -1780,6 +1792,9 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice phys
+     
+     vt_unserialize_VkSurfaceCapabilitiesKHR(pSurfaceCapabilities, inputBuffer, &globalMemoryPool);
+     VT_CALL_UNLOCK();
++#ifdef VORTEK_STANDALONE
++    if (result == VK_SUCCESS) X11Present_fixSurfaceCapabilities(surface, pSurfaceCapabilities);
++#endif
+     return (VkResult)result;
+ }
+ 
+@@ -1830,10 +1845,16 @@ VkResult vt_call_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateIn
+     *pSwapchain = VkObject_toHandle(swapchainObject);
+     
+     VT_CALL_UNLOCK();
++#ifdef VORTEK_STANDALONE
++    if (result == VK_SUCCESS) X11Present_onCreateSwapchain(device, pCreateInfo, *pSwapchain);
++#endif
+     return (VkResult)result;     
+ }
+ 
+ void vt_call_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator) {
++#ifdef VORTEK_STANDALONE
++    X11Present_onDestroySwapchain(device, swapchain);
++#endif
+     VT_CALL_LOCK();
+     VkObject* deviceObject = VkObject_fromHandle(device);
+     VkObject* swapchainObject = VkObject_fromHandle(swapchain);
+@@ -1881,11 +1902,18 @@ VkResult vt_call_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain
+ }
+ 
+ VkResult vt_call_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
++#ifdef VORTEK_STANDALONE
++    VkResult presentResult = X11Present_present(queue, pPresentInfo, pPresentInfo->pResults);
++#endif
+     VT_CALL_LOCK();
+     
+     VT_SERIALIZE_CMD(VkPresentInfoKHR, pPresentInfo);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_PRESENT_KHR, VT_RETURN);
+     
++#ifdef VORTEK_STANDALONE
++    VT_CALL_UNLOCK();
++    return presentResult;
++#else
+     if (pPresentInfo->pResults) {
+         for (int i = 0; i < pPresentInfo->swapchainCount; i++) {
+             pPresentInfo->pResults[i] = VK_SUCCESS;
+@@ -1894,10 +1922,14 @@ VkResult vt_call_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPrese
+     
+     VT_CALL_UNLOCK();
+     return VK_SUCCESS;
++#endif
+ }
+ 
+ VkResult vt_call_vkCreateXlibSurfaceKHR(VkInstance instance, const VkXlibSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface) {
+     VkObject* surfaceObject = VkObject_create(VK_OBJECT_TYPE_SURFACE_KHR, (uint64_t)pCreateInfo->window);
++#ifdef VORTEK_STANDALONE
++    X11Present_initXlibSurface(surfaceObject, pCreateInfo->dpy, pCreateInfo->window);
++#endif
+     *pSurface = VkObject_toHandle(surfaceObject);
+     return VK_SUCCESS;
+ }
+@@ -3303,6 +3335,10 @@ static const struct VulkanFunc vkDispatchTable[] = {
+     {"vkQueuePresentKHR", vt_call_vkQueuePresentKHR},
+     {"vkCreateXlibSurfaceKHR", vt_call_vkCreateXlibSurfaceKHR},
+     {"vkGetPhysicalDeviceXlibPresentationSupportKHR", vt_call_vkGetPhysicalDeviceXlibPresentationSupportKHR},
++#ifdef VORTEK_STANDALONE
++    {"vkCreateXcbSurfaceKHR", vt_call_vkCreateXcbSurfaceKHR},
++    {"vkGetPhysicalDeviceXcbPresentationSupportKHR", vt_call_vkGetPhysicalDeviceXcbPresentationSupportKHR},
++#endif
+     {"vkGetPhysicalDeviceFeatures2", vt_call_vkGetPhysicalDeviceFeatures2},
+     {"vkGetPhysicalDeviceFeatures2KHR", vt_call_vkGetPhysicalDeviceFeatures2},
+     {"vkGetPhysicalDeviceProperties2", vt_call_vkGetPhysicalDeviceProperties2},

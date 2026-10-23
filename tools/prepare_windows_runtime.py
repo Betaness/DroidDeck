@@ -234,7 +234,7 @@ def prepare(apk, rebuilt_dir, gamescope, llvm_strip=None, rebuilt_vr=None, vk_in
         for name in names:
             if name.endswith('/') or name in excluded or name.startswith(VR_PREFIX):
                 continue
-            if name.startswith(('assets/linuxfs/', 'assets/directaudio/', 'assets/droiddeck-esync/')):
+            if name.startswith(('assets/linuxfs/', 'assets/directaudio/', 'assets/droiddeck-esync/', 'assets/droiddeck-esync-extra/')):
                 target = 'app/src/main/' + name
                 checked_output(target)
                 plan[target] = package.read(name)
@@ -266,7 +266,7 @@ def prepare(apk, rebuilt_dir, gamescope, llvm_strip=None, rebuilt_vr=None, vk_in
         origins[target] = 'VR rebuilt from current source; source and output checksums verified'
     # Do not silently retain unrelated files from a prior preparation.
     expected = set(plan) | {'app/src/main/' + name for name in helper_assets}
-    for tree in ('linuxfs', 'directaudio', 'droiddeck-esync'):
+    for tree in ('linuxfs', 'directaudio', 'droiddeck-esync', 'droiddeck-esync-extra'):
         base = ROOT / 'app/src/main/assets' / tree
         for path in base.rglob('*'):
             if path.is_file() and not any(part.startswith('.') for part in path.relative_to(base).parts):

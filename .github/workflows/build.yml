@@ -1,3 +1,4 @@
+# Also built in the private Betaness/DroidDeck-G2-build (Actions were disabled on the public fork).
 name: Build APK
 run-name: ${{ github.event_name == 'pull_request' && format('building pr {0} on {1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('building {0} on {1}', github.ref_name, github.sha) }}
 
@@ -85,8 +86,35 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # [mali-g2] The Vortek client is a glibc aarch64 library: build it natively on an arm runner.
+  vortek:
+    name: Vortek client (mali-g2)
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build libvulkan_vortek.so
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake make gcc libx11-dev libxcb1-dev libxcb-shm0-dev libvulkan-dev >/dev/null
+          mali-g2/vortek/fetch.sh
+          JOBS=4 mali-g2/vortek/build-client.sh "$PWD/vortek-client"
+          install -m644 mali-g2/vortek/NOTICE mali-g2/vortek/LICENSE.LGPL-2.1 vortek-client/
+          ls -l vortek-client
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vortek-client
+          path: vortek-client
+          if-no-files-found: error
+          retention-days: 14
+
   build:
-    needs: xbox
+    needs: [xbox, vortek]
     name: Compile and test APK
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -373,7 +401,8 @@ jobs:
           set -euo pipefail
           . tools/linuxfs/debian-image.env
           image=public.ecr.aws/docker/library/debian:bullseye
-          if gh release download "$DEBIAN_IMAGE_TAG" -R "$GITHUB_REPOSITORY" -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst \
+          # [mali-g2] forks have no copy of the CI image release: take upstream's (sha256-checked below)
+          if gh release download "$DEBIAN_IMAGE_TAG" -R Droid-Deck/DroidDeck -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst \
              && { [ -z "$DEBIAN_IMAGE_SHA256" ] || echo "$DEBIAN_IMAGE_SHA256  /tmp/debian-image.tar.zst" | sha256sum -c -; }; then
             zstd -dc /tmp/debian-image.tar.zst | docker load
             rm -f /tmp/debian-image.tar.zst
@@ -432,6 +461,8 @@ jobs:
             test -f app/src/main/assets/droiddeck-esync/index.json.sig
             ls -lR app/src/main/assets/droiddeck-esync
           fi
+      - name: Bundle the extra droiddeck-esync packs (tools/droiddeck-esync/extra.list)
+        run: tools/droiddeck-esync/fetch-extra.sh "$PWD"
 
       - name: Cache PulseAudio 13.0 source
         id: pa-src
@@ -557,6 +588,44 @@ jobs:
           rustup target add --toolchain 1.90.0 aarch64-unknown-linux-gnu
           RUSTUP_TOOLCHAIN=1.90.0 bash tools/comet/build.sh
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: vortek-client
+          path: vortek-client
+
+      - name: Vortek server and guest ICD (mali-g2)
+        run: |
+          set -euo pipefail
+          D=app/src/main/assets/linuxfs
+          install -Dm644 vortek-client/libvulkan_vortek.so "$D/usr/local/lib/droiddeck-vortek/libvulkan_vortek.so"
+          install -Dm644 vortek-client/vortek_icd.aarch64.json "$D/usr/local/lib/droiddeck-vortek/vortek_icd.aarch64.json"
+          install -Dm644 vortek-client/LICENSE.LGPL-2.1 "$D/usr/local/share/licenses/droiddeck-vortek/LGPL-2.1"
+          install -Dm644 vortek-client/NOTICE "$D/usr/local/share/licenses/droiddeck-vortek/NOTICE"
+          rm -rf vortek-client
+          mali-g2/vortek/fetch.sh
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}" JOBS=4 \
+            mali-g2/vortek/build-server.sh "$PWD/app/src/main/jniLibs/arm64-v8a/libvortekserver.so"
+          rm -rf mali-g2/vortek/work mali-g2/vortek/out
+          ls -l "$D/usr/local/lib/droiddeck-vortek" app/src/main/jniLibs/arm64-v8a/libvortekserver.so
+
+      - name: MaliBridge server and guest ICD (mali-g2, BL_VK_BRIDGE=malibridge)
+        run: |
+          set -euo pipefail
+          D=app/src/main/assets/linuxfs
+          V=v0.5.2
+          curl -fsSL -o mb.apk "https://github.com/ASEbrahim/MaliBridge/releases/download/$V/DroidDeck-MaliBridge-$V.apk"
+          echo "82c22f8681d0ee8b0b21f189bbfe5d260ba31a87cca8f38965700faa6c125b47  mb.apk" | sha256sum -c
+          mkdir mb && unzip -q mb.apk lib/arm64-v8a/libvkbridge_server.so \
+            assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so \
+            assets/linuxfs/usr/local/share/vkbridge/droidbridge_icd.json -d mb
+          install -Dm755 mb/lib/arm64-v8a/libvkbridge_server.so app/src/main/jniLibs/arm64-v8a/libvkbridge_server.so
+          install -Dm644 mb/assets/linuxfs/usr/local/lib/vkbridge/libvulkan_droidbridge.so "$D/usr/local/lib/vkbridge/libvulkan_droidbridge.so"
+          install -Dm644 mb/assets/linuxfs/usr/local/share/vkbridge/droidbridge_icd.json "$D/usr/local/share/vkbridge/droidbridge_icd.json"
+          printf 'MaliBridge %s (GPL-3.0), https://github.com/ASEbrahim/MaliBridge/releases/tag/%s\nSource: https://github.com/ASEbrahim/MaliBridge/tree/%s\n' "$V" "$V" "$V" \
+            | install -Dm644 /dev/stdin "$D/usr/local/share/licenses/malibridge/NOTICE"
+          install -Dm644 LICENSE "$D/usr/local/share/licenses/malibridge/GPL-3"
+          rm -rf mb mb.apk
+
       - name: Build the add-on packs
         run: bash tools/packs/build.sh app/build/packs
 
@@ -653,6 +722,13 @@ jobs:
           done
           grep -qi "CN=Android, OU=Android, O=Android" /tmp/sig.txt \
             || { echo "::error::apk is not signed with the AOSP testkey"; exit 1; }
+
+      - name: The APK carries Vortek (mali-g2)
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk -name '*.apk' | head -1)
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libvortekserver.so|assets/linuxfs/usr/local/lib/droiddeck-vortek/' \
+            | tee /dev/stderr | wc -l | grep -qx 3 || { echo "::error::Vortek files missing from the APK"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         id: apk-upload

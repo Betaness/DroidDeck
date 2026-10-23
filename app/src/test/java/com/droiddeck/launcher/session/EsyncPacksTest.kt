@@ -1,6 +1,7 @@
 package com.droiddeck.launcher.session
 
 import com.droiddeck.launcher.core.GameEnvironment
+import com.github.luben.zstd.ZstdOutputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
@@ -498,6 +499,52 @@ class EsyncPacksTest {
         assertTrue(File(store, "packs/ge-b-r1/.complete").isFile)
         assertEquals(setOf("ge-b-r1"), EsyncPacks.installedIds(store))
         assertTrue(File(store, "packs").list()!!.none { it.startsWith(".") })
+    }
+
+    private fun tzst(pack: JSONObject): ByteArray {
+        val out = ByteArrayOutputStream()
+        TarArchiveOutputStream(ZstdOutputStream(out)).use { stream ->
+            stream.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
+            val items = listOf(EsyncPacks.NTDLL to ntdllBytes, EsyncPacks.WINESERVER to wineserverBytes, "pack.json" to pack.toString().toByteArray())
+            for ((name, data) in items) {
+                stream.putArchiveEntry(TarArchiveEntry(name).apply { size = data.size.toLong() })
+                stream.write(data)
+                stream.closeArchiveEntry()
+            }
+        }
+        return out.toByteArray()
+    }
+
+    @Test fun extraPacksInstallFromTheirManifestAndSurviveRevocationAndPruning() {
+        val id = "valve-experimental-11.0-20261014-arm64-1791970419-ccf9fc588e30-r2"
+        val archive = tzst(packJson(id, rev = 2))
+        val archiveSha = sha(archive)
+        val release = entryJson(id, rev = 2, revoked = true).put("asset", JSONObject().put("sha256", archiveSha).put("size", archive.size))
+        val good = JSONObject().put("id", id).put("sha256", archiveSha).put("entry", release)
+        val wrongSha = JSONObject().put("id", "valve-b-r1").put("sha256", "e".repeat(64))
+            .put("entry", entryJson("valve-b-r1").put("asset", JSONObject().put("sha256", "f".repeat(64)).put("size", 1)))
+        val wrongId = JSONObject().put("id", "valve-c-r1").put("sha256", archiveSha).put("entry", release)
+        val manifest = JSONObject().put("format", 1).put("packs", JSONArray(listOf(good, wrongSha, wrongId, good)))
+        val extra = EsyncPacks.parseExtras(manifest.toString().toByteArray()).single()
+        assertEquals(id, extra.id)
+        assertEquals(2, extra.rev)
+        assertEquals(archiveSha, extra.asset.sha256)
+        assertFalse(extra.revoked)
+        rejects { EsyncPacks.parseExtras(JSONObject(manifest.toString()).put("format", 2).toString().toByteArray()) }
+
+        val store = EsyncPacks.store(temp.newFolder("rootfs"))
+        val file = temp.newFile("extra.tzst").apply { writeBytes(archive) }
+        assertTrue(EsyncPacks.install(store, extra, file))
+        assertTrue(File(store, "packs/$id/${EsyncPacks.NTDLL}").canExecute())
+        assertEquals(setOf(id), EsyncPacks.installedIds(store))
+
+        val day = 24L * 60 * 60 * 1000
+        val index = EsyncPacks.parseIndex(indexBytes(1, entryJson(id, rev = 2, revoked = true)))
+        assertTrue(EsyncPacks.removeRevoked(store, index, setOf(id)).isEmpty())
+        val keep = EsyncPacks.keep(store, index, emptyList(), emptyList(), setOf(id))
+        assertTrue(EsyncPacks.prune(store, keep, System.currentTimeMillis() + 400 * day).isEmpty())
+        assertEquals(setOf(id), EsyncPacks.installedIds(store))
+        assertEquals(listOf(id), EsyncPacks.removeRevoked(store, index))
     }
 
     @Test fun entryPathAcceptsTheThreeFilesAndTheirDirectories() {

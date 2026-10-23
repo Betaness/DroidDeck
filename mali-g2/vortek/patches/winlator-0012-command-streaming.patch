@@ -1,0 +1,78 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 922edf6..0959ab3 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -1333,16 +1333,35 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
+     vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+ }
+ 
+-void vt_handle_vkEndCommandBuffer(VkContext* context) {
++/* [mali-g2] Replays a batch of recorded commands (uint64 command buffer id, then the commands, each
++ * an 8-byte header {requestCode, size} and its serialized arguments) into the command buffer. Shared
++ * by END_COMMAND_BUFFER and the client's command chunks (REQUEST_CODE_DD_CMD_CHUNK, sent while the
++ * application is still recording). Each command handler unserializes into context->memoryPool,
++ * which is reset after every request, so nothing may keep pointers into it across commands: the
++ * driver copies what it records and the texture decoder copies the regions it defers.
++ * A batch for a null command buffer id is dropped whole (replaying it would hand VK_NULL_HANDLE to
++ * every vkCmd*). Ids are the driver's handles, so a non-null id that is stale or unknown is not
++ * detected here, as before.
++ * Texture decoder (only created when the driver lacks textureCompressionBC; Mali-G2 has it): its
++ * deferred vkCmdCopyBufferToImage regions go on one per-context queue that the next vkQueueSubmit
++ * from any thread decodes and uploads, whatever command buffer recorded them. With streaming a copy
++ * reaches that queue when its chunk is replayed rather than at End, so it can be uploaded before
++ * this command buffer is ended or submitted, or even if it is reset or freed and never submitted.
++ * Set VORTEK_CMD_CHUNK=0 on devices where the decoder is active. */
++static VkCommandBuffer replayCommands(VkContext* context) {
+     int position = 0;
+     char* inputBuffer = context->inputBuffer;
++    int inputBufferSize = context->inputBufferSize;
++    if (inputBufferSize < VK_HANDLE_BYTE_COUNT) return VK_NULL_HANDLE;
+     uint64_t commandBufferId = *(uint64_t*)(inputBuffer);
+     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
++    if (commandBuffer == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+     position += VK_HANDLE_BYTE_COUNT;
+ 
+-    while (position < context->inputBufferSize) {
++    while (position + HEADER_SIZE <= inputBufferSize) {
+         int requestCode = *(int*)(inputBuffer + position + 0);
+         int size = *(int*)(inputBuffer + position + 4);
++        if (size < 0 || position + HEADER_SIZE + size > inputBufferSize) break;
+ 
+         context->inputBuffer = inputBuffer + position + HEADER_SIZE;
+         HandleRequestFunc handleRequestFunc = getHandleRequestFunc(requestCode);
+@@ -1357,9 +1376,26 @@ void vt_handle_vkEndCommandBuffer(VkContext* context) {
+         position += size + HEADER_SIZE;
+     }
+ 
+-    vulkanWrapper.vkEndCommandBuffer(commandBuffer);
++    return commandBuffer;
+ }
+ 
++void vt_handle_vkEndCommandBuffer(VkContext* context) {
++    VkCommandBuffer commandBuffer = replayCommands(context);
++    if (commandBuffer) vulkanWrapper.vkEndCommandBuffer(commandBuffer);
++}
++
++#ifdef VORTEK_STANDALONE
++/* REQUEST_CODE_DD_CMD_CHUNK (91): the commands recorded so far; the command buffer stays recording. */
++static void droiddeck_handleCmdChunk(VkContext* context) {
++    static bool warnedTextureDecoder = false;
++    if (context->textureDecoder && !warnedTextureDecoder) {
++        warnedTextureDecoder = true;
++        println("vortek: texture decoder active: BC copies in command chunks are queued before End (client VORTEK_CMD_CHUNK=0 avoids this)");
++    }
++    replayCommands(context);
++}
++#endif
++
+ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+     uint64_t commandBufferId;
+     VkCommandBufferResetFlags flags;
+@@ -3901,6 +3937,7 @@ extern void droiddeck_handlePresentZeroCopy(VkContext* context);
+ HandleRequestFunc getHandleRequestFunc(short requestCode) {
+ #ifdef VORTEK_STANDALONE
+     if (requestCode == 90) return droiddeck_handlePresentZeroCopy;
++    if (requestCode == 91) return droiddeck_handleCmdChunk;
+ #endif
+     int index = requestCode - REQUEST_CODE_VK_CALL_START;
+     return index >= 0 && index < REQUEST_CODE_VK_CALL_COUNT ? handleRequestFuncs[index] : NULL;

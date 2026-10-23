@@ -1,0 +1,31 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 908fac5..a3d741b 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -172,6 +172,26 @@ void vt_handle_vkCreateDevice(VkContext* context) {
+                      extraExtensions, ARRAY_SIZE(extraExtensions),
+                      globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions));
+ 
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] The serializer has no maintenance5/6 feature structs, so the client's
++     * request for them is lost on the wire: turn them on whenever the extension is. */
++    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
++    VkPhysicalDeviceMaintenance6FeaturesKHR maintenance6 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR};
++    for (uint32_t i = 0; i < createInfo.enabledExtensionCount; i++) {
++        const char* name = createInfo.ppEnabledExtensionNames[i];
++        if (strcmp(name, "VK_KHR_maintenance5") == 0 && !maintenance5.maintenance5) {
++            maintenance5.maintenance5 = VK_TRUE;
++            maintenance5.pNext = (void*)createInfo.pNext;
++            createInfo.pNext = &maintenance5;
++        }
++        else if (strcmp(name, "VK_KHR_maintenance6") == 0 && !maintenance6.maintenance6) {
++            maintenance6.maintenance6 = VK_TRUE;
++            maintenance6.pNext = (void*)createInfo.pNext;
++            createInfo.pNext = &maintenance6;
++        }
++    }
++#endif
++
+     VkDevice device;
+     VkResult result = vulkanWrapper.vkCreateDevice(physicalDevice, &createInfo, NULL, &device);
+     if (result == VK_SUCCESS) initVulkanDevice(context, physicalDevice, device);

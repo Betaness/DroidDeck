@@ -75,9 +75,36 @@ object SessionArtifacts {
             markScrubbed(scrubTree(record))
             SessionEvents.record("session.artifacts_collected", mapOf("reason" to reason), dir)
             File(dir, COMPLETE_MARKER).writeText("collected: $reason at ${now()}\n")
+            mirrorToExternal(context, dir)
         } catch (e: Exception) {
             Log.w(TAG, "collecting session artifacts", e)
         }
+    }
+
+    /**
+     * [mali-g2] Copy a finished, scrubbed session folder to getExternalFilesDir()/logs, where
+     * `adb shell` can read it (the app is not debuggable, so run-as cannot). Keeps the newest 5.
+     */
+    fun mirrorToExternal(context: Context, dir: File) {
+        try {
+            val base = File(context.getExternalFilesDir(null) ?: return, "logs").apply { mkdirs() }
+            val dest = File(base, dir.name)
+            dest.deleteRecursively()
+            dir.copyRecursively(dest, overwrite = true)
+            base.listFiles { f -> f.isDirectory }?.sortedByDescending { it.name }?.drop(5)?.forEach { it.deleteRecursively() }
+            Log.i(TAG, "session logs mirrored to $dest")
+        } catch (e: Exception) {
+            Log.w(TAG, "mirroring session logs", e)
+        }
+    }
+
+    /** [mali-g2] Mirror the newest finished session folders that are not mirrored yet (e.g. from before an update). */
+    fun mirrorRecent(context: Context) {
+        val base = context.getExternalFilesDir(null)?.let { File(it, "logs") }
+        LinuxRuntime.logDir(context).listFiles { f -> SessionPaths.isSessionFolder(f) && File(f, COMPLETE_MARKER).exists() }
+            ?.sortedByDescending { it.name }?.take(3)
+            ?.filter { base == null || !File(base, it.name).exists() }
+            ?.forEach { mirrorToExternal(context, it) }
     }
 
     @Synchronized
@@ -216,6 +243,46 @@ object SessionArtifacts {
             }
         }
         Log.i(TAG, "collected ${out.listFiles()?.size ?: 0} Steam log(s), scrubbed, into $out")
+        copyGameLogs(context, logs.parentFile ?: return, dir, record)
+    }
+
+    /**
+     * [mali-g2] Game-side logs from this session, for bring-up on new GPUs: Proton's
+     * ~/steam-<appid>.log, Unity Player.log / crash folders and DXVK/VKD3D logs written in the
+     * last hours. Scrubbed like the Steam logs; each file capped at 4 MiB, 40 files in total.
+     */
+    private fun copyGameLogs(context: Context, steamRoot: File, dir: File, record: Record) {
+        val since = System.currentTimeMillis() - 6L * 3600 * 1000
+        val out = File(dir, "game").apply { mkdirs() }
+        val found = ArrayList<File>()
+        fun wanted(f: File): Boolean {
+            val n = f.name
+            return f.isFile && f.lastModified() >= since && f.length() in 1..(4L * 1024 * 1024) &&
+                (n.startsWith("steam-") && n.endsWith(".log") || n == "Player.log" || n == "Player-prev.log" ||
+                    n == "error.log" || n.endsWith("_d3d11.log") || n.endsWith("_d3d9.log") ||
+                    n.endsWith("_dxgi.log") || n.endsWith("_d3d12.log") || n.endsWith("_d3d10core.log"))
+        }
+        fun walk(d: File, depth: Int) {
+            if (found.size >= 40 || depth < 0) return
+            d.listFiles()?.forEach { f ->
+                if (found.size >= 40) return
+                if (f.isDirectory) { if (!java.nio.file.Files.isSymbolicLink(f.toPath())) walk(f, depth - 1) }
+                else if (wanted(f)) found.add(f)
+            }
+        }
+        LinuxRuntime.rootDir(context).let { root -> File(root, "root").listFiles()?.filter { wanted(it) }?.let { found.addAll(it) } }
+        walk(File(steamRoot, "steamapps/common"), 5)
+        File(steamRoot, "steamapps/compatdata").listFiles()?.forEach { walk(File(it, "pfx/drive_c/users/steamuser/AppData/LocalLow"), 4) }
+        found.forEachIndexed { i, src ->
+            try {
+                val dst = File(out, "%02d-%s-%s".format(i, src.parentFile?.name ?: "", src.name))
+                dst.bufferedWriter().use { w -> src.forEachLine { line -> w.write(LogRedactor.redact(line)); w.newLine() } }
+                record.files[dst] = Scrubbed(dst.length(), dst.lastModified())
+            } catch (e: Exception) {
+                Log.w(TAG, "could not copy ${src.path}", e)
+            }
+        }
+        Log.i(TAG, "collected ${found.size} game log(s) into $out")
     }
 
     @Synchronized

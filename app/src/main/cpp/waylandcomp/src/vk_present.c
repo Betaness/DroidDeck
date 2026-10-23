@@ -1807,6 +1807,19 @@ int vkp_map_draw(const struct vkp_draw *d, int out[8]) {
     return 1;
 }
 
+/* [mali-g2] Maps a buf_w x buf_h buffer shown over the scene rectangle x,y,w,h through the current
+ * output mapping, cropping the source where the window leaves the scene or the screen. */
+int vkp_map_window(int buf_w, int buf_h, int x, int y, int w, int h, int scene_w, int scene_h, int out[8]) {
+    if (!g_map.valid || w <= 0 || h <= 0 || buf_w <= 0 || buf_h <= 0) return 0;
+    struct vkp_image tmp = {.w = buf_w, .h = buf_h};
+    const float fx = (float)buf_w / w, fy = (float)buf_h / h;
+    const int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    const int x1 = x + w > scene_w ? scene_w : x + w, y1 = y + h > scene_h ? scene_h : y + h;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    struct vkp_draw d = {&tmp, (x0 - x) * fx, (y0 - y) * fy, (x1 - x0) * fx, (y1 - y0) * fy, x0, y0, x1 - x0, y1 - y0, 0};
+    return vkp_map_draw(&d, out);
+}
+
 int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
     if (!src || !dst || !dst->blit_dst || g_dev_state == -2 || dev_init() != 0) {
         if (wait_fd >= 0) close(wait_fd);

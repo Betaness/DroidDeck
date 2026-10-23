@@ -51,6 +51,7 @@ object SessionFiles {
             "usr/local/bin/droiddeck-session" to "usr/local/bin/droiddeck-session",
             "usr/local/bin/droiddeck-fonts" to "usr/local/bin/droiddeck-fonts",
             "usr/local/bin/droiddeck-agent" to "usr/local/bin/droiddeck-agent",
+            "usr/local/bin/droiddeck-vortek-focus" to "usr/local/bin/droiddeck-vortek-focus",
             "usr/local/bin/steam-compatibility" to "usr/local/bin/steam-compatibility",
             "usr/local/bin/droiddeck-clipboard" to "usr/local/bin/droiddeck-clipboard",
             "usr/local/bin/droiddeck-desktop-clipboard" to "usr/local/bin/droiddeck-desktop-clipboard",
@@ -136,12 +137,18 @@ object SessionFiles {
         val fexPreloads = listOf("x86_64", "i386").flatMap { arch ->
             listOf("libblsession.so", "libfakeinput.so", "libfaultreport.so").map { "$arch/$it" to "usr/local/lib/droiddeck-fex/$arch/$it" }
         } + listOf("libvulkan-thunk.so", "libwebkitinput.so").map { "x86_64/$it" to "usr/local/lib/droiddeck-fex/x86_64/$it" }
+        // [mali-g2] Vortek's guest ICD (mali-g2/vortek), used with VortekServerComponent on Mali.
+        val vortek = (listOf("libvulkan_vortek.so", "vortek_icd.aarch64.json").map { "usr/local/lib/droiddeck-vortek/$it" } +
+            listOf("LGPL-2.1", "NOTICE").map { "usr/local/share/licenses/droiddeck-vortek/$it" }).map { it to it }
+        // [mali-g2] MaliBridge's guest ICD, for BL_VK_BRIDGE=malibridge (MaliBridgeComponent).
+        val maliBridge = listOf("usr/local/lib/vkbridge/libvulkan_droidbridge.so", "usr/local/share/vkbridge/droidbridge_icd.json",
+            "usr/local/share/licenses/malibridge/NOTICE", "usr/local/share/licenses/malibridge/GPL-3").map { it to it }
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/lib/droiddeck-pipewire.tzst" to "usr/local/lib/droiddeck-pipewire.tzst",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads).filter { (asset, _) ->
+        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads + vortek + maliBridge).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }

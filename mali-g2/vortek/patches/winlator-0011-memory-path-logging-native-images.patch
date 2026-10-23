@@ -1,0 +1,494 @@
+diff --git a/app/src/main/cpp/vortekrenderer/include/resource_memory.h b/app/src/main/cpp/vortekrenderer/include/resource_memory.h
+index 1f8a05f..a628ad1 100644
+--- a/app/src/main/cpp/vortekrenderer/include/resource_memory.h
++++ b/app/src/main/cpp/vortekrenderer/include/resource_memory.h
+@@ -12,15 +12,33 @@ typedef enum ResourceMemoryType {
+     RESOURCE_MEMORY_TYPE_AHARDWAREBUFFER
+ } ResourceMemoryType;
+ 
++/* Buffer usage of the exportable VkBuffer the OPAQUE_FD path creates; also used for the
++ * VkPhysicalDeviceExternalBufferInfo capability query (vulkan_helper.c), where usage 0 is invalid. */
++#define RESOURCE_MEMORY_BUFFER_USAGE (VK_BUFFER_USAGE_TRANSFER_SRC_BIT | \
++                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT | \
++                                      VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | \
++                                      VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | \
++                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | \
++                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | \
++                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | \
++                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | \
++                                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)
++
+ typedef struct ResourceMemory {
+     int fd;
+     AHardwareBuffer* hardwareBuffer;
+     VkBuffer buffer;
+     VkDeviceMemory memory;
+     VkDeviceSize allocationSize;
++    bool nativeImage; /* [mali-g2] VORTEK_NATIVE_IMAGES: plain vkAllocateMemory, not mappable (fd -1) */
+ } ResourceMemory;
+ 
+ extern ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkMemoryAllocateInfo* memoryInfo);
+ extern void ResourceMemory_free(VkContext* context, VkDevice device, ResourceMemory* resourceMemory);
+ 
++/* [mali-g2] VORTEK_NATIVE_IMAGES: process-wide, thread-safe set of VK_IMAGE_TILING_OPTIMAL images. */
++extern void ResourceMemory_trackImage(VkDevice device, VkImage image, VkImageTiling tiling);
++extern void ResourceMemory_untrackImage(VkImage image);
++extern void ResourceMemory_untrackDevice(VkDevice device);
++
+ #endif
+diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+index a3b4886..f8d42cf 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
++++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+@@ -19,6 +19,7 @@ typedef struct VkContext {
+ 
+     bool hasExternalMemoryFd;
+     bool hasExternalMemoryDMABuf;
++    bool nativeImages; /* [mali-g2] VORTEK_NATIVE_IMAGES: dedicated optimal-image memory via plain vkAllocateMemory */
+ 
+ #if ENABLE_VALIDATION_LAYER
+     VkDebugReportCallbackEXT debugReportCallback;
+@@ -60,6 +61,7 @@ typedef struct VortekOptions {
+     short maxDeviceMemory;
+     short imageCacheSize;
+     uint8_t resourceMemoryType;
++    bool nativeImages;                  /* VORTEK_NATIVE_IMAGES=1 (experimental, default off) */
+     ArrayList* exposedDeviceExtensions; /* NULL = expose all */
+ } VortekOptions;
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 2a4f7bd..922edf6 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -207,6 +207,7 @@ void vt_handle_vkDestroyDevice(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+ 
+     AsyncPipelineCreator_destroyDevice(device);
++    if (context->nativeImages) ResourceMemory_untrackDevice(device);
+     vulkanWrapper.vkDestroyDevice(device, NULL);
+ }
+ 
+@@ -353,7 +354,16 @@ void vt_handle_vkMapMemory(VkContext* context) {
+     vt_unserialize_VkDeviceMemory((VkDeviceMemory)&memoryId, context->inputBuffer, &context->memoryPool);
+     ResourceMemory* resourceMemory = VkObject_fromId(memoryId);
+ 
+-    VkResult result = resourceMemory->fd != -1 ? VK_SUCCESS : VK_ERROR_MEMORY_MAP_FAILED;
++    /* [mali-g2] memory without an fd (not host visible, or a VORTEK_NATIVE_IMAGES dedicated
++     * image allocation): SCM_RIGHTS with fd -1 makes sendmsg fail with EBADF and the client
++     * would block forever in recv_fds. Send the result without an fd instead. */
++    if (!resourceMemory || resourceMemory->fd < 0) {
++        VkResult result = VK_ERROR_MEMORY_MAP_FAILED;
++        send(context->clientFd, &result, sizeof(VkResult), MSG_NOSIGNAL); /* no SCM_RIGHTS: client sees numFds 0 */
++        return;
++    }
++
++    VkResult result = VK_SUCCESS;
+     send_fds(context->clientFd, &resourceMemory->fd, 1, &result, sizeof(VkResult));
+ }
+ 
+@@ -848,6 +858,8 @@ void vt_handle_vkCreateImage(VkContext* context) {
+     }
+     else result = vulkanWrapper.vkCreateImage(device, &createInfo, NULL, &image);
+ 
++    if (result == VK_SUCCESS && context->nativeImages) ResourceMemory_trackImage(device, image, createInfo.tiling);
++
+     VT_SERIALIZE_CMD(VkImage, image);
+     vt_send(context->clientRing, result, outputBuffer, bufferSize);
+ }
+@@ -860,6 +872,8 @@ void vt_handle_vkDestroyImage(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkImage image = VkObject_fromId(imageId);
+ 
++    if (context->nativeImages) ResourceMemory_untrackImage(image);
++
+     if (context->textureDecoder && TextureDecoder_containsImage(context->textureDecoder, image)) {
+         TextureDecoder_destroyImage(context->textureDecoder, image);
+     }
+@@ -2326,7 +2340,14 @@ void vt_handle_vkGetMemoryFdKHR(VkContext* context) {
+     vt_unserialize_VkDeviceMemory((VkDeviceMemory)&memoryId, context->inputBuffer, &context->memoryPool);
+     ResourceMemory* resourceMemory = VkObject_fromId(memoryId);
+ 
+-    VkResult result = resourceMemory->fd != -1 ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
++    /* [mali-g2] same as vkMapMemory: never put fd -1 into SCM_RIGHTS */
++    if (!resourceMemory || resourceMemory->fd < 0) {
++        VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
++        send(context->clientFd, &result, sizeof(VkResult), MSG_NOSIGNAL); /* no SCM_RIGHTS: client sees numFds 0 */
++        return;
++    }
++
++    VkResult result = VK_SUCCESS;
+     send_fds(context->clientFd, &resourceMemory->fd, 1, &result, sizeof(VkResult));
+ }
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/resource_memory.c b/app/src/main/cpp/vortekrenderer/src/resource_memory.c
+index 86012d1..29e04cc 100644
+--- a/app/src/main/cpp/vortekrenderer/src/resource_memory.c
++++ b/app/src/main/cpp/vortekrenderer/src/resource_memory.c
+@@ -28,6 +28,149 @@ static AHardwareBuffer* allocateHardwareBuffer(int size) {
+     return hardwareBuffer;
+ }
+ 
++/* [mali-g2] Which allocation path ResourceMemory_allocate took. Each path is logged
++ * once per process (first success and first failure) so the logs show what the vendor
++ * driver actually accepts; the capability query alone does not tell. */
++enum {
++    MEMORY_PATH_OPAQUE_FD,
++    MEMORY_PATH_DMABUF,
++    MEMORY_PATH_AHB,
++    MEMORY_PATH_AHB_FALLBACK,
++    MEMORY_PATH_PLAIN,
++    MEMORY_PATH_NATIVE_IMAGE,
++    MEMORY_PATH_COUNT
++};
++
++static const char* const memoryPathNames[MEMORY_PATH_COUNT] = {
++    "opaque_fd (export)",
++    "dmabuf (import)",
++    "ahb (import, no dmabuf)",
++    "ahb fallback after dmabuf failure",
++    "plain (not host visible)",
++    "native image (plain, dedicated optimal image)"
++};
++
++static int memoryPathLogged[MEMORY_PATH_COUNT];
++static int memoryPathFailLogged[MEMORY_PATH_COUNT];
++
++static void memoryFlagsToString(uint32_t flags, char* out, size_t size) {
++    snprintf(out, size, "%s%s%s%s%s%s",
++             flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "DL|" : "",
++             flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "HV|" : "",
++             flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? "HC|" : "",
++             flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "HCACHED|" : "",
++             flags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT ? "LAZY|" : "",
++             flags & VK_MEMORY_PROPERTY_PROTECTED_BIT ? "PROT|" : "");
++    size_t len = strlen(out);
++    if (len > 0) out[len - 1] = '\0';
++    else snprintf(out, size, "none");
++}
++
++static void logMemoryPath(int path, VkResult result, uint32_t requestedTypeIndex, uint32_t typeIndex, VkDeviceSize size) {
++    int* logged = result == VK_SUCCESS ? &memoryPathLogged[path] : &memoryPathFailLogged[path];
++    if (__atomic_exchange_n(logged, 1, __ATOMIC_RELAXED)) return;
++
++    char flags[64];
++    memoryFlagsToString(getMemoryPropertyFlags(typeIndex), flags, sizeof(flags));
++    if (result == VK_SUCCESS) {
++        println("vortek: memory path %s: first allocation ok, type %u (requested %u) flags 0x%x [%s], %llu bytes",
++                memoryPathNames[path], typeIndex, requestedTypeIndex, getMemoryPropertyFlags(typeIndex), flags, (unsigned long long)size);
++    }
++    else {
++        println("vortek: memory path %s: first FAILURE (VkResult %d), type %u (requested %u) flags 0x%x [%s], %llu bytes",
++                memoryPathNames[path], result, typeIndex, requestedTypeIndex, getMemoryPropertyFlags(typeIndex), flags, (unsigned long long)size);
++    }
++}
++
++/* ---- [mali-g2] VORTEK_NATIVE_IMAGES: optimal-tiling image set ---- */
++
++static pthread_mutex_t optimalImagesLock = PTHREAD_MUTEX_INITIALIZER;
++static SparseArray64 optimalImages = {0}; /* key: VkImage, value: owning VkDevice */
++static uint32_t nativeImageAllocations = 0;
++static uint32_t nativeImageLive = 0;
++static uint64_t nativeImageBytesLive = 0;
++static uint64_t nativeImageBytesTotal = 0;
++
++void ResourceMemory_trackImage(VkDevice device, VkImage image, VkImageTiling tiling) {
++    if (!image || tiling != VK_IMAGE_TILING_OPTIMAL) return;
++    pthread_mutex_lock(&optimalImagesLock);
++    SparseArray64_put(&optimalImages, (int64_t)image, device);
++    pthread_mutex_unlock(&optimalImagesLock);
++}
++
++void ResourceMemory_untrackImage(VkImage image) {
++    if (!image) return;
++    pthread_mutex_lock(&optimalImagesLock);
++    SparseArray64_remove(&optimalImages, (int64_t)image);
++    pthread_mutex_unlock(&optimalImagesLock);
++}
++
++void ResourceMemory_untrackDevice(VkDevice device) {
++    pthread_mutex_lock(&optimalImagesLock);
++    for (int i = optimalImages.size - 1; i >= 0; i--) {
++        if (optimalImages.entries[i].value == (void*)device) SparseArray64_removeAt(&optimalImages, i);
++    }
++    pthread_mutex_unlock(&optimalImagesLock);
++}
++
++static bool isOptimalImage(VkImage image) {
++    pthread_mutex_lock(&optimalImagesLock);
++    bool found = SparseArray64_get(&optimalImages, (int64_t)image) != NULL;
++    pthread_mutex_unlock(&optimalImagesLock);
++    return found;
++}
++
++static VkResult allocateNativeImageMemory(VkContext* context, VkDevice device, VkMemoryAllocateInfo* memoryInfo, ResourceMemory* resourceMemory) {
++    /* Keep the client's memory type and rebuild pNext from copies of the structs that are
++     * safe to forward (dedicated image, allocate flags, opaque capture address): the driver
++     * gets a normal dedicated image allocation. Import/export structs never get here (see
++     * ResourceMemory_allocate), and a client fd number must never reach the driver.
++     * The memory is never exported, so vkMapMemory reports VK_ERROR_MEMORY_MAP_FAILED. */
++    VkMemoryDedicatedAllocateInfo dedicatedInfo = {0};
++    VkMemoryAllocateFlagsInfo flagsInfo = {0};
++    VkMemoryOpaqueCaptureAddressAllocateInfo captureInfo = {0};
++    void* pNext = NULL;
++
++    VkMemoryOpaqueCaptureAddressAllocateInfo* clientCapture = findNextVkStructure((void*)memoryInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
++    if (clientCapture) {
++        captureInfo = *clientCapture;
++        captureInfo.pNext = pNext;
++        pNext = &captureInfo;
++    }
++    VkMemoryAllocateFlagsInfo* clientFlags = findNextVkStructure((void*)memoryInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
++    if (clientFlags) {
++        flagsInfo = *clientFlags;
++        flagsInfo.pNext = pNext;
++        pNext = &flagsInfo;
++    }
++    VkMemoryDedicatedAllocateInfo* clientDedicated = findNextVkStructure((void*)memoryInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
++    dedicatedInfo = *clientDedicated;
++    dedicatedInfo.pNext = pNext;
++    pNext = &dedicatedInfo;
++
++    VkMemoryAllocateInfo allocateInfo = *memoryInfo;
++    allocateInfo.pNext = pNext;
++    VkResult result = vulkanWrapper.vkAllocateMemory(device, &allocateInfo, NULL, &resourceMemory->memory);
++    logMemoryPath(MEMORY_PATH_NATIVE_IMAGE, result, memoryInfo->memoryTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++    if (result != VK_SUCCESS) return result;
++
++    resourceMemory->nativeImage = true;
++    pthread_mutex_lock(&optimalImagesLock);
++    uint32_t count = ++nativeImageAllocations;
++    nativeImageLive++;
++    nativeImageBytesLive += memoryInfo->allocationSize;
++    nativeImageBytesTotal += memoryInfo->allocationSize;
++    uint32_t live = nativeImageLive;
++    uint64_t bytesLive = nativeImageBytesLive, bytesTotal = nativeImageBytesTotal;
++    pthread_mutex_unlock(&optimalImagesLock);
++
++    if (count == 1 || (count % 64) == 0) {
++        println("vortek: native image allocations: %u total (%.1f MiB), %u live (%.1f MiB)",
++                count, bytesTotal / 1048576.0, live, bytesLive / 1048576.0);
++    }
++    return VK_SUCCESS;
++}
++
+ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkMemoryAllocateInfo* memoryInfo) {
+     uint64_t maxAllocationSize = (VkDeviceSize)context->maxDeviceMemory << 20;
+     if (maxAllocationSize == 0) maxAllocationSize = deviceMemoryInfo.maxAllocationSize;
+@@ -35,7 +178,20 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+ 
+     VkResult result;
+     ResourceMemory* resourceMemory = internalAllocate();
+-    if (isHostVisibleMemory(memoryInfo->memoryTypeIndex)) {
++    uint32_t requestedTypeIndex = memoryInfo->memoryTypeIndex;
++
++    VkMemoryDedicatedAllocateInfo* dedicatedInfo = context->nativeImages ? findNextVkStructure((void*)memoryInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) : NULL;
++    /* Memory the client wants to import (VkImportMemoryFdInfoKHR carries a client fd number)
++     * or export (VkExportMemoryAllocateInfo needs resourceMemory->fd) keeps the external path. */
++    if (dedicatedInfo && (findNextVkStructure((void*)memoryInfo->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) ||
++                          findNextVkStructure((void*)memoryInfo->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO))) {
++        dedicatedInfo = NULL;
++    }
++    if (dedicatedInfo && dedicatedInfo->image != VK_NULL_HANDLE && isOptimalImage(dedicatedInfo->image)) {
++        result = allocateNativeImageMemory(context, device, memoryInfo, resourceMemory);
++        if (result != VK_SUCCESS) goto error;
++    }
++    else if (isHostVisibleMemory(memoryInfo->memoryTypeIndex)) {
+         bool hasExternalMemoryFd = context->hasExternalMemoryFd;
+         bool hasExternalMemoryDMABuf = context->hasExternalMemoryDMABuf;
+ 
+@@ -63,19 +219,14 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+             bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+             bufferInfo.pNext = &externalMemoryBufferInfo;
+             bufferInfo.size = memoryInfo->allocationSize;
+-            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+-                               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+-                               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+-                               VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+-                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+-                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+-                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+-                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+-                               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
++            bufferInfo.usage = RESOURCE_MEMORY_BUFFER_USAGE;
+             bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+ 
+             result = vulkanWrapper.vkCreateBuffer(device, &bufferInfo, NULL, &resourceMemory->buffer);
+-            if (result != VK_SUCCESS) goto error;
++            if (result != VK_SUCCESS) {
++                logMemoryPath(MEMORY_PATH_OPAQUE_FD, result, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++                goto error;
++            }
+ 
+             VkMemoryRequirements memReqs = {0};
+             vulkanWrapper.vkGetBufferMemoryRequirements(device, resourceMemory->buffer, &memReqs);
+@@ -93,7 +244,10 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+             memoryInfo->pNext = &memoryDedicatedInfo;
+             memoryInfo->allocationSize = memReqs.size;
+             result = vulkanWrapper.vkAllocateMemory(device, memoryInfo, NULL, &resourceMemory->memory);
+-            if (result != VK_SUCCESS) goto error;
++            if (result != VK_SUCCESS) {
++                logMemoryPath(MEMORY_PATH_OPAQUE_FD, result, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++                goto error;
++            }
+ 
+             VkMemoryGetFdInfoKHR getFdInfo = {0};
+             getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+@@ -102,8 +256,12 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+ 
+             int fd = -1;
+             result = vulkanWrapper.vkGetMemoryFd(device, &getFdInfo, &fd);
+-            if (result != VK_SUCCESS || fd <= 0) goto error;
++            if (result != VK_SUCCESS || fd <= 0) {
++                logMemoryPath(MEMORY_PATH_OPAQUE_FD, result != VK_SUCCESS ? result : VK_ERROR_INVALID_EXTERNAL_HANDLE, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++                goto error;
++            }
+             resourceMemory->fd = fd;
++            logMemoryPath(MEMORY_PATH_OPAQUE_FD, VK_SUCCESS, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
+         }
+         else {
+             if ((getMemoryPropertyFlags(memoryInfo->memoryTypeIndex) & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+@@ -122,6 +280,7 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+ 
+                     memoryInfo->pNext = &memoryImportInfo;
+                     result = vulkanWrapper.vkAllocateMemory(device, memoryInfo, NULL, &resourceMemory->memory);
++                    logMemoryPath(MEMORY_PATH_DMABUF, result, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
+                     if (result == VK_SUCCESS) {
+                         resourceMemory->fd = fd;
+                     }
+@@ -131,16 +290,26 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+                         useExternalMemoryAHB = true;
+                     }
+                 }
+-                else useExternalMemoryAHB = true;
++                else {
++                    logMemoryPath(MEMORY_PATH_DMABUF, VK_ERROR_OUT_OF_DEVICE_MEMORY, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++                    useExternalMemoryAHB = true;
++                }
+             }
+ 
+             if (useExternalMemoryAHB) {
++                int ahbPath = hasExternalMemoryDMABuf ? MEMORY_PATH_AHB_FALLBACK : MEMORY_PATH_AHB;
+                 AHardwareBuffer* hardwareBuffer = allocateHardwareBuffer(memoryInfo->allocationSize);
+-                if (!hardwareBuffer) goto error;
++                if (!hardwareBuffer) {
++                    logMemoryPath(ahbPath, VK_ERROR_OUT_OF_HOST_MEMORY, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++                    goto error;
++                }
+                 resourceMemory->hardwareBuffer = hardwareBuffer;
+ 
+                 int fd = AHardwareBuffer_getFd(hardwareBuffer);
+-                if (fd <= 0) goto error;
++                if (fd <= 0) {
++                    logMemoryPath(ahbPath, VK_ERROR_INVALID_EXTERNAL_HANDLE, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
++                    goto error;
++                }
+ 
+                 VkImportAndroidHardwareBufferInfoANDROID memoryImportInfo = {0};
+                 memoryImportInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+@@ -148,6 +317,7 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+ 
+                 memoryInfo->pNext = &memoryImportInfo;
+                 result = vulkanWrapper.vkAllocateMemory(device, memoryInfo, NULL, &resourceMemory->memory);
++                logMemoryPath(ahbPath, result, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
+                 if (result != VK_SUCCESS) goto error;
+                 resourceMemory->fd = fd;
+             }
+@@ -155,6 +325,7 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
+     }
+     else {
+         result = vulkanWrapper.vkAllocateMemory(device, memoryInfo, NULL, &resourceMemory->memory);
++        logMemoryPath(MEMORY_PATH_PLAIN, result, requestedTypeIndex, memoryInfo->memoryTypeIndex, memoryInfo->allocationSize);
+         if (result != VK_SUCCESS) goto error;
+     }
+ 
+@@ -176,6 +347,14 @@ void ResourceMemory_free(VkContext* context, VkDevice device, ResourceMemory* re
+     }
+ 
+     CLOSEFD(resourceMemory->fd);
++    if (resourceMemory->nativeImage) {
++        pthread_mutex_lock(&optimalImagesLock);
++        if (nativeImageLive > 0) nativeImageLive--;
++        nativeImageBytesLive = nativeImageBytesLive > resourceMemory->allocationSize ? nativeImageBytesLive - resourceMemory->allocationSize : 0;
++        pthread_mutex_unlock(&optimalImagesLock);
++        resourceMemory->nativeImage = false;
++    }
++
+     if (resourceMemory->memory) {
+         vulkanWrapper.vkFreeMemory(device, resourceMemory->memory, NULL);
+         resourceMemory->memory = VK_NULL_HANDLE;
+diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+index fc2802f..c160647 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
++++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+@@ -119,6 +119,7 @@ VkContext* createVkContext(int clientFd, const VortekOptions* options) {
+     context->maxDeviceMemory = options->maxDeviceMemory;
+     context->imageCacheSize = options->imageCacheSize;
+     context->resourceMemoryType = options->resourceMemoryType;
++    context->nativeImages = options->nativeImages;
+     context->exposedDeviceExtensions = options->exposedDeviceExtensions ? ArrayList_fromStrings((const char**)options->exposedDeviceExtensions->elements, options->exposedDeviceExtensions->size) : NULL;
+ 
+     pthread_mutex_init(&context->extraDataRequestsMutex, NULL);
+diff --git a/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c b/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
+index bd2f6f6..5823b81 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
++++ b/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
+@@ -14,20 +14,45 @@ static VkBool32 debugReportCallback(VkDebugReportFlagsEXT flags, VkDebugReportOb
+ }
+ #endif
+ 
+-static bool isExternalMemoryHandleTypeSupported(VkPhysicalDevice physicalDevice, VkExternalMemoryHandleTypeFlagBits handleType) {
++/* [mali-g2] usage must be a valid, non-zero VkBufferUsageFlags (VUID-VkPhysicalDeviceExternalBufferInfo-None-09499);
++ * upstream passed 0, so the answer was undefined. Query with the usage the OPAQUE_FD path creates its buffer with. */
++static bool isExternalMemoryHandleTypeSupported(VkPhysicalDevice physicalDevice, VkExternalMemoryHandleTypeFlagBits handleType, VkBufferUsageFlags usage, VkExternalMemoryProperties* outProperties) {
+     VkPhysicalDeviceExternalBufferInfo bufferInfo = {0};
+     bufferInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
++    bufferInfo.usage = usage;
+     bufferInfo.handleType = handleType;
+ 
+     VkExternalBufferProperties bufferProperties = {0};
+     bufferProperties.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
+     vulkanWrapper.vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, &bufferInfo, &bufferProperties);
+     VkExternalMemoryProperties* memoryProperties = &bufferProperties.externalMemoryProperties;
++    if (outProperties) *outProperties = *memoryProperties;
+ 
+     return (memoryProperties->externalMemoryFeatures & (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) != 0 &&
+            (memoryProperties->compatibleHandleTypes & handleType) != 0;
+ }
+ 
++static void logExternalMemoryCaps(VkContext* context, VkPhysicalDevice physicalDevice, const VkExternalMemoryProperties* fdProperties, const VkExternalMemoryProperties* dmabufProperties) {
++    static int logged = 0;
++    if (__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) return;
++
++    /* What the old (invalid) usage-0 query answered, for comparison only. */
++    bool legacyFd = isExternalMemoryHandleTypeSupported(physicalDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, 0, NULL);
++    bool legacyDMABuf = isExternalMemoryHandleTypeSupported(physicalDevice, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, 0, NULL);
++
++    /* println() formats through a 256-byte buffer: keep each format string short. */
++    println("vortek: external memory caps (buffer usage 0x%x): hasExternalMemoryFd=%d (features 0x%x compatible 0x%x)",
++            RESOURCE_MEMORY_BUFFER_USAGE, context->hasExternalMemoryFd, fdProperties->externalMemoryFeatures, fdProperties->compatibleHandleTypes);
++    println("vortek: external memory caps (buffer usage 0x%x): hasExternalMemoryDMABuf=%d (features 0x%x compatible 0x%x)",
++            RESOURCE_MEMORY_BUFFER_USAGE, context->hasExternalMemoryDMABuf, dmabufProperties->externalMemoryFeatures, dmabufProperties->compatibleHandleTypes);
++    println("vortek: external memory caps: old invalid usage-0 query said fd=%d dmabuf=%d", legacyFd, legacyDMABuf);
++
++    static const char* const typeNames[] = {"auto", "opaque_fd", "dma_buf", "ahardwarebuffer"};
++    int type = context->resourceMemoryType;
++    println("vortek: host-visible memory: resource memory type option %d (%s), native images %s",
++            type, type >= 0 && type < (int)ARRAY_SIZE(typeNames) ? typeNames[type] : "?", context->nativeImages ? "ON (VORTEK_NATIVE_IMAGES=1)" : "off");
++}
++
+ static void setupExposedDeviceExtensions(VkContext* context) {
+     if (!context->engineName) return;
+ 
+@@ -101,8 +126,10 @@ void initVulkanInstance(VkContext* context, VkInstance instance, const VkApplica
+     vulkanWrapper.vkGetPhysicalDeviceProperties2(physicalDevices[0], &properties2);
+     context->driverID = driverProperties.driverID;
+ 
+-    context->hasExternalMemoryFd = isExternalMemoryHandleTypeSupported(physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+-    context->hasExternalMemoryDMABuf = isExternalMemoryHandleTypeSupported(physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
++    VkExternalMemoryProperties fdProperties = {0}, dmabufProperties = {0};
++    context->hasExternalMemoryFd = isExternalMemoryHandleTypeSupported(physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, RESOURCE_MEMORY_BUFFER_USAGE, &fdProperties);
++    context->hasExternalMemoryDMABuf = isExternalMemoryHandleTypeSupported(physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, RESOURCE_MEMORY_BUFFER_USAGE, &dmabufProperties);
++    logExternalMemoryCaps(context, physicalDevices[0], &fdProperties, &dmabufProperties);
+ 
+     MEMFREE(context->engineName);
+     context->engineVersion = 0;
