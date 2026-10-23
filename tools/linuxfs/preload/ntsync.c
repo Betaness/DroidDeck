@@ -68,12 +68,13 @@ struct ns_wait_args {
 #define NS_PROCS 256u
 #define NS_FDS 65536
 #define NS_DEVS 8
-#define NS_VERSION 1u
+#define NS_VERSION 2u
 #define NS_HEAD_MAGIC 0x31434e5953544e44ull
 #define NS_DEV_MAGIC 0x4e54445600000000ull
 #define NS_OBJ_MAGIC 0x27ull
 #define NS_WAITERS 0x80000000u
 #define NS_SWEEP_NS 2000000000ull
+#define NS_SPIN_NS 4000ull
 #define NS_DEAD 0xffffffffu
 
 #ifndef CLOSE_RANGE_CLOEXEC
@@ -144,6 +145,7 @@ struct ns_q {
   uint32_t waiting;
   uint32_t inuse;
   uint32_t next_free;
+  uint32_t sleeping;
   struct ns_ent ent[NS_ENTS];
 };
 
@@ -255,19 +257,104 @@ static void ns_unlock(uint32_t *w) {
   }
 }
 
-static void ns_block(sigset_t *old) {
-  sigset_t s;
-  sigfillset(&s);
-  sigdelset(&s, SIGSEGV);
-  sigdelset(&s, SIGBUS);
-  sigdelset(&s, SIGILL);
-  sigdelset(&s, SIGFPE);
-  sigdelset(&s, SIGTRAP);
-  pthread_sigmask(SIG_BLOCK, &s, old);
+#define NS_DEFER 4
+
+struct ns_cs {
+  int depth;
+  int count;
+  int sigs[NS_DEFER];
+  siginfo_t info[NS_DEFER];
+};
+
+static __thread struct ns_cs ns_cs;
+static uintptr_t ns_handlers[_NSIG];
+static uint8_t ns_siginfo[_NSIG];
+
+int bl_from_ntdll(const void *caller) __attribute__((visibility("hidden")));
+
+static int ns_deferrable(int sig) {
+  return sig > 0 && sig < _NSIG && sig != SIGKILL && sig != SIGSTOP && sig != SIGSEGV && sig != SIGBUS && sig != SIGILL
+         && sig != SIGFPE && sig != SIGTRAP && sig != SIGSYS;
 }
 
-static void ns_restore(const sigset_t *old) {
-  pthread_sigmask(SIG_SETMASK, old, NULL);
+static int ns_defer(int sig, const siginfo_t *si) {
+  struct ns_cs *cs = &ns_cs;
+  if (sig < SIGRTMIN)
+    for (int i = 0; i < cs->count; i++)
+      if (cs->sigs[i] == sig) return 1;
+  if (cs->count >= NS_DEFER) return 0;
+  cs->sigs[cs->count] = sig;
+  if (si) memcpy(&cs->info[cs->count], si, sizeof(*si));
+  else memset(&cs->info[cs->count], 0, sizeof(*si));
+  cs->count++;
+  return 1;
+}
+
+static void ns_trampoline(int sig, siginfo_t *si, void *uc) {
+  if (__atomic_load_n(&ns_cs.depth, __ATOMIC_RELAXED) > 0 && ns_defer(sig, si)) return;
+  uintptr_t h = __atomic_load_n(&ns_handlers[sig], __ATOMIC_ACQUIRE);
+  if (!h) return;
+  if (__atomic_load_n(&ns_siginfo[sig], __ATOMIC_RELAXED)) ((void (*)(int, siginfo_t *, void *))h)(sig, si, uc);
+  else ((void (*)(int))h)(sig);
+}
+
+static void ns_flush(void) {
+  struct ns_cs *cs = &ns_cs;
+  int n = cs->count, sigs[NS_DEFER];
+  siginfo_t info[NS_DEFER];
+  memcpy(sigs, cs->sigs, sizeof(sigs));
+  memcpy(info, cs->info, sizeof(info));
+  cs->count = 0;
+  int saved = errno;
+  pid_t pid = getpid(), tid = (pid_t)ns_self();
+  for (int i = 0; i < n; i++)
+    if (syscall(SYS_rt_tgsigqueueinfo, pid, tid, sigs[i], &info[i]) != 0) syscall(SYS_tgkill, pid, tid, sigs[i]);
+  errno = saved;
+}
+
+static void ns_block(void) {
+  ns_cs.depth++;
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+}
+
+static void ns_restore(void) {
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  if (--ns_cs.depth == 0) {
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (ns_cs.count) ns_flush();
+  }
+}
+
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
+  static int (*real)(int, const struct sigaction *, struct sigaction *);
+  if (!real) real = (int (*)(int, const struct sigaction *, struct sigaction *))dlsym(RTLD_NEXT, "sigaction");
+  if (!real) {
+    errno = ENOSYS;
+    return -1;
+  }
+  if (!ns_deferrable(sig) || !ns_on()) return real(sig, act, old);
+  uintptr_t prev = __atomic_load_n(&ns_handlers[sig], __ATOMIC_ACQUIRE);
+  uint8_t prev_info = __atomic_load_n(&ns_siginfo[sig], __ATOMIC_RELAXED);
+  struct sigaction mine;
+  const struct sigaction *use = act;
+  if (act && act->sa_handler != SIG_DFL && act->sa_handler != SIG_IGN && bl_from_ntdll(__builtin_return_address(0))) {
+    mine = *act;
+    mine.sa_sigaction = ns_trampoline;
+    mine.sa_flags |= SA_SIGINFO;
+    __atomic_store_n(&ns_siginfo[sig], (act->sa_flags & SA_SIGINFO) ? 1 : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&ns_handlers[sig], (uintptr_t)act->sa_sigaction, __ATOMIC_RELEASE);
+    use = &mine;
+  }
+  int r = real(sig, use, old);
+  if (r != 0 && use == &mine) {
+    __atomic_store_n(&ns_siginfo[sig], prev_info, __ATOMIC_RELAXED);
+    __atomic_store_n(&ns_handlers[sig], prev, __ATOMIC_RELEASE);
+  }
+  if (r == 0 && old && old->sa_sigaction == ns_trampoline) {
+    old->sa_sigaction = (void (*)(int, siginfo_t *, void *))prev;
+    if (!prev_info) old->sa_flags &= ~SA_SIGINFO;
+  }
+  return r;
 }
 
 static inline struct ns_obj *ns_obj(struct ns_head *h, uint32_t s) {
@@ -378,10 +465,11 @@ static int ns_claim(struct ns_q *q, int32_t index) {
     if (dead) return 0;
   }
   int32_t want = -1;
-  return __atomic_compare_exchange_n(&q->signaled, &want, index, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+  return __atomic_compare_exchange_n(&q->signaled, &want, index, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
 }
 
 static void ns_wake(struct ns_q *q) {
+  if (!__atomic_load_n(&q->sleeping, __ATOMIC_SEQ_CST)) return;
   int saved = errno;
   ns_futex(&q->signaled, FUTEX_WAKE, 1, NULL, 0);
   errno = saved;
@@ -618,14 +706,13 @@ static void ns_dev_put_locked(struct ns_dev *d) {
 
 static void ns_dev_put(struct ns_dev *d) {
   if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL)) return;
-  sigset_t old;
   int saved = errno;
-  ns_block(&old);
+  ns_block();
   pthread_mutex_lock(&ns_mx);
   uint32_t zero = 0;
   if (d->h && __atomic_compare_exchange_n(&d->refs, &zero, NS_DEAD, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) ns_release(d);
   pthread_mutex_unlock(&ns_mx);
-  ns_restore(&old);
+  ns_restore();
   errno = saved;
 }
 
@@ -682,20 +769,18 @@ static void ns_forget_locked(int fd) {
 }
 
 static void ns_forget(int fd) {
-  sigset_t old;
   int saved = errno;
-  ns_block(&old);
+  ns_block();
   pthread_mutex_lock(&ns_mx);
   ns_forget_locked(fd);
   pthread_mutex_unlock(&ns_mx);
-  ns_restore(&old);
+  ns_restore();
   errno = saved;
 }
 
 static uint64_t ns_adopt(struct ns_dev *d, uint32_t tag, int fd, uint32_t gen, uint32_t s) {
   uint64_t e = 0;
-  sigset_t old;
-  ns_block(&old);
+  ns_block();
   pthread_mutex_lock(&ns_mx);
   if (!d->h || d->tag != tag || !ns_table() || ns_attach(d) < 0 || s >= NS_SLOTS) goto out;
   if ((e = __atomic_load_n(&ns_fdt[fd], __ATOMIC_ACQUIRE))) goto out;
@@ -710,7 +795,7 @@ static uint64_t ns_adopt(struct ns_dev *d, uint32_t tag, int fd, uint32_t gen, u
   ns_unlock(&o->lock);
 out:
   pthread_mutex_unlock(&ns_mx);
-  ns_restore(&old);
+  ns_restore();
   return e;
 }
 
@@ -719,8 +804,7 @@ static uint64_t ns_note_device(int fd) {
   uint64_t e = 0;
   if (syscall(SYS_fstat, fd, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
   if (((uint64_t)st.st_size & ~0xffffull) != NS_DEV_MAGIC) return 0;
-  sigset_t old;
-  ns_block(&old);
+  ns_block();
   pthread_mutex_lock(&ns_mx);
   struct ns_dev *d = ns_table() ? ns_map(fd, (uint32_t)st.st_size & 0xffff, (uint64_t)st.st_ino) : NULL;
   if (d) {
@@ -732,7 +816,7 @@ static uint64_t ns_note_device(int fd) {
     }
   }
   pthread_mutex_unlock(&ns_mx);
-  ns_restore(&old);
+  ns_restore();
   return e;
 }
 
@@ -773,15 +857,14 @@ static int ns_ready(struct ns_dev *d) {
 
 static void ns_thread_gone(void *p) {
   struct ns_tls *t = p;
-  if (!t || !t->d || !t->q) return;
-  sigset_t old;
+  if (!t || !t->d) return;
   struct ns_dev *d = t->d;
-  ns_block(&old);
-  ns_free_q(d->h, t->q - 1);
+  ns_block();
+  if (t->q) ns_free_q(d->h, t->q - 1);
   t->q = 0;
   t->waiting = 0;
   t->d = NULL;
-  ns_restore(&old);
+  ns_restore();
   ns_dev_put(d);
 }
 
@@ -789,24 +872,36 @@ static void ns_key_init(void) {
   pthread_key_create(&ns_key, ns_thread_gone);
 }
 
-static struct ns_q *ns_thread_q(struct ns_dev *d, uint32_t *qi) {
-  struct ns_head *h = d->h;
-  if (ns_tq.d && ns_tq.q && ns_tq.waiting) {
-    ns_drop_q(ns_tq.d->h, ns_tq.q - 1);
-    ns_tq.waiting = 0;
-  }
-  if (ns_tq.d == d && ns_tq.q) {
-    *qi = ns_tq.q - 1;
-    return ns_q(h, *qi);
-  }
-  if (ns_tq.d && ns_tq.q) {
-    struct ns_dev *old = ns_tq.d;
-    ns_free_q(old->h, ns_tq.q - 1);
+static int ns_hold(struct ns_dev *d) {
+  if (ns_tq.d == d) return 1;
+  if (!ns_dev_get(d)) return 0;
+  struct ns_dev *old = ns_tq.d;
+  if (old) {
+    ns_block();
+    if (ns_tq.q) ns_free_q(old->h, ns_tq.q - 1);
     ns_tq.q = 0;
+    ns_tq.waiting = 0;
     ns_tq.d = NULL;
+    ns_restore();
     ns_dev_put(old);
   }
   pthread_once(&ns_once, ns_key_init);
+  ns_tq.d = d;
+  pthread_setspecific(ns_key, &ns_tq);
+  return 1;
+}
+
+static struct ns_q *ns_thread_q(struct ns_dev *d, uint32_t *qi) {
+  struct ns_head *h = d->h;
+  if (ns_tq.d != d) return NULL;
+  if (ns_tq.q && ns_tq.waiting) {
+    ns_drop_q(h, ns_tq.q - 1);
+    ns_tq.waiting = 0;
+  }
+  if (ns_tq.q) {
+    *qi = ns_tq.q - 1;
+    return ns_q(h, *qi);
+  }
   uint32_t i;
   if (!ns_pop(h, &h->q_free, 0, &i) && !ns_grow(&h->q_hwm, NS_QS, &i)) {
     ns_sweep_dead(h);
@@ -815,22 +910,19 @@ static struct ns_q *ns_thread_q(struct ns_dev *d, uint32_t *qi) {
   struct ns_q *q = ns_q(h, i);
   q->proc = (uint32_t)d->proc;
   q->waiting = 0;
+  q->sleeping = 0;
   q->inuse = 1;
-  __atomic_add_fetch(&d->refs, 1, __ATOMIC_ACQ_REL);
-  ns_tq.d = d;
   ns_tq.q = i + 1;
   ns_tq.waiting = 0;
-  pthread_setspecific(ns_key, &ns_tq);
   *qi = i;
   return q;
 }
 
 static int ns_create(struct ns_dev *d, int type, uint32_t a, uint32_t b) {
   struct ns_head *h = d->h;
-  sigset_t old;
   int fd = -1, err = 0;
   uint32_t s = 0;
-  ns_block(&old);
+  ns_block();
   pthread_mutex_lock(&ns_mx);
   if (!ns_table() || ns_attach(d) < 0) {
     err = ENOMEM;
@@ -879,7 +971,7 @@ static int ns_create(struct ns_dev *d, int type, uint32_t a, uint32_t b) {
   ns_unlock(&o->lock);
 out:
   pthread_mutex_unlock(&ns_mx);
-  ns_restore(&old);
+  ns_restore();
   if (fd < 0) errno = err;
   return fd;
 }
@@ -890,6 +982,20 @@ static int ns_expired(const struct ns_wait_args *args) {
   return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec >= args->timeout;
 }
 
+static uint64_t ns_now(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static void ns_spin(struct ns_q *q) {
+  uint64_t end = ns_now() + NS_SPIN_NS;
+  for (unsigned i = 1; __atomic_load_n(&q->signaled, __ATOMIC_ACQUIRE) == -1; i++) {
+    ns_relax();
+    if (!(i & 63) && ns_now() >= end) return;
+  }
+}
+
 static int ns_sleep(struct ns_q *q, const struct ns_wait_args *args) {
   struct timespec ts, *tsp = NULL;
   int op = FUTEX_WAIT_BITSET | ((args->flags & NS_WAIT_REALTIME) ? FUTEX_CLOCK_REALTIME : 0);
@@ -898,14 +1004,45 @@ static int ns_sleep(struct ns_q *q, const struct ns_wait_args *args) {
     ts.tv_nsec = (long)(args->timeout % 1000000000ull);
     tsp = &ts;
   }
-  while (__atomic_load_n(&q->signaled, __ATOMIC_ACQUIRE) == -1) {
-    if (tsp && ns_expired(args)) return ETIMEDOUT;
-    if (ns_futex(&q->signaled, op, (uint32_t)-1, tsp, FUTEX_BITSET_MATCH_ANY) == -1) {
-      if (errno == ETIMEDOUT) return ETIMEDOUT;
-      if (errno == EINTR) return EINTR;
-    }
+  ns_spin(q);
+  int ret = 0;
+  __atomic_store_n(&q->sleeping, 1, __ATOMIC_SEQ_CST);
+  while (!ret && __atomic_load_n(&q->signaled, __ATOMIC_SEQ_CST) == -1) {
+    if (tsp && ns_expired(args)) ret = ETIMEDOUT;
+    else if (ns_futex(&q->signaled, op, (uint32_t)-1, tsp, FUTEX_BITSET_MATCH_ANY) == -1 && (errno == ETIMEDOUT || errno == EINTR))
+      ret = errno;
   }
-  return 0;
+  __atomic_store_n(&q->sleeping, 0, __ATOMIC_RELAXED);
+  return ret;
+}
+
+static int ns_try_any(struct ns_head *h, const uint32_t *slots, const uint32_t *gens, uint32_t total, uint32_t owner, int *dead) {
+  for (uint32_t i = 0; i < total; i++) {
+    struct ns_obj *o = ns_obj(h, slots[i]);
+    ns_lock(&o->lock);
+    int busy = o->type == NS_FREE || o->gen != gens[i] || o->any_head || o->all_hint;
+    if (!busy && ns_signaled(o, owner)) {
+      switch (o->type) {
+      case NS_SEM:
+        o->a--;
+        break;
+      case NS_MUTEX:
+        *dead = (int)o->ownerdead;
+        o->ownerdead = 0;
+        o->a++;
+        o->b = owner;
+        break;
+      case NS_EVENT:
+        if (!o->a) o->b = 0;
+        break;
+      }
+      ns_unlock(&o->lock);
+      return (int)i;
+    }
+    ns_unlock(&o->lock);
+    if (busy) return -1;
+  }
+  return -2;
 }
 
 static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
@@ -927,12 +1064,23 @@ static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
       for (uint32_t j = 0; j < i; j++)
         if (slots[j] == slots[i]) return EINVAL;
   }
-  sigset_t old;
-  ns_block(&old);
+  ns_block();
+  if (!all && !ns_tq.waiting) {
+    int dead = 0, got = ns_try_any(h, slots, gens, total, args.owner, &dead);
+    if (got >= 0) {
+      ns_restore();
+      ua->index = (uint32_t)got;
+      return dead ? EOWNERDEAD : 0;
+    }
+    if (got == -2 && args.timeout != UINT64_MAX && ns_expired(&args)) {
+      ns_restore();
+      return ETIMEDOUT;
+    }
+  }
   uint32_t qi;
   struct ns_q *q = ns_ready(d) ? ns_thread_q(d, &qi) : NULL;
   if (!q) {
-    ns_restore(&old);
+    ns_restore();
     return ENOMEM;
   }
   ns_maybe_sweep(h);
@@ -1004,16 +1152,15 @@ static int ns_wait(struct ns_dev *d, struct ns_wait_args *ua, int all) {
   }
   int ret = 0;
   if (!bad && __atomic_load_n(&q->signaled, __ATOMIC_ACQUIRE) == -1) {
-    sigset_t held;
-    ns_restore(&old);
+    ns_restore();
     ret = ns_sleep(q, &args);
-    ns_block(&held);
+    ns_block();
   }
   ns_drop_q(h, qi);
   ns_tq.waiting = 0;
   int32_t got = __atomic_load_n(&q->signaled, __ATOMIC_ACQUIRE);
   int dead = (int)q->ownerdead;
-  ns_restore(&old);
+  ns_restore();
   if (bad) return EINVAL;
   if (got != -1) {
     ua->index = (uint32_t)got;
@@ -1061,12 +1208,11 @@ static int ns_obj_ioctl(struct ns_dev *d, uint64_t e, unsigned long req, void *a
     return ENOTTY;
   }
   if (type != (uint32_t)want) return EINVAL;
-  sigset_t old;
-  ns_block(&old);
+  ns_block();
   int all = ns_lock_obj(h, o);
   if (o->type != (uint32_t)want || o->gen != gen) {
     ns_unlock_obj(h, o, all);
-    ns_restore(&old);
+    ns_restore();
     return EINVAL;
   }
   switch (req) {
@@ -1133,7 +1279,7 @@ static int ns_obj_ioctl(struct ns_dev *d, uint64_t e, unsigned long req, void *a
   }
   }
   ns_unlock_obj(h, o, all);
-  ns_restore(&old);
+  ns_restore();
   if (ret) return ret;
   if (req == NS_SEM_RELEASE || req == NS_EVENT_SET || req == NS_EVENT_RESET || req == NS_EVENT_PULSE)
     memcpy(arg, &prev, sizeof(prev));
@@ -1176,9 +1322,8 @@ int bl_ntsync_ioctl(int fd, unsigned long req, void *arg, int *rc) {
   uint64_t e = ns_lookup(fd);
   if (!e) return 0;
   struct ns_dev *d = &ns_devs[(e >> 56) & 7];
-  if (!ns_dev_get(d)) return 0;
+  if (!ns_hold(d)) return 0;
   int out = 0, err = (e & NS_E_DEVICE) ? ns_dev_ioctl(d, req, arg, &out) : ns_obj_ioctl(d, e, req, arg);
-  ns_dev_put(d);
   if (err) {
     errno = err;
     *rc = -1;
