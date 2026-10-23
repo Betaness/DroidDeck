@@ -993,17 +993,18 @@ static void sendLayerRequest(X11Swapchain* sc, uint32_t flags, uint64_t key) {
                       (int)(sizeof(request) + ((flags & DD_ZC_FLAG_STACK_KEY) ? sizeof(key) : 0)));
 }
 
-/* Windows on compositor layers that are idle (Chromium presents only on damage) are kept right,
- * at most every 100 ms from any present of this process:
- * - unmapped (a closed menu may never present again): its layer is taken down (DD_ZC_FLAG_HIDE);
+/* Windows on compositor layers that are idle (Chromium presents only on damage) are kept right
+ * from any present of this process:
+ * - unmapped (a closed menu may never present again): its layer is taken down (DD_ZC_FLAG_HIDE),
+ *   checked on every present, else the menu lingers over the view below until the next check;
  * - restacked, or windows below it came or went: the compositor gets its new stacking key
- *   (DD_ZC_FLAG_RESTACK), so layers keep the windows' order.
+ *   (DD_ZC_FLAG_RESTACK), so layers keep the windows' order; checked at most every 100 ms.
  * A swapchain in the middle of its own present is left for the next round. */
 static void sweepLayers(void) {
-    static double lastSweep;
+    static double lastRestack;
     double now = nowSeconds();
-    if (now - lastSweep < 0.1) return;
-    lastSweep = now;
+    bool restack = now - lastRestack >= 0.1;
+    if (restack) lastRestack = now;
     pthread_mutex_lock(&registryLock);
     for (int i = 0; i < MAX_TRACKED_SWAPCHAINS; i++) {
         X11Swapchain* other = registry[i];
@@ -1021,7 +1022,8 @@ static void sweepLayers(void) {
             fprintf(stderr, "vortek-x11: window 0x%x %ux%u is no longer viewable, its layer was taken down\n",
                     other->surface->window, other->extent.width, other->extent.height);
         }
-        else if (stackKeyOf(conn, other->pub.chain, other->pub.chainLength, other->pub.root, &key) && key != other->pub.key) {
+        else if (restack && stackKeyOf(conn, other->pub.chain, other->pub.chainLength, other->pub.root, &key) &&
+                 key != other->pub.key) {
             sendLayerRequest(other, DD_ZC_FLAG_RESTACK | DD_ZC_FLAG_STACK_KEY, key);
             other->pub.key = key;
         }
