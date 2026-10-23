@@ -65,12 +65,12 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
     fun tick(top: List<Int>, busiest: Triple<Int, Int, Double>?): String? {
         val target = target ?: return null
         val cluster = busiest?.let { (pid, tid, _) -> cpuOf(pid, tid)?.let { cpu -> clusters.firstOrNull { cpu in it.cpus } } }
-        val held = cluster != null && cluster != target && busiest.third >= BUSY && isHeld(cluster)
-        return when (decider.tick(held)) {
+        val heldKhz = if (cluster != null && cluster != target && busiest.third >= BUSY) heldClock(cluster) else null
+        return when (decider.tick(heldKhz != null)) {
             Action.STEER -> {
                 top.forEach { move(it, target.mask) }
                 "moved ${top.size} processes to cores ${target.cpus.first()}-${target.cpus.last()}: " +
-                    "cores ${cluster!!.cpus.first()}-${cluster.cpus.last()} held at ${khz(cluster.policy, "scaling_cur_freq")} kHz " +
+                    "cores ${cluster!!.cpus.first()}-${cluster.cpus.last()} held at $heldKhz kHz " +
                     "under a thread ${(busiest!!.third * 100).toInt()}% busy"
             }
             Action.RELEASE -> {
@@ -94,11 +94,12 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
         if (taskset(mask, pid)) moved[pid] = threadCount(pid) else moved.remove(pid)
     }
 
-    private fun isHeld(c: Cluster): Boolean {
-        val cur = khz(c.policy, "scaling_cur_freq") ?: return false
-        val min = khz(c.policy, "scaling_min_freq") ?: return false
-        val max = khz(c.policy, "cpuinfo_max_freq") ?: return false
-        return held(cur, min, max)
+    /** The cluster's clock when it is held, else null. */
+    private fun heldClock(c: Cluster): Long? {
+        val cur = khz(c.policy, "scaling_cur_freq") ?: return null
+        val min = khz(c.policy, "scaling_min_freq") ?: return null
+        val max = khz(c.policy, "cpuinfo_max_freq") ?: return null
+        return cur.takeIf { held(it, min, max) }
     }
 
     companion object {
