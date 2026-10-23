@@ -1,0 +1,31 @@
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c	2026-10-23 23:38:11.742000000 +1100
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c	2026-10-23 23:38:11.742000000 +1100
+@@ -3740,7 +3740,27 @@
+     VkDevice device = VkObject_fromId(deviceId);
+     ShaderModule* shaderModule = VkObject_fromId(shaderModuleId);
+ 
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] ShaderInspector_createModule keeps vertex and fragment modules as SPIR-V until a
++     * pipeline uses them (module == VK_NULL_HANDLE), and the Mali driver dereferences a null module
++     * (SIGSEGV at 0x28, taking the server and every client down: Steam's shader pre-caching,
++     * Fossilize, asks for identifiers at session start). Such a module's identifier is the one of
++     * its create info, as the extension defines it; none when the driver cannot give one. */
++    identifier.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT;
++    if (shaderModule && shaderModule->module) {
++        vulkanWrapper.vkGetShaderModuleIdentifier(device, shaderModule->module, &identifier);
++    }
++    else if (shaderModule && shaderModule->code && vulkanWrapper.vkGetShaderModuleCreateInfoIdentifier) {
++        VkShaderModuleCreateInfo createInfo = {0};
++        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++        createInfo.codeSize = shaderModule->codeSize;
++        createInfo.pCode = shaderModule->code;
++        vulkanWrapper.vkGetShaderModuleCreateInfoIdentifier(device, &createInfo, &identifier);
++    }
++    else identifier.identifierSize = 0;
++#else
+     vulkanWrapper.vkGetShaderModuleIdentifier(device, shaderModule->module, &identifier);
++#endif
+ 
+     VT_SERIALIZE_CMD(VkShaderModuleIdentifierEXT, &identifier);
+     vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
