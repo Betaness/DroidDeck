@@ -25,17 +25,34 @@ rewrites _NET_ACTIVE_WINDOW on every activation, giving the window input focus t
 Wine also leaves room for the frame it expects a window manager to draw: a 1280x720 game window
 with a caption sat at 3,22, a black band above it. Game windows as large as the screen are moved
 to its corner, as gamescope shows them.
+
+Wine windows it will not make foreground (WS_DISABLED, WS_EX_NOACTIVATE, tool windows) are neither
+activated nor raised over while another window can be: Wine took such a window for the foreground one
+and the game lost activation. As under gamescope, only no-activate and tool windows that do not fill
+the screen are left out of GAMESCOPE_FOCUSABLE_*: Steam puts itself ahead of a game it finds no
+window of there.
+Windows the client has not tagged with STEAM_GAME (x86-64 clients, overlay off) get their app the way
+gamescope finds it, from Proton's WM_CLASS or the SteamLaunch process they descend from.
+
+Steam suspends a session it takes for idle, judging by GAMESCOPE_INPUT_COUNTER, which gamescope bumps
+on input. Touch and keys go to the game's window here, so the counter is bumped when the X server's
+idle time shows input since the last look.
 """
 import ctypes as c
+import re
 import select
 import sys
+import time
 
 IDLE_S = 2.0  # recheck this often without X events, in case one was missed
+INPUT_S = 1.5  # look at the idle time at most this often, and at least every IDLE_S
 STEAM_APP = 769
+STEAM_ANCESTORS = 32
 XA_ATOM, XA_CARDINAL, XA_WINDOW = 4, 6, 33
-CLIENT_MESSAGE, MAP_NOTIFY, UNMAP_NOTIFY, PROPERTY_NOTIFY = 33, 19, 18, 28
+CLIENT_MESSAGE, MAP_NOTIFY, UNMAP_NOTIFY, PROPERTY_NOTIFY, CONFIGURE_NOTIFY = 33, 19, 18, 28, 22
 WITHDRAWN, NORMAL, ICONIC = 0, 1, 3
-PROPERTY_CHANGE, SUBSTRUCTURE_NOTIFY = 1 << 22, 1 << 19
+PROPERTY_CHANGE, SUBSTRUCTURE_NOTIFY, STRUCTURE_NOTIFY = 1 << 22, 1 << 19, 1 << 17
+WS_DISABLED, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE = 0x08000000, 0x80, 0x40000, 0x08000000
 
 
 class X:
@@ -99,6 +116,17 @@ class X:
         finally:
             self.x.XFree(data)
 
+    def text(self, window, name):
+        t, f, n, left = c.c_ulong(), c.c_int(), c.c_ulong(), c.c_ulong()
+        data = c.POINTER(c.c_ubyte)()
+        if self.x.XGetWindowProperty(self.dpy, window, self.atom(name), 0, 64, False, 0, c.byref(t), c.byref(f),
+                                     c.byref(n), c.byref(left), c.byref(data)) != 0 or not data:
+            return b''
+        try:
+            return c.string_at(data, n.value) if f.value == 8 else b''
+        finally:
+            self.x.XFree(data)
+
     def set_cardinals(self, name, values, window=None, kind=XA_CARDINAL):
         window = window or self.root
         if values:
@@ -127,6 +155,86 @@ class Attrs(c.Structure):
                 ('colormap', c.c_ulong), ('map_installed', c.c_int), ('map_state', c.c_int),
                 ('all_event_masks', c.c_long), ('your_event_mask', c.c_long), ('do_not_propagate_mask', c.c_long),
                 ('override_redirect', c.c_int), ('screen', c.c_void_p)]
+
+
+class SyncValue(c.Structure):
+    _fields_ = [('hi', c.c_int), ('lo', c.c_uint)]
+
+
+class SyncSystemCounter(c.Structure):
+    _fields_ = [('name', c.c_char_p), ('counter', c.c_ulong), ('resolution', SyncValue)]
+
+
+class ScreenSaverInfo(c.Structure):
+    _fields_ = [('window', c.c_ulong), ('state', c.c_int), ('kind', c.c_int), ('til_or_since', c.c_ulong),
+                ('idle', c.c_ulong), ('event_mask', c.c_ulong)]
+
+
+def idle_clock(x):
+    """(name, function returning the ms since the X server last saw input, or None), from the SYNC
+    extension's IDLETIME counter or else MIT-SCREEN-SAVER; (None, None) without either."""
+    D, I = c.c_void_p, c.POINTER(c.c_int)
+    a, b = c.c_int(), c.c_int()
+    try:
+        ext = c.CDLL('libXext.so.6')
+        ext.XSyncQueryExtension.argtypes = [D, I, I]
+        ext.XSyncInitialize.argtypes = [D, I, I]
+        ext.XSyncListSystemCounters.argtypes = [D, I]
+        ext.XSyncListSystemCounters.restype = c.POINTER(SyncSystemCounter)
+        ext.XSyncFreeSystemCounterList.argtypes = [c.POINTER(SyncSystemCounter)]
+        ext.XSyncQueryCounter.argtypes = [D, c.c_ulong, c.POINTER(SyncValue)]
+        counter = 0
+        if ext.XSyncQueryExtension(x.dpy, c.byref(a), c.byref(b)) and \
+                ext.XSyncInitialize(x.dpy, c.byref(a), c.byref(b)):
+            counters = ext.XSyncListSystemCounters(x.dpy, c.byref(a))
+            if counters:
+                counter = next((counters[i].counter for i in range(a.value) if counters[i].name == b'IDLETIME'), 0)
+                ext.XSyncFreeSystemCounterList(counters)
+        if counter:
+            def sync_idle():
+                v = SyncValue()
+                return v.hi << 32 | v.lo if ext.XSyncQueryCounter(x.dpy, counter, c.byref(v)) else None
+            return 'IDLETIME', sync_idle
+    except (OSError, AttributeError):
+        pass
+    try:
+        xss = c.CDLL('libXss.so.1')
+        xss.XScreenSaverQueryExtension.argtypes = [D, I, I]
+        xss.XScreenSaverAllocInfo.restype = c.POINTER(ScreenSaverInfo)
+        xss.XScreenSaverQueryInfo.argtypes = [D, c.c_ulong, c.POINTER(ScreenSaverInfo)]
+        info = xss.XScreenSaverQueryExtension(x.dpy, c.byref(a), c.byref(b)) and xss.XScreenSaverAllocInfo()
+        if info:
+            def saver_idle():
+                return info.contents.idle if xss.XScreenSaverQueryInfo(x.dpy, x.root, info) else None
+            return 'MIT-SCREEN-SAVER', saver_idle
+    except (OSError, AttributeError):
+        pass
+    return None, None
+
+
+def parent_pid(pid):
+    try:
+        with open('/proc/%d/stat' % pid, encoding='utf-8', errors='replace') as f:
+            return int(f.read().rsplit(')', 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def launch_app(pid):
+    """AppId=N of the SteamLaunch process pid descends from, 0 without one."""
+    for _ in range(STEAM_ANCESTORS):
+        if pid <= 1:
+            break
+        try:
+            with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                args = f.read().split(b'\0')
+        except OSError:
+            break
+        if b'SteamLaunch' in args:
+            ids = [a[6:] for a in args if a.startswith(b'AppId=')]
+            return int(ids[0]) & 0xffffffff if ids and ids[0].isdigit() else 0
+        pid = parent_pid(pid)
+    return 0
 
 
 def main():
@@ -158,7 +266,7 @@ def main():
     x.x.XChangeProperty(x.dpy, check, x.atom('_NET_WM_NAME'), x.atom('UTF8_STRING'), 8, 0, name, len(name))
     x.set_cardinals('_NET_SUPPORTED', [x.atom(n) for n in ('_NET_ACTIVE_WINDOW', '_NET_CLIENT_LIST',
                                                              '_NET_CLIENT_LIST_STACKING')], kind=XA_ATOM)
-    x.x.XSelectInput(x.dpy, x.root, SUBSTRUCTURE_NOTIFY)
+    x.x.XSelectInput(x.dpy, x.root, SUBSTRUCTURE_NOTIFY | STRUCTURE_NOTIFY)
     active_atom = x.atom('_NET_ACTIVE_WINDOW')
     state_atom = x.atom('_NET_WM_STATE')
     fullscreen_atom = x.atom('_NET_WM_STATE_FULLSCREEN')
@@ -212,11 +320,12 @@ def main():
         x.x.XWindowEvent(x.dpy, check, PROPERTY_CHANGE, ev)
         return ev[6]  # XPropertyEvent: type, serial, send_event, display, window, atom, time
 
-    def activate(w):
+    def activate(w, raise_=True):
         """Raise w, give it input focus and publish it as the active window."""
         if wm_state(w) != NORMAL:
             set_wm_state(w, NORMAL)
-        x.x.XRaiseWindow(x.dpy, w)
+        if raise_:
+            x.x.XRaiseWindow(x.dpy, w)
         # ICCCM: a window that takes no input itself but speaks WM_TAKE_FOCUS (wine) is asked to.
         hints = x.x.XGetWMHints(x.dpy, w)
         accepts = True
@@ -233,6 +342,22 @@ def main():
             x.x.XSendEvent(x.dpy, w, False, 0, msg)
         # Rewritten even when unchanged: wine waits for this property change to confirm.
         x.set_cardinals('_NET_ACTIVE_WINDOW', [w], kind=XA_WINDOW)
+
+    def publish(w, app):
+        app = [app] if app else []
+        x.set_cardinals('GAMESCOPE_FOCUSED_APP', app)
+        x.set_cardinals('GAMESCOPE_FOCUSED_APP_GFX', app)
+        x.set_cardinals('GAMESCOPE_FOCUSED_WINDOW', [w])
+
+    style_atoms = (x.atom('_WINE_HWND_STYLE'), x.atom('_WINE_HWND_EXSTYLE'))
+    styles = {}  # window -> its Wine (style, exstyle), until they change
+    inert = set()  # windows of the last scan Wine will not make foreground
+    skipped = set()  # of those, the ones gamescope leaves out of the focusable lists
+
+    def wine_style(w):
+        if w not in styles:
+            styles[w] = tuple((x.cardinals(w, n) or [0])[0] for n in ('_WINE_HWND_STYLE', '_WINE_HWND_EXSTYLE'))
+        return styles[w]
 
     # Windows mapped before we started.
     for w in x.children(x.root):
@@ -253,19 +378,79 @@ def main():
               % (w, a.width, a.height, a.x, a.y), flush=True)
 
     tags = {}  # window -> (app, pid), read once the client has tagged it
+    launches = {}  # pid -> app of its SteamLaunch ancestor, 0 without one
+
+    def identify(w):
+        """(app, pid) of w. A guessed app is not kept in tags, so a STEAM_GAME tag set later wins."""
+        if w in tags:
+            return tags[w]
+        app = x.cardinals(w, 'STEAM_GAME')
+        pid = x.cardinals(w, '_NET_WM_PID')
+        pid = pid[0] if pid else 0
+        if app:
+            tags[w] = (app[0], pid)
+            return tags[w]
+        for part in x.text(w, 'WM_CLASS').split(b'\0'):
+            m = re.fullmatch(rb'steam_app_(\d+)', part)
+            if m:
+                return int(m.group(1)) & 0xffffffff, pid
+        if pid not in launches:
+            launches[pid] = launch_app(pid)
+            if launches[pid]:
+                print('droiddeck-vortek-focus: pid %d runs under SteamLaunch AppId=%d' % (pid, launches[pid]),
+                      flush=True)
+        return launches[pid], pid
+
     watched = {}  # window -> event mask we selected on it
     restore = None
     last_focus = None
     last_lists = None
-    print('droiddeck-vortek-focus: raising Steam menus over games', flush=True)
+    stack = []
+    # Properties a scan reads; titles and the like change often and need none.
+    scan_atoms = style_atoms + tuple(x.atom(n) for n in ('STEAM_GAME', '_NET_WM_PID', 'WM_CLASS'))
+    scanned, busy = 0.0, True
+    idle_source, idle_ms = idle_clock(x)
+    checked, last_idle = time.monotonic(), idle_ms() if idle_ms else None
+    print('droiddeck-vortek-focus: raising Steam menus over games, input seen by %s' % (idle_source or 'nothing'),
+          flush=True)
     while True:
+        if not busy:
+            if idle_ms and time.monotonic() - checked >= INPUT_S:
+                now, idle = time.monotonic(), idle_ms()
+                if idle is not None and (last_idle is not None and idle < last_idle or
+                                         idle < (now - checked) * 1000 + 250):
+                    count = (x.cardinals(x.root, 'GAMESCOPE_INPUT_COUNTER') or [0])[0]
+                    x.set_cardinals('GAMESCOPE_INPUT_COUNTER', [(count + 1) & 0xffffffff])
+                checked, last_idle = now, idle
+            # Sleep until the X server has something: a window mapped, unmapped, restacked or tagged,
+            # a menu opened or closed, an activation request.
+            x.x.XFlush(x.dpy)
+            if not x.x.XPending(x.dpy):
+                wake = min(scanned, checked) if idle_ms else scanned
+                select.select([fd], [], [], max(0.0, wake + IDLE_S - time.monotonic()))
         # _NET_ACTIVE_WINDOW requests, from Steam (Resume, launches) or from games.
         while x.x.XPending(x.dpy):
             x.x.XNextEvent(x.dpy, event)
             kind = c.cast(event, c.POINTER(c.c_int))[0]
+            # XPropertyEvent: type, serial, send_event, display, window, atom
+            if kind == PROPERTY_NOTIFY:
+                if event[5] in style_atoms:
+                    styles.pop(event[4], None)
+                busy = busy or event[5] in scan_atoms
+                continue
+            busy = True
             # XMapEvent/XUnmapEvent: type, serial, send_event, display, event, window, override_redirect
             if kind == MAP_NOTIFY and event[4] == x.root and not c.cast(event, c.POINTER(c.c_int * 14))[0][12]:
                 set_wm_state(event[5], NORMAL)
+                continue
+            # XConfigureEvent: type, serial, send_event, display, event, window
+            if kind == CONFIGURE_NOTIFY and event[5] == x.root:
+                root_attrs = attrs(x.root) or root_attrs
+                moved.clear()
+                # Fullscreen windows take the new size; their size before is still the one to restore.
+                for w in list(saved):
+                    set_fullscreen(w, True)
+                print('droiddeck-vortek-focus: screen now %dx%d' % (root_attrs.width, root_attrs.height), flush=True)
                 continue
             if kind == UNMAP_NOTIFY and event[4] == x.root and event[5] != check:
                 if wm_state(event[5]) not in (None, WITHDRAWN):
@@ -290,13 +475,24 @@ def main():
                 if tags.get(w, (0,))[0] == STEAM_APP and menu_open(w):
                     continue
                 if a and a.map_state == 2 and w in x.children(x.root):
+                    # Activating it would only have the scan below take the focus back.
+                    if w in inert and any(e[0] not in inert for e in stack):
+                        print('droiddeck-vortek-focus: window 0x%x asked to be activated, inert' % w, flush=True)
+                        continue
                     activate(w)
-                    last_focus = None
+                    app = identify(w)[0]
+                    publish(w, app)
+                    last_focus = (w, app)
                     restore = None
                     print('droiddeck-vortek-focus: activated window 0x%x' % w, flush=True)
+        if not busy and time.monotonic() - scanned < IDLE_S:
+            continue
+        busy, scanned = False, time.monotonic()
 
         # Bottom to top: mapped, managed top-level windows with their app and pid.
         stack = []
+        inert.clear()
+        skipped.clear()
         for w in x.children(x.root):
             a = attrs(w)
             if not a or a.map_state != 2 or a.override_redirect or (a.width <= 1 and a.height <= 1):
@@ -306,27 +502,29 @@ def main():
                 if fullscreen_atom in x.cardinals(w, '_NET_WM_STATE') and \
                         (a.x, a.y, a.width, a.height) != (0, 0, root_attrs.width, root_attrs.height):
                     set_fullscreen(w, True)
-            if w not in tags:
-                app = x.cardinals(w, 'STEAM_GAME')
-                pid = x.cardinals(w, '_NET_WM_PID')
-                if not app:
-                    # Wake up when the client tags it.
-                    if watched.get(w) != PROPERTY_CHANGE:
-                        x.x.XSelectInput(x.dpy, w, PROPERTY_CHANGE)
-                        watched[w] = PROPERTY_CHANGE
-                    stack.append((w, 0, pid[0] if pid else 0))
-                    continue
-                tags[w] = (app[0], pid[0] if pid else 0)
-            if tags[w][0] != STEAM_APP:
+            app, pid = identify(w)
+            if app and app != STEAM_APP:
                 to_corner(w, a)
+            # Wake up when the client tags a window or Wine changes its style.
             # The Steam window's children are its menus: wake up when they map or unmap.
-            mask = SUBSTRUCTURE_NOTIFY if tags[w][0] == STEAM_APP else 0
+            mask = PROPERTY_CHANGE | (SUBSTRUCTURE_NOTIFY if app == STEAM_APP else 0)
             if watched.get(w) != mask:
                 x.x.XSelectInput(x.dpy, w, mask)
                 watched[w] = mask
-            stack.append((w,) + tags[w])
+            style, exstyle = wine_style(w)
+            # Wine marks these skip-taskbar and -pager, which gamescope only lets through when fullscreen.
+            if (exstyle & WS_EX_NOACTIVATE or exstyle & WS_EX_TOOLWINDOW and not exstyle & WS_EX_APPWINDOW) and \
+                    (a.width < root_attrs.width or a.height < root_attrs.height):
+                skipped.add(w)
+            if w in skipped or style & WS_DISABLED:
+                inert.add(w)
+            stack.append((w, app, pid))
         for w in set(tags) - {e[0] for e in stack}:
             del tags[w]
+        for w in set(styles) - {e[0] for e in stack}:
+            del styles[w]
+        for pid in set(launches) - {e[2] for e in stack}:
+            del launches[pid]
         for w in set(watched) - {e[0] for e in stack}:
             del watched[w]
         for w in set(saved) - {e[0] for e in stack}:
@@ -355,32 +553,29 @@ def main():
                       flush=True)
             restore = None
 
-        apps, windows = [], []
+        apps, windows, clients = [], [], []
         for w, app, pid in stack:
+            clients.append(w)
+            if w in skipped:
+                continue
             if app and app not in apps:
                 apps.append(app)
             windows += [w, app, pid]
-        if (apps, windows) != last_lists:
+        if (apps, windows, clients) != last_lists:
             x.set_cardinals('GAMESCOPE_FOCUSABLE_APPS', apps)
             x.set_cardinals('GAMESCOPE_FOCUSABLE_WINDOWS', windows)
-            x.set_cardinals('_NET_CLIENT_LIST', windows[0::3], kind=XA_WINDOW)
-            x.set_cardinals('_NET_CLIENT_LIST_STACKING', windows[0::3], kind=XA_WINDOW)
-            last_lists = (apps, windows)
-        top = stack[-1] if stack else None
+            x.set_cardinals('_NET_CLIENT_LIST', clients, kind=XA_WINDOW)
+            x.set_cardinals('_NET_CLIENT_LIST_STACKING', clients, kind=XA_WINDOW)
+            last_lists = (apps, windows, clients)
+        # gamescope's order too: such windows only when there is nothing else.
+        top = next((e for e in reversed(stack) if e[0] not in inert), stack[-1] if stack else None)
         if top and (top[0], top[1]) != last_focus:
-            app = [top[1]] if top[1] else []
-            x.set_cardinals('GAMESCOPE_FOCUSED_APP', app)
-            x.set_cardinals('GAMESCOPE_FOCUSED_APP_GFX', app)
-            x.set_cardinals('GAMESCOPE_FOCUSED_WINDOW', [top[0]])
+            publish(top[0], top[1])
             # A new window on top gets focus; the Steam menus leave it with the game (restore is set).
+            # Inert windows over it stay over it.
             if restore is None:
-                activate(top[0])
+                activate(top[0], raise_=top is stack[-1])
             last_focus = (top[0], top[1])
-        # Sleep until the X server has something: a window mapped, unmapped, restacked or tagged,
-        # a menu opened or closed, an activation request.
-        x.x.XFlush(x.dpy)
-        if not x.x.XPending(x.dpy):
-            select.select([fd], [], [], IDLE_S)
 
 
 if __name__ == '__main__':
