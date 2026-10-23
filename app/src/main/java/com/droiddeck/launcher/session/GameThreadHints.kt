@@ -83,6 +83,8 @@ object GameThreadHints {
 
     private fun run(hm: PerformanceHintManager, pm: PowerManager) {
         val scanner = Scanner()
+        // [mali-g2] Only where a frame regulator was seen holding a cluster's clock (see ClusterSteer).
+        val steer = if (Build.SOC_MODEL == "O3") ClusterSteer.forDevice() else null
         var session: PerformanceHintManager.Session? = null
         var boosted = emptySet<Int>()
         val frames = ArrayDeque<Long>()
@@ -98,6 +100,8 @@ object GameThreadHints {
                     val paced = frames.size > PACE_WINDOW_S &&
                         holdsPace(fps, SessionState.refreshHz.toDouble(), SessionState.fpsLimit)
                     pacedFor = if (paced) pacedFor + 1 else 0
+                    steer?.tick(scanner.top, busy.maxByOrNull { it.value }?.let { (tid, share) -> scanner.owner[tid]?.let { Triple(it, tid, share) } })
+                        ?.let { Log.i(TAG, "cluster steering: $it (game ${fps.toInt()} fps)") }
                     // Not SEVERE: the Odin 3 reports it once its skin reaches 50 C, a couple of minutes into any game.
                     val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
                     val next = when {
@@ -122,6 +126,7 @@ object GameThreadHints {
             Log.w(TAG, "stopped", t)
         } finally {
             session?.close()
+            steer?.release()
         }
     }
 
@@ -173,6 +178,11 @@ object GameThreadHints {
         private var lastThread = HashMap<Int, Long>()
         private var lastBusy = HashMap<Int, Double>()
 
+        /** The busiest processes of the last sample, and the process of each thread read. */
+        var top: List<Int> = emptyList()
+            private set
+        val owner = HashMap<Int, Int>()
+
         /** Only the busiest few processes have their threads read, so a second costs a few dozen small reads. */
         fun sample(): Map<Int, Double> {
             val now = System.nanoTime()
@@ -192,6 +202,8 @@ object GameThreadHints {
                 .take(TOP_PROCESSES)
                 .toList()
             lastProcess = process
+            this.top = top.map { it.first }
+            owner.clear()
             val thread = HashMap<Int, Long>()
             val busy = HashMap<Int, Double>()
             for ((pid, _) in top) {
@@ -199,6 +211,7 @@ object GameThreadHints {
                     val tid = entry.toIntOrNull() ?: return@forEach
                     val ticks = cpuTicks("/proc/$pid/task/$tid/stat") ?: return@forEach
                     thread[tid] = ticks
+                    owner[tid] = pid
                     lastThread[tid]?.let { before -> busy[tid] = ((ticks - before) / hz / seconds + (lastBusy[tid] ?: 0.0)) / 2 }
                 }
             }
