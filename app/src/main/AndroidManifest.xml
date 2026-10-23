@@ -39,11 +39,9 @@
         android:theme="@style/AppTheme"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
-        android:extractNativeLibs="true">
-        <!-- [mali-g2] Not android:isGame / appCategory="game": on Xiaomi's Xring O3, HyperOS's FrameSchedPolicy
-             hands a game to the SchedGenius frame regulator, which sizes the CPU clocks by this process's own
-             UI and render threads (idle here: the game runs in a child process) and keeps other threads off the
-             prime cores. Duckov's main thread then sat at 0.55 GHz on a mid core, 25-38 fps instead of 55-80. -->
+        android:extractNativeLibs="true"
+        android:appCategory="game"
+        android:isGame="true">
 
         <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
         <!-- simpleperf / perfetto CPU profiling of the session from adb (release builds otherwise refuse). -->
