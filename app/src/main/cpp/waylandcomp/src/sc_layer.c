@@ -677,11 +677,11 @@ void sc_layer_hdr_symbols(char *out, size_t size) {
 static void log_layer_count(void) {
     if (g_two_logged) return;
     g_two_logged = 1;
-    droiddeck_log("layer", "%d display layers in use: \"%s\" (z=%d) and \"%s\" (z=%d) above it, both children of the "
-               "screen surface; the app's own views (drawer, HUD, pointer) stay above both. %d is the cap - more "
+    droiddeck_log("layer", "2 display layers in use: \"%s\" (z=%d) and \"%s\" (z=%d) above it, both children of the "
+               "screen surface; the app's own views (drawer, HUD, pointer) stay above both. 2 is the cap - more "
                "would push SurfaceFlinger into GPU client composition",
-               SC_LAYER_COUNT, g_layers[SC_LAYER_GAME].name, (int)g_layers[SC_LAYER_GAME].z,
-               g_layers[SC_LAYER_OVERLAY].name, (int)g_layers[SC_LAYER_OVERLAY].z, SC_LAYER_COUNT);
+               g_layers[SC_LAYER_GAME].name, (int)g_layers[SC_LAYER_GAME].z,
+               g_layers[SC_LAYER_OVERLAY].name, (int)g_layers[SC_LAYER_OVERLAY].z);
 }
 
 static ASurfaceControl *swap_sc_begin(struct layer *l) {
@@ -810,15 +810,15 @@ int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, in
     struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
     int r[8];
     if (!l || !ahb || !token || w <= 0 || h <= 0) goto unavailable;
-    int restack = l->z != z;
-    l->z = z;
+    /* l->z is the z the SurfaceControl has; it changes only once the transaction is applied. */
     if (ensure_sc(l) != 0) goto unavailable;
+    int restack = l->z != z;
     if (vkp_update_map(scene_w, scene_h) != 0) goto unavailable;
     if (!vkp_map_window(buf_w, buf_h, x, y, w, h, scene_w, scene_h, r)) goto unavailable;
     ASurfaceTransaction *tx = api.txCreate();
     if (!tx) goto unavailable;
     ASurfaceControl *old = swap_sc_begin(l);
-    if (old || restack) api.setZOrder(tx, l->sc, l->z);
+    if (old || restack) api.setZOrder(tx, l->sc, z);
     api.setBuffer(tx, l->sc, ahb, acquire_fd);
     api.setBufferTransparency(tx, l->sc, ASC_TRANSPARENCY_OPAQUE);
     apply_geometry(tx, l, r);
@@ -832,6 +832,7 @@ int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, in
     }
     api.txApply(tx);
     api.txDelete(tx);
+    l->z = z;
     l->cur_token = token;
     if (!l->shown) { l->shown = 1; droiddeck_log("layer", "%s: layer shown", l->name); }
     vkp_signal_first_frame();
@@ -853,13 +854,16 @@ void sc_layer_vortek_z(int slot, int z) {
     if (slot < 0 || slot >= SC_VORTEK_LAYERS) return;
     struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
     if (l->z == z) return;
-    l->z = z;
-    if (!l->sc || api.state != 1) return;
+    if (!l->sc || api.state != 1) {
+        l->z = z; /* ensure_sc creates the SurfaceControl at this z */
+        return;
+    }
     ASurfaceTransaction *tx = api.txCreate();
     if (!tx) return;
     api.setZOrder(tx, l->sc, z);
     api.txApply(tx);
     api.txDelete(tx);
+    l->z = z;
 }
 
 int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const struct droiddeck_color *color) {

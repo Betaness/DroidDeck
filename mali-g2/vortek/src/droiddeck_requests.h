@@ -28,6 +28,8 @@ typedef struct DDPresentZeroCopy {
  * layer. HIDE: no image, take this swapchain's layer off the screen (its window is gone or hidden). */
 #define DD_ZC_FLAG_STACK_KEY 0x80000000u
 #define DD_ZC_FLAG_HIDE 0x40000000u
+/* RESTACK (with STACK_KEY): no image, the swapchain's window moved in the X stacking order. */
+#define DD_ZC_FLAG_RESTACK 0x20000000u
 #define DD_ZC_WAIT_COUNT_MASK 0x0000ffffu
 
 /* Payload: the layout of REQUEST_CODE_VK_END_COMMAND_BUFFER (uint64 command buffer id, then the

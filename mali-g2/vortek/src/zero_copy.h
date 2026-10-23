@@ -25,6 +25,7 @@ enum {
     ZC_MSG_RELEASE = 5,
     ZC_MSG_REFUSED = 6,
     ZC_MSG_MODE = 7,
+    ZC_MSG_RESTACK = 8,      /* server -> compositor: a shown chain's stacking key changed */
 };
 
 typedef struct ZeroCopyMsg {
@@ -53,6 +54,7 @@ bool ZeroCopy_present(uint32_t chain, uint32_t index, int32_t x, int32_t y, int3
 /* False while the compositor needs the composited scene (screen effects and the like). */
 bool ZeroCopy_accepting(void);
 void ZeroCopy_hide(uint32_t chain);
+void ZeroCopy_restack(uint32_t chain, uint64_t stackKey);
 void ZeroCopy_destroyChain(uint32_t chain);
 
 #endif

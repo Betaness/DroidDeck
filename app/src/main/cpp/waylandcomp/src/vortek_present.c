@@ -148,7 +148,7 @@ static void hide(void) {
 }
 
 /* Layer order from the stacking keys; returns the z of `slot` and moves the other layers whose
- * place changed. The z values sit between sc_layer's GAME and OVERLAY layers. */
+ * place changed (slot -1: moves them all). The z values sit between sc_layer's GAME and OVERLAY. */
 static int restack(int slot) {
     int order[VP_LAYERS], n = 0;
     for (int i = 0; i < VP_LAYERS; i++) if (g_show[i].chain) order[n++] = i;
@@ -227,19 +227,21 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     if (slot < 0) {
         fresh = 1;
         for (int i = 0; i < VP_LAYERS && slot < 0; i++) if (!g_show[i].chain) slot = i;
-        /* Every layer taken: a swapchain recreated for a window takes over that window's layer. */
+        /* Every layer taken: a swapchain recreated for a window (same place, same stacking key)
+         * takes over that window's layer. */
+        uint64_t key = ((uint64_t)m->key_hi << 32) | m->key_lo;
         for (int i = 0; i < VP_LAYERS && slot < 0; i++)
             if (g_show[i].rect[0] == m->x && g_show[i].rect[1] == m->y && g_show[i].rect[2] == m->w &&
-                g_show[i].rect[3] == m->h) slot = i;
+                g_show[i].rect[3] == m->h && g_show[i].key == key) slot = i;
         if (slot < 0) {
             if (acquire_fd >= 0) close(acquire_fd);
             send_release(m->chain, m->index, -1);
             refuse(m->chain, "every zero-copy layer is in use");
             return;
         }
-        g_show[slot].seq = ++g_show_seq;
     }
     struct vp_shown before = g_show[slot];
+    if (fresh) g_show[slot].seq = ++g_show_seq;
     g_show[slot].chain = m->chain;
     g_show[slot].rect[0] = m->x; g_show[slot].rect[1] = m->y; g_show[slot].rect[2] = m->w; g_show[slot].rect[3] = m->h;
     g_show[slot].key = ((uint64_t)m->key_hi << 32) | m->key_lo;
@@ -301,6 +303,16 @@ static int on_conn(int fd, uint32_t mask, void *data) {
         case VP_MSG_HIDE:
             if (got_fd >= 0) close(got_fd);
             hide_chain(m.chain);
+            break;
+        case VP_MSG_RESTACK:
+            if (got_fd >= 0) close(got_fd);
+            for (int i = 0; i < VP_LAYERS; i++) {
+                uint64_t key = ((uint64_t)m.key_hi << 32) | m.key_lo;
+                if (g_show[i].chain == m.chain && g_show[i].key != key) {
+                    g_show[i].key = key;
+                    restack(-1);
+                }
+            }
             break;
         case VP_MSG_CHAIN_DESTROY: {
             if (got_fd >= 0) close(got_fd);

@@ -18,6 +18,7 @@ enum {
     VP_MSG_RELEASE = 5,       /* compositor -> server, SCM_RIGHTS: release fence or none */
     VP_MSG_REFUSED = 6,       /* compositor -> server: never present this chain zero-copy */
     VP_MSG_MODE = 7,          /* compositor -> server: index 1 accepts presents, 0 pauses them */
+    VP_MSG_RESTACK = 8,       /* server -> compositor: a shown chain's stacking key (key_hi/key_lo) changed */
 };
 
 struct vp_msg {

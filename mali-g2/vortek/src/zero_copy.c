@@ -162,6 +162,13 @@ void ZeroCopy_hide(uint32_t chain) {
     sendSimple(ZC_MSG_HIDE, chain);
 }
 
+void ZeroCopy_restack(uint32_t chain, uint64_t stackKey) {
+    ZeroCopyMsg msg = {.type = ZC_MSG_RESTACK, .chain = chain, .keyHi = (uint32_t)(stackKey >> 32), .keyLo = (uint32_t)stackKey};
+    pthread_mutex_lock(&lock);
+    if (connFd >= 0 && sendMsg(connFd, &msg, -1) != 0) disconnectLocked();
+    pthread_mutex_unlock(&lock);
+}
+
 void ZeroCopy_destroyChain(uint32_t chain) {
     sendSimple(ZC_MSG_CHAIN_DESTROY, chain);
 }

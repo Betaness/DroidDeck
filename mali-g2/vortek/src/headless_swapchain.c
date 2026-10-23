@@ -98,6 +98,7 @@ static void releaseImageLocked(HeadlessSwapchain* headless, uint32_t index, int 
 }
 
 static void onRelease(uint32_t chain, uint32_t index, int fd) {
+    bool hideRefused = false;
     pthread_mutex_lock(&zcLock);
     for (int i = 0; i < MAX_ZERO_COPY_CHAINS; i++) {
         HeadlessSwapchain* headless = zcChains[i];
@@ -106,6 +107,7 @@ static void onRelease(uint32_t chain, uint32_t index, int fd) {
             if (headless->chainId == chain) {
                 headless->zeroCopy = false;
                 headless->shown = false;
+                hideRefused = true;
                 println("vortek-server: compositor refused zero-copy swapchain %u, presenting through X11", chain);
             }
         }
@@ -122,6 +124,8 @@ static void onRelease(uint32_t chain, uint32_t index, int fd) {
     pthread_cond_broadcast(&zcCond);
     pthread_mutex_unlock(&zcLock);
     if (fd >= 0) close(fd);
+    /* A frame of this chain sent before the refusal arrived may be on a layer by now. */
+    if (hideRefused) ZeroCopy_hide(chain);
 }
 
 static void registerZeroCopy(HeadlessSwapchain* headless) {
@@ -957,6 +961,17 @@ void XWindowSwapchain_forgetContext(void* context) {
 
 /* DD_ZC_FLAG_HIDE: the client's window is gone or hidden; its frames leave the screen. Images the
  * compositor holds come back with its release messages. */
+/* DD_ZC_FLAG_RESTACK: the window of a shown swapchain moved in the X stacking order. */
+static VkResult restackZeroCopy(XWindowSwapchain* swapchain, uint64_t stackKey) {
+    HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
+    if (!headless || !headless->owner) return VK_SUCCESS;
+    pthread_mutex_lock(&zcLock);
+    bool shown = headless->shown;
+    pthread_mutex_unlock(&zcLock);
+    if (shown) ZeroCopy_restack(headless->chainId, stackKey);
+    return VK_SUCCESS;
+}
+
 static VkResult hideZeroCopy(XWindowSwapchain* swapchain) {
     HeadlessSwapchain* headless = (HeadlessSwapchain*)swapchain;
     if (!headless || !headless->owner) return VK_SUCCESS;
@@ -979,6 +994,13 @@ void droiddeck_handlePresentZeroCopy(VkContext* context) {
         uint32_t extra = (flags & DD_ZC_FLAG_STACK_KEY) ? 1 : 0;
         if (flags & DD_ZC_FLAG_HIDE) {
             result = hideZeroCopy(VkObject_fromId(request.swapchainId));
+        }
+        else if (flags & DD_ZC_FLAG_RESTACK) {
+            uint64_t stackKey = 0;
+            if (extra && context->inputBufferSize >= (int)(sizeof(request) + sizeof(stackKey))) {
+                memcpy(&stackKey, context->inputBuffer + sizeof(request), sizeof(stackKey));
+                result = restackZeroCopy(VkObject_fromId(request.swapchainId), stackKey);
+            }
         }
         else if (count <= 16 && context->inputBufferSize >= (int)(sizeof(request) + (count + extra) * sizeof(uint64_t))) {
             uint64_t stackKey = 0;
