@@ -297,6 +297,9 @@ if [ -z "${BL_INSIDE:-}" ]; then
     unset STEAM_MULTIPLE_XWAYLANDS STEAM_USE_MANGOAPP STEAM_MANGOAPP_PRESETS_SUPPORTED \
       STEAM_MANGOAPP_HORIZONTAL_SUPPORTED MANGOHUD_CONFIGFILE gamescope_cursor_composite BL_STRETCHED
     start_vortek_display || exit 66
+    # A fullscreen SDL game that loses focus to a Steam menu must not iconify itself (gamescope sets
+    # the same for its children).
+    export SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0
     # Without gamescope the Steam menus would open under a running game: this puts them on top,
     # answers Steam's Resume (_NET_ACTIVE_WINDOW) and publishes the focus atoms gamescope would.
     if [ "$mode" = steam ] && [ -x /usr/local/bin/droiddeck-vortek-focus ]; then
@@ -905,8 +908,11 @@ BUSCONF
     if [ "${BL_STEAM_UI:-}" != desktop ]; then
       if [ "$steam_x64" = 0 ] || [ "${BL_X64_DECK:-1}" != 0 ]; then
         _bl_ui+=(-steamdeck -steamos3)
-        export STEAM_GAMESCOPE_NIS_SUPPORTED=1
-        export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
+        # [mali-g2] Vortek has no gamescope to do the scaling and filters these offer in the QAM.
+        if [ "${BL_GPU_MODE:-}" != vortek ]; then
+          export STEAM_GAMESCOPE_NIS_SUPPORTED=1
+          export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
+        fi
         echo "== steam: Deck mode on (-steamdeck -steamos3)"
       fi
     fi
