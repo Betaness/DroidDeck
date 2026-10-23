@@ -10,6 +10,20 @@
 #include <sys/syscall.h>
 #include "droiddeck_ext.h"
 
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#define F_SEAL_SEAL 0x0001
+#define F_SEAL_SHRINK 0x0002
+#define F_SEAL_GROW 0x0004
+#define F_SEAL_WRITE 0x0008
+#endif
+
 /* [mali-g2] Committed text (Android IME, Steam's keyboard) for X programs of the rootful Xwayland,
  * which has no text-input. As gamescope's ime.cpp: characters keymap.xkb cannot type get Unicode
  * keysyms (U4E2D) on character keys of a temporary keymap sent only to Xwayland, which passes it to
@@ -289,26 +303,35 @@ void x11_key_action(uint32_t evdev) {
 
 int x11_type_text(const char *utf8, size_t len) {
     struct wl_client *c = droiddeck_key_target_client(0);
-    if (!c || !is_xwayland(c) || !g_timer) return 0;
+    if (!c) return 0;
+    int xw = is_xwayland(c) && g_timer;
     uint32_t *cps = malloc((len + 1) * sizeof(*cps)), ev;
     if (!cps) return 1;
-    size_t n = decode(utf8, len, cps);
+    size_t n = decode(utf8, len, cps), typed = 0;
     if (!n) { free(cps); return 1; }
-    int plain = !g_temp && !g_npending;
+    int plain = !g_temp && !g_npending, keys = 0;
     int shift;
-    for (size_t i = 0; i < n && plain; i++)
-        if (!direct_key(cps[i], &ev) && !ascii_key(cps[i], &ev, &shift)) plain = 0;
-    if (plain) {
+    for (size_t i = 0; i < n; i++)
+        if (direct_key(cps[i], &ev) || ascii_key(cps[i], &ev, &shift)) keys = 1; else plain = 0;
+    if (!xw && !keys) { free(cps); return 0; }
+    /* Not Xwayland (gamescope's own X, a Wayland program without text-input): what keymap.xkb types
+     * goes as key presses and the rest is dropped, as KeyboardHost did before it sent such text here. */
+    if (plain || !xw) {
         droiddeck_release_keys();
         for (size_t i = 0; i < n; i++) {
-            if (direct_key(cps[i], &ev)) { x11_key_action(ev); continue; }
-            ascii_key(cps[i], &ev, &shift);
+            if (direct_key(cps[i], &ev)) { x11_key_action(ev); typed++; continue; }
+            if (!ascii_key(cps[i], &ev, &shift)) continue;
             if (shift) droiddeck_inject_key(KEY_LEFTSHIFT, 1);
             x11_key_action(ev);
             if (shift) droiddeck_inject_key(KEY_LEFTSHIFT, 0);
+            typed++;
         }
-        droiddeck_log("text-input", "typed %zu chars into %s as key presses", n, droiddeck_client_name(c));
         free(cps);
+        if (typed < n)
+            droiddeck_log("text-input", "typed %zu of %zu chars into %s as key presses, the rest dropped: it has no "
+                          "text input", typed, n, droiddeck_client_name(c));
+        else
+            droiddeck_log("text-input", "typed %zu chars into %s as key presses", n, droiddeck_client_name(c));
         return 1;
     }
     if (!load_map()) { free(cps); return 1; }
