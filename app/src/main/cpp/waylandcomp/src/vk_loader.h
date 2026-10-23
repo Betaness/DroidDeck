@@ -32,7 +32,8 @@
     X(UpdateDescriptorSets) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdBindPipeline) \
     X(CmdBindDescriptorSets) X(CmdPushConstants) X(CmdDraw) X(CmdSetViewport) X(CmdSetScissor) \
       \
-    X(DestroySemaphore)
+    X(DestroySemaphore) X(DestroyFence) X(GetFenceStatus) X(FreeCommandBuffers) X(DestroyCommandPool) \
+    X(CreateQueryPool) X(DestroyQueryPool) X(CmdResetQueryPool) X(CmdWriteTimestamp) X(GetQueryPoolResults)
 
 struct vk_api {
 #define X(n) PFN_vk##n n;

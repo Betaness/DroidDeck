@@ -33,6 +33,14 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
                                           int as_blit_dst);
 int vkp_image_is_dmabuf(const struct vkp_image *img);
 
+/* [mali-g2] AHardwareBuffer import (VK_ANDROID_external_memory_android_hardware_buffer): the driver
+ * reads gralloc's own layout. LAYER: a pool buffer the compositor blits or renders into; SAMPLED: a
+ * client's buffer it samples. Owned by the foreign queue family between uses, like a dma-buf. */
+enum { VKP_AHB_LAYER = 0, VKP_AHB_SAMPLED = 1 };
+struct AHardwareBuffer;
+int vkp_ahb_import_available(void);
+struct vkp_image *vkp_image_import_ahb(struct AHardwareBuffer *ahb, int target);
+
 struct vkp_image *vkp_image_create_shm(int w, int h);
 void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride);
 /* Only the rectangles (x0, y0, x1, y1 in buffer pixels) the client damaged; the rest of img keeps
