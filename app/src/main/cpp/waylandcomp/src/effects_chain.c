@@ -146,6 +146,16 @@ int vkp_effects_active(void) {
     return spatial_mode(g_cur.scaling) || effect_count(&g_cur) > 0;
 }
 
+int vkp_effects_spatial_active(void) {
+    vkp_effects_sync();
+    return spatial_mode(g_cur.scaling) || cas_active(&g_cur);
+}
+
+int vkp_effects_scene_active(void) {
+    vkp_effects_sync();
+    return effect_count(&g_cur) - cas_active(&g_cur) > 0;
+}
+
 VkFilter vkp_effects_blit_filter(void) {
     vkp_effects_sync();
     return g_cur.scaling == 2 ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;

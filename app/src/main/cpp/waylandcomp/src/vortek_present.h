@@ -34,8 +34,10 @@ struct vp_msg {
 
 void vortek_present_init(struct wl_event_loop *loop);
 void vortek_present_scene_size(int w, int h);
-/* Screen effects, frame generation and cardboard need the composited scene: pause zero-copy. */
+/* Scene effects, frame generation and cardboard need the composited scene: pause zero-copy. */
 void vortek_present_set_accept(int accept);
+/* Scaling filters and CAS stay on the copy path only: zero-copy layers show the frames as they are. */
+void vortek_present_set_spatial(int on);
 unsigned vortek_present_stats_take(void);
 /* From sc_layer's transaction-complete callback (a binder thread). */
 void vortek_present_released(void *token, int release_fd);

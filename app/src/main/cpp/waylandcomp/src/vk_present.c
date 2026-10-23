@@ -36,6 +36,7 @@ struct vkp_image {
     int in_general;
     VkFormat fmt;
     int sampled;
+    uint64_t gpu_serial;   /* the last frame that reads it; 0: none in flight */
 };
 
 static ANativeWindow *g_window;
@@ -48,9 +49,24 @@ static VkQueue g_queue;
 static uint32_t g_qfam;
 static VkCommandPool g_pool;
 #define MAX_PRESENTS (1 + VKP_FG_MAX_GENERATIONS)
-static VkCommandBuffer g_cmds[MAX_PRESENTS];
-static VkSemaphore g_acqs[MAX_PRESENTS], g_rnds[MAX_PRESENTS];
+/* render_impl does not wait for the GPU after presenting: a frame keeps its slot (command buffers,
+ * semaphores, fence) until the slot is reused, and whatever the CPU would change under a frame still
+ * in flight (an shm image it reads, a buffer going back to its client, anything destroyed) waits for
+ * that frame first. */
+#define FRAME_SLOTS 2
+struct frame_slot {
+    VkCommandBuffer cmds[MAX_PRESENTS];
+    VkSemaphore acqs[MAX_PRESENTS], rnds[MAX_PRESENTS];
+    VkFence fence;
+    uint64_t serial;   /* frame submitted with the fence, 0: nothing pending */
+};
+static struct frame_slot g_slots[FRAME_SLOTS];
+static unsigned g_slot_next;
+static uint64_t g_frame_serial;
+/* One-shot submissions that wait for themselves (layer blits and passes, readback, setup). */
+static VkCommandBuffer g_sync_cmd;
 static VkFence g_fence;
+static int frames_wait(uint64_t serial);
 static int g_swap_extra;
 #define SCENE_FMT VK_FORMAT_R8G8B8A8_UNORM
 static VkPhysicalDeviceMemoryProperties g_memprops;
@@ -191,11 +207,14 @@ void vk_present_set_driver(const char *driver_path, const char *library_name,
 
 static void reset_sync(void) {
     VkSemaphoreCreateInfo semci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    for (int k = 0; k < MAX_PRESENTS; k++) {
-        if (g_acqs[k]) g_vk.DestroySemaphore(g_dev, g_acqs[k], NULL);
-        if (g_rnds[k]) g_vk.DestroySemaphore(g_dev, g_rnds[k], NULL);
-        g_vk.CreateSemaphore(g_dev, &semci, NULL, &g_acqs[k]);
-        g_vk.CreateSemaphore(g_dev, &semci, NULL, &g_rnds[k]);
+    for (int f = 0; f < FRAME_SLOTS; f++) {
+        for (int k = 0; k < MAX_PRESENTS; k++) {
+            VkSemaphore *acq = &g_slots[f].acqs[k], *rnd = &g_slots[f].rnds[k];
+            if (*acq) g_vk.DestroySemaphore(g_dev, *acq, NULL);
+            if (*rnd) g_vk.DestroySemaphore(g_dev, *rnd, NULL);
+            g_vk.CreateSemaphore(g_dev, &semci, NULL, acq);
+            g_vk.CreateSemaphore(g_dev, &semci, NULL, rnd);
+        }
     }
 }
 
@@ -524,8 +543,13 @@ static int dev_init(void) {
     VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                        .commandPool = g_pool,
                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = MAX_PRESENTS};
-    g_vk.AllocateCommandBuffers(g_dev, &cai, g_cmds);
     VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (int f = 0; f < FRAME_SLOTS; f++) {
+        g_vk.AllocateCommandBuffers(g_dev, &cai, g_slots[f].cmds);
+        g_vk.CreateFence(g_dev, &fci, NULL, &g_slots[f].fence);
+    }
+    cai.commandBufferCount = 1;
+    g_vk.AllocateCommandBuffers(g_dev, &cai, &g_sync_cmd);
     g_vk.CreateFence(g_dev, &fci, NULL, &g_fence);
 
     vkp_effects_bind_device(g_dev, g_pd, &g_memprops);
@@ -779,7 +803,7 @@ static void init_black_image(void) {
     }
     g_vk.BindImageMemory(g_dev, g_black_img, g_black_mem, 0);
 
-    VkCommandBuffer cmd = g_cmds[0];
+    VkCommandBuffer cmd = g_sync_cmd;
     g_vk.ResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -1040,13 +1064,58 @@ struct vkp_image *vkp_image_create_shm(int w, int h) {
     return img;
 }
 
+/* The GPU reads shm images straight from their mapping: a frame still in flight that reads img
+ * is waited for before img is rewritten or destroyed. Returns 1 if it had to wait. */
+static int image_idle(struct vkp_image *img) {
+    if (!img || !img->gpu_serial) return 0;
+    const int waited = frames_wait(img->gpu_serial);
+    img->gpu_serial = 0;
+    return waited;
+}
+
+void vkp_image_wait_idle(struct vkp_image *img) { image_idle(img); }
+
+static void upload_note(int64_t t0, uint64_t bytes, int partial, int waited) {
+    perf_add(&g_perf.upload_ns, &g_perf.upload_max_ns, &g_perf.uploads, perf_now() - t0);
+    g_perf.upload_bytes += bytes;
+    if (partial) g_perf.uploads_partial++;
+    if (waited) g_perf.upload_waits++;
+}
+
 void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
     if (!img || !img->map || !data) return;
+    const int64_t t0 = perf_now();
+    const int waited = image_idle(img);
     size_t rowbytes = (size_t)img->w * 4;
     if ((size_t)stride < rowbytes) rowbytes = (size_t)stride;
     for (int y = 0; y < img->h; y++)
         memcpy((uint8_t *)img->map + img->offset + (size_t)y * img->row_pitch,
                (const uint8_t *)data + (size_t)y * stride, rowbytes);
+    upload_note(t0, (uint64_t)rowbytes * (uint64_t)img->h, 0, waited);
+}
+
+void vkp_image_upload_shm_rects(struct vkp_image *img, const void *data, int stride, const int (*rects)[4], int n) {
+    if (!img || !img->map || !data || n <= 0) return;
+    const int64_t t0 = perf_now();
+    const int waited = image_idle(img);
+    size_t rowbytes = (size_t)img->w * 4;
+    if ((size_t)stride < rowbytes) rowbytes = (size_t)stride;
+    const int max_x = (int)(rowbytes / 4);
+    uint64_t bytes = 0;
+    for (int i = 0; i < n; i++) {
+        int x0 = rects[i][0], y0 = rects[i][1], x1 = rects[i][2], y1 = rects[i][3];
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > max_x) x1 = max_x;
+        if (y1 > img->h) y1 = img->h;
+        if (x1 <= x0 || y1 <= y0) continue;
+        const size_t off = (size_t)x0 * 4, len = (size_t)(x1 - x0) * 4;
+        for (int y = y0; y < y1; y++)
+            memcpy((uint8_t *)img->map + img->offset + (size_t)y * img->row_pitch + off,
+                   (const uint8_t *)data + (size_t)y * stride + off, len);
+        bytes += (uint64_t)len * (uint64_t)(y1 - y0);
+    }
+    upload_note(t0, bytes, 1, waited);
 }
 
 int vkp_image_width(const struct vkp_image *img) { return img ? img->w : 0; }
@@ -1055,6 +1124,7 @@ int vkp_image_height(const struct vkp_image *img) { return img ? img->h : 0; }
 void vkp_image_destroy(struct vkp_image *img) {
     if (!img) return;
     if (g_dev) {
+        image_idle(img);
         blendp_forget_image(img->image);
         if (img->map) g_vk.UnmapMemory(g_dev, img->mem);
         if (img->image) g_vk.DestroyImage(g_dev, img->image, NULL);
@@ -1251,6 +1321,24 @@ static void device_lost(const char *where) {
     g_nimg = 0;
 }
 
+static int slot_wait(struct frame_slot *f) {
+    if (!f->serial) return 0;
+    VkResult r = timed_wait(f->fence, UINT64_MAX);
+    f->serial = 0;
+    if (r == VK_ERROR_DEVICE_LOST) device_lost("frame fence");
+    return 1;
+}
+
+/* Waits for every frame in flight up to and including `serial`; returns 1 if one was pending. */
+static int frames_wait(uint64_t serial) {
+    int waited = 0;
+    for (int i = 0; i < FRAME_SLOTS; i++)
+        if (g_slots[i].serial && g_slots[i].serial <= serial) waited |= slot_wait(&g_slots[i]);
+    return waited;
+}
+
+static void frames_idle(void) { frames_wait(UINT64_MAX); }
+
 static const char *vk_result_name(VkResult r) {
     switch (r) {
     case VK_ERROR_OUT_OF_DATE_KHR: return "OUT_OF_DATE";
@@ -1336,11 +1424,11 @@ static void record_screen_blit(VkCommandBuffer cmd, VkImage src, int src_w, int 
                             0, 0, NULL, 0, NULL, 1, &b_present);
 }
 
-static int acquire_image(int k, int first, uint32_t *img, VkResult *ar_out) {
+static int acquire_image(const struct frame_slot *f, int k, int first, uint32_t *img, VkResult *ar_out) {
     for (int attempt = 0; ; attempt++) {
         if (!g_swapchain && (!first || swap_init() != 0)) return -1;
         const int64_t t_acq = perf_now();
-        VkResult ar = g_vk.AcquireNextImageKHR(g_dev, g_swapchain, 1000000000ULL, g_acqs[k], VK_NULL_HANDLE, img);
+        VkResult ar = g_vk.AcquireNextImageKHR(g_dev, g_swapchain, 1000000000ULL, f->acqs[k], VK_NULL_HANDLE, img);
         perf_add(&g_perf.acquire_ns, &g_perf.acquire_max_ns, &g_perf.acquires, perf_now() - t_acq);
         if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) { *ar_out = ar; return 0; }
         if (ar == VK_ERROR_DEVICE_LOST) { device_lost("acquire"); return -1; }
@@ -1484,9 +1572,19 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     }
     g_swap_hdr_want = want_hdr;
 
+    /* The slot's command buffers and acquire semaphores are reused: its last frame must be done. */
+    struct frame_slot *f = &g_slots[g_slot_next];
+    slot_wait(f);
+    if (g_dev_state == -2) return -1;
     uint32_t img = 0;
     VkResult ar;
-    if (acquire_image(0, 1, &img, &ar) != 0) return -1;
+    if (acquire_image(f, 0, 1, &img, &ar) != 0) return -1;
+    /* Recording reuses single-instance resources (scene image, effect targets, blend and cardboard
+     * descriptor caches, frame generation), so the previous frame finishes first. It normally has by
+     * now: only this wait, after the acquire, is left of the old wait right after every present. */
+    frames_idle();
+    if (g_dev_state == -2) return -1;
+    const uint64_t serial = ++g_frame_serial;
     update_map(scene_w, scene_h);
     if (g_swap_is_hdr && hf && hf->color && hf->color->identity != g_swap_md_identity) {
         g_swap_md_identity = hf->color->identity;
@@ -1526,7 +1624,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     const VkFormat scene_fmt = deep ? FG_HDR_FMT : SCENE_FMT;
     const VkFilter blit_filter = vkp_effects_blit_filter();
 
-    VkCommandBuffer cmd = g_cmds[0];
+    VkCommandBuffer cmd = f->cmds[0];
     g_vk.ResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -1544,6 +1642,7 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
     for (int i = 0; i < n; i++) {
         struct vkp_image *im = draws[i].img;
+        if (im) im->gpu_serial = serial;
         int seen = 0;
         for (int j = 0; j < i; j++) if (draws[j].img == im) { seen = 1; break; }
         if (seen || !im) continue;
@@ -1654,17 +1753,17 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     const int presents = 1 + ngen;
     int fence_submitted = 0, presented_gen = 0;
     VkResult pr = VK_SUCCESS;
-    g_vk.ResetFences(g_dev, 1, &g_fence);
+    g_vk.ResetFences(g_dev, 1, &f->fence);
     for (int k = 0; k < presents; k++) {
         if (k > 0) {
             VkResult ark;
-            if (acquire_image(k, 0, &img, &ark) != 0) {
+            if (acquire_image(f, k, 0, &img, &ark) != 0) {
                 droiddeck_log("framegen", "present %d/%d: no swapchain image; the frame ends early", k + 1, presents);
                 pr = VK_ERROR_OUT_OF_DATE_KHR;
                 break;
             }
             if (ark == VK_SUBOPTIMAL_KHR) ar = ark;
-            VkCommandBuffer ck = g_cmds[k];
+            VkCommandBuffer ck = f->cmds[k];
             g_vk.ResetCommandBuffer(ck, 0);
             g_vk.BeginCommandBuffer(ck, &bi);
             record_screen_blit(ck, k < ngen ? gens[k] : result, rw, rh, scene_w, scene_h, img, blit_filter, cb);
@@ -1673,9 +1772,9 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         const int last = (k + 1 == presents);
         VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1,
-                           .pWaitSemaphores = &g_acqs[k], .pWaitDstStageMask = &wait, .commandBufferCount = 1,
-                           .pCommandBuffers = &g_cmds[k], .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rnds[k]};
-        VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, last ? g_fence : VK_NULL_HANDLE);
+                           .pWaitSemaphores = &f->acqs[k], .pWaitDstStageMask = &wait, .commandBufferCount = 1,
+                           .pCommandBuffers = &f->cmds[k], .signalSemaphoreCount = 1, .pSignalSemaphores = &f->rnds[k]};
+        VkResult qr = g_vk.QueueSubmit(g_queue, 1, &si, last ? f->fence : VK_NULL_HANDLE);
         if (qr != VK_SUCCESS) {
             if (qr == VK_ERROR_DEVICE_LOST) device_lost("submit");
             else LOGE("present: submit %d/%d failed (%d)", k + 1, presents, (int)qr);
@@ -1683,8 +1782,9 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
             return -1;
         }
         fence_submitted = last;
+        if (last) f->serial = serial;
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
-                               .pWaitSemaphores = &g_rnds[k], .swapchainCount = 1,
+                               .pWaitSemaphores = &f->rnds[k], .swapchainCount = 1,
                                .pSwapchains = &g_swapchain, .pImageIndices = &img};
         const int64_t t_pres = perf_now();
         pr = g_vk.QueuePresentKHR(g_queue, &pi);
@@ -1694,11 +1794,13 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     }
     if (!fence_submitted) {
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
+        if (g_vk.QueueSubmit(g_queue, 1, &si, f->fence) == VK_SUCCESS) f->serial = serial;
     }
-    VkResult fr = timed_wait(g_fence, UINT64_MAX);
+    g_slot_next = (g_slot_next + 1) % FRAME_SLOTS;
+    /* Frame generation keeps its own per-frame state outside these slots: its frames finish here. */
+    if (fg) slot_wait(f);
     if (fg) vkp_framegen_presented(presented_gen);
-    if (fr == VK_ERROR_DEVICE_LOST || pr == VK_ERROR_DEVICE_LOST) { device_lost("present"); return -1; }
+    if (g_dev_state == -2 || pr == VK_ERROR_DEVICE_LOST) { device_lost("present"); return -1; }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR) {
         droiddeck_log("gpu", "screen surface %s on present: rebuilding the swapchain", vk_result_name(pr));
         destroy_swapchain();
@@ -1825,11 +1927,13 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
         if (wait_fd >= 0) close(wait_fd);
         return -1;
     }
+    /* src may be what a frame in flight reads (its layout changes below) */
+    frames_idle();
     const int gpu_wait = take_wait_fd(wait_fd);
     if (gpu_wait < 0) return -1;
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    VkCommandBuffer g_cmd = g_cmds[0];
+    VkCommandBuffer g_cmd = g_sync_cmd;
     g_vk.ResetCommandBuffer(g_cmd, 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -1929,8 +2033,9 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
         }
         g_rb = img;
     }
+    frames_idle();
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkCommandBuffer cmd = g_cmds[0];
+    VkCommandBuffer cmd = g_sync_cmd;
     g_vk.ResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -2007,6 +2112,8 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
                            const struct vkp_hdr_frame *hf, int *rw, int *rh) {
     if (g_pass.active) vkp_pass_abort();
     if (vkp_update_map(scene_w, scene_h) != 0) return -1;
+    /* The pass records into the same scene image, effect targets and blend caches as render_impl. */
+    frames_idle();
     if (hf) {
         if (ensure_img(&g_hdrscene, scene_w, scene_h, HDR_FMT,
                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2015,7 +2122,7 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
             return -1;
     } else if (ensure_scene_image(scene_w, scene_h) != 0) return -1;
 
-    VkCommandBuffer cmd = g_cmds[0];
+    VkCommandBuffer cmd = g_sync_cmd;
     g_vk.ResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -2095,7 +2202,7 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
 int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
     if (!g_pass.active) { if (wait_fd >= 0) close(wait_fd); return -1; }
     g_pass.active = 0;
-    VkCommandBuffer cmd = g_cmds[0];
+    VkCommandBuffer cmd = g_sync_cmd;
     if (!dst || !dst->blit_dst || g_dev_state == -2) {
         if (wait_fd >= 0) close(wait_fd);
         g_vk.EndCommandBuffer(cmd);
@@ -2148,5 +2255,5 @@ int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
 void vkp_pass_abort(void) {
     if (!g_pass.active) return;
     g_pass.active = 0;
-    g_vk.EndCommandBuffer(g_cmds[0]);
+    g_vk.EndCommandBuffer(g_sync_cmd);
 }
