@@ -206,6 +206,8 @@ static int32_t utf8_offset(const char *s, size_t len, int chars) {
 void text_input_host_commit(const char *utf8, size_t len) {
     struct text_input *ti = active_input();
     if (!ti) {
+        /* [mali-g2] X programs of the rootful Xwayland have no text-input: typed as keys there. */
+        if (x11_type_text(utf8, len)) return;
         droiddeck_log("text-input", "typed text (%zu chars) dropped: no program accepts text input", utf8_chars(utf8, len));
         return;
     }

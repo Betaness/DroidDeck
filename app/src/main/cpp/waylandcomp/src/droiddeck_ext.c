@@ -113,6 +113,7 @@ void droiddeck_ext_init(struct wl_display *display) {
         __android_log_print(ANDROID_LOG_ERROR, "DroidDeckWayland", "host queue pipe failed");
     clipboard_init(display);
     text_input_init(display);
+    x11_type_init(display);
     toplevel_icon_init(display);
     single_pixel_init(display);
 }

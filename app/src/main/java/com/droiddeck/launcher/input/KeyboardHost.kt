@@ -12,6 +12,8 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import com.droiddeck.launcher.wayland.CompositorHost
+import com.droiddeck.launcher.wayland.WaylandCompositor
 
 class KeyboardHost(
     context: Context,
@@ -35,11 +37,23 @@ class KeyboardHost(
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
         if (!shown) return null
+        // A password field keeps IMEs on a Latin layout that types key by key; pinyin, kana and
+        // hangul need a plain text field, where they compose before committing.
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            (if (fullIme()) 0 else InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD)
         outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_FULLSCREEN or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI
         return KeyConnection()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun fullIme(): Boolean {
+        val locales = resources.configuration.locales
+        val languages = (0 until locales.size()).mapTo(mutableListOf<String>()) { locales[it].language }
+        imm.currentInputMethodSubtype?.let {
+            languages += it.languageTag.ifEmpty { it.locale }.substringBefore('-').substringBefore('_')
+        }
+        return languages.any { it in COMPOSING_LANGUAGES }
     }
 
     fun toggle() = if (shown && imeVisible()) hide() else show()
@@ -65,25 +79,36 @@ class KeyboardHost(
     }
 
     private inner class KeyConnection : BaseInputConnection(this, false) {
+        // Composing text stays in the IME's candidate bar; programs get it once committed.
+        private var composing = ""
+
         override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-            if (text.isNullOrEmpty()) return true
-            val events = map.getEvents(text.toString().toCharArray())
-            if (events != null) {
-                for (event in events) sendKeyEvent(event)
-            } else {
-                for (ch in text) {
-                    val t = System.currentTimeMillis()
-                    val down = KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_UNKNOWN, 0, 0,
-                        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, 0)
-                    sendKeyEvent(CharKeyEvent(down, ch))
-                    sendKeyEvent(CharKeyEvent(KeyEvent.changeAction(down, KeyEvent.ACTION_UP), ch))
-                }
-            }
+            composing = ""
+            if (!text.isNullOrEmpty()) type(text.toString())
             return true
         }
 
-        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean = true
-        override fun finishComposingText(): Boolean = true
+        override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+            composing = text?.toString().orEmpty()
+            return true
+        }
+
+        override fun finishComposingText(): Boolean {
+            val text = composing
+            composing = ""
+            if (text.isNotEmpty()) type(text)
+            return true
+        }
+
+        // Whole, so ASCII in it keeps its place: the compositor types it into X programs too.
+        private fun type(text: String) {
+            val events = map.getEvents(text.toCharArray())
+            if (events != null) {
+                for (event in events) sendKeyEvent(event)
+            } else if (CompositorHost.isStarted) {
+                WaylandCompositor.textInputCommit(text)
+            }
+        }
 
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
             repeat(beforeLength) { tap(KeyEvent.KEYCODE_DEL) }
@@ -109,8 +134,7 @@ class KeyboardHost(
         override fun getSelectedText(flags: Int): CharSequence? = null
     }
 
-    private class CharKeyEvent(origin: KeyEvent, private val ch: Char) : KeyEvent(origin) {
-        override fun getUnicodeChar(): Int = ch.code
-        override fun getUnicodeChar(metaState: Int): Int = ch.code
+    private companion object {
+        val COMPOSING_LANGUAGES = setOf("zh", "ja", "ko")
     }
 }
