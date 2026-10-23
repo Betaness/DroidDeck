@@ -446,10 +446,11 @@ static int alloc_slot(struct layer *l, struct slot *s, int w, int h, uint32_t fm
             continue;
         }
         /* [mali-g2] Imported as an AHardwareBuffer the driver knows gralloc's layout (AFBC on Mali); the
-         * dma-buf import below needs the layout spelled out, which only Qualcomm handles allow. */
-        struct vkp_image *img = vkp_ahb_import_available() ? vkp_image_import_ahb(ahb, VKP_AHB_LAYER) : NULL;
+         * dma-buf import below needs the layout spelled out, which only Qualcomm handles allow. Those
+         * keep the dma-buf import they always had. */
+        struct vkp_image *img = (!qcom && vkp_ahb_import_available()) ? vkp_image_import_ahb(ahb, VKP_AHB_LAYER) : NULL;
         const int via_ahb = img != NULL;
-        if (via_ahb && !qcom) mod = MOD_GRALLOC;
+        if (via_ahb) mod = MOD_GRALLOC;
         if (!img && !qcom) {
             if (tier < TIER_LINEAR) {
                 AHardwareBuffer_release(ahb);

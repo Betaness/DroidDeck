@@ -162,11 +162,21 @@ const uint32_t *vkp_effects_shader(int which, size_t *size) {
     }
 }
 
+/* Reads the newest settings without taking them over: called per Vortek frame, between vsyncs, it must
+ * not swallow the change that on_vsync's vkp_effects_sync turns into a redraw (a scene effect switched
+ * on would then never pause zero-copy). */
 int vkp_effects_scaling(int *sharp_pct, int *cas_on) {
-    vkp_effects_sync();
-    if (sharp_pct) *sharp_pct = g_cur.sharp_pct;
-    if (cas_on) *cas_on = cas_active(&g_cur);
-    return g_cur.scaling;
+    struct fx_settings s;
+    if (g_changed || !g_cur_valid) {
+        pthread_mutex_lock(&g_lock);
+        s = g_set;
+        pthread_mutex_unlock(&g_lock);
+    } else {
+        s = g_cur;
+    }
+    if (sharp_pct) *sharp_pct = s.sharp_pct;
+    if (cas_on) *cas_on = cas_active(&s);
+    return s.scaling;
 }
 
 int vkp_effects_scene_active(void) {

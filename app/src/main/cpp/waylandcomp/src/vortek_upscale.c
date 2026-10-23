@@ -768,7 +768,8 @@ static int run_job(struct job *j, int z, struct ASurfaceTransaction *batch) {
     int game_fd = done_fd >= 0 ? dup(done_fd) : -1, keep_fd = done_fd >= 0 ? dup(done_fd) : -1;
     if (done_fd < 0 || game_fd < 0 || keep_fd < 0) {
         /* Without a fence to hand on, the pass has to be over before anyone sees its result. */
-        if (job_wait(j) != 0) {
+        const int unfinished = job_wait(j) != 0;
+        if (unfinished) {
             if (G.state == 1) disable("a pass did not finish");
         } else if (done_fd < 0) {
             disable("the driver did not export a sync_fd for a finished pass");
@@ -777,6 +778,13 @@ static int run_job(struct job *j, int z, struct ASurfaceTransaction *batch) {
         if (keep_fd >= 0) close(keep_fd);
         if (done_fd >= 0) close(done_fd);
         game_fd = keep_fd = done_fd = -1;
+        if (unfinished) {
+            /* A half-written buffer is not shown; the game gets its image back regardless. */
+            release_game(j->chain, j->index, -1);
+            sc_layer_vortek_pool_put(j->slot, j->pool_idx, -1);
+            g_stat.drops++;
+            return -1;
+        }
     }
     release_game(j->chain, j->index, game_fd);
     if (sc_layer_present_vortek_pooled(j->slot, z, j->pool_idx, done_fd, j->geo, batch) != 0) {
