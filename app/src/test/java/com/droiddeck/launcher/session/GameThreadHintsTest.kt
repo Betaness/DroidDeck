@@ -32,4 +32,9 @@ class GameThreadHintsTest {
         assertFalse(GameThreadHints.holdsPace(105.0, 120.0))
         assertFalse(GameThreadHints.holdsPace(3.0, 120.0))    // headless or loading: boost
     }
+
+    @Test fun `a saturated thread at half the panel rate is not held by a limiter`() {
+        assertFalse(GameThreadHints.limitedBy(0.83))  // Duckov's main thread at ~60 fps on a mid core
+        assertTrue(GameThreadHints.limitedBy(0.45))   // a 60 fps limiter leaves the thread idle part of each frame
+    }
 }
