@@ -181,6 +181,22 @@ object WirelessAdbFix {
         saveConnection(context, host, port)
     }
 
+    /**
+     * A shell-user connection to this device through the saved pairing (the cached port, else the one
+     * discovered now), or null without a pairing or when wireless debugging is off. The caller closes it.
+     */
+    fun connectUsingSavedPairing(context: Context): Kadb? {
+        val appContext = context.applicationContext
+        val saved = savedConnection(appContext) ?: return null
+        loadOrCreateIdentity(appContext)
+        fun attempt(port: Int): Kadb? = runCatching {
+            Kadb.create(saved.host, port, connectTimeout = 3000).takeIf { it.shell("echo ok").output.trim() == "ok" }
+        }.getOrNull()
+        saved.port?.let { port -> attempt(port)?.let { return it } }
+        val port = findConnectPort(appContext, saved.host) ?: return null
+        return attempt(port)?.also { saveConnection(appContext, saved.host, port) }
+    }
+
     fun setUsingSavedPairing(context: Context, enabled: Boolean) {
         val appContext = context.applicationContext
         val saved = savedConnection(appContext)
