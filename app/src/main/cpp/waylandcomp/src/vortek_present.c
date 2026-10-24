@@ -86,6 +86,12 @@ static int g_batching;
 static struct ASurfaceTransaction *g_batch;
 static unsigned g_batch_buffers;  /* layers that got a buffer in g_batch */
 static int g_trace;               /* VORTEK_PRESENT_TRACE=1: a timestamped line per message */
+/* [mali-g2] The layer whose frames go to HyperOS's frame governor (FrameSchedFeed), -1: none yet. It
+ * stays with one layer: two windows of the same size (Steam's Big Picture behind a full-screen game)
+ * would otherwise take turns, each turn a new layer id for SchedGenius. */
+static int g_feed_slot = -1;
+static int64_t g_feed_ns;
+#define FEED_SWITCH_NS 500000000LL /* the reported layer showed nothing for this long: another may take over */
 
 /* sc_layer only compares tokens, and its completion callback may run after the chain is gone,
  * so a token encodes chain and image instead of pointing at them. */
@@ -418,10 +424,23 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         if (g_show[i].chain && (int64_t)g_show[i].rect[2] * g_show[i].rect[3] > biggest)
             biggest = (int64_t)g_show[i].rect[2] * g_show[i].rect[3];
     if (area >= biggest) droiddeck_count_game_frame();
-    if (area >= biggest && vf.main_window && fsf_enabled()) {
-        const char *name = NULL;
-        const void *sc = sc_layer_vortek_surface(slot, &name);
-        fsf_game_frame(sc, name, feed_fd, (int)c->n, sc_layer_frame_rate_want());
+    /* A frame the upscaler dropped (no free job or pool buffer, a failed pass) is not reported: those
+     * come when the GPU falls behind, and reporting them would hide the misses from SchedGenius. A
+     * deferred pass is: it is shown when the game's frame is ready, unless the next frame overtakes it. */
+    const int shown = up == VKU_SHOWN || up == VKU_DIRECT || vku_pending(slot);
+    if (area >= biggest && vf.main_window && shown && fsf_enabled()) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int64_t t = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        const int64_t feed_area = g_feed_slot >= 0 && g_show[g_feed_slot].chain
+                                      ? (int64_t)g_show[g_feed_slot].rect[2] * g_show[g_feed_slot].rect[3] : -1;
+        if (slot == g_feed_slot || feed_area < area || t - g_feed_ns > FEED_SWITCH_NS) {
+            g_feed_slot = slot;
+            g_feed_ns = t;
+            const char *name = NULL;
+            const void *sc = sc_layer_vortek_surface(slot, &name);
+            fsf_game_frame(sc, name, feed_fd, (int)c->n, sc_layer_frame_rate_want());
+        }
     }
     if (feed_fd >= 0) close(feed_fd);
     if (!g_first_logged) {

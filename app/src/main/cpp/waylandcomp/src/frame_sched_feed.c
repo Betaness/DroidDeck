@@ -44,6 +44,8 @@ _Static_assert(sizeof(struct fbt_fps) == 0x20, "xr_fbt fps layout");
 #define FBT_DEVICE "/dev/xr_fbt"
 
 #define LOG_EVERY_NS 30000000000LL
+#define LOG_CHANGE_NS 5000000000LL  /* a change of layer or thread is logged at most this often */
+#define CHECK_THREAD_NS 1000000000LL /* how often the game's thread is looked for in /proc */
 #define FPS_AGAIN_NS 1000000000LL /* SchedGenius drops a layer that went quiet; its rate is sent again */
 
 static _Atomic int g_mode;
@@ -63,6 +65,8 @@ static int g_last_errno;
 static const char *g_hash_name;
 static uint64_t g_hash;
 static int32_t g_logged_layer, g_logged_pid, g_logged_tid;
+static int64_t g_change_ns, g_check_ns;
+static unsigned g_changes; /* changes not logged since the last line */
 
 void fsf_set_mode(int mode) {
     if (mode < FSF_OFF || mode > FSF_GAME_THREAD) mode = FSF_OFF;
@@ -84,7 +88,7 @@ static int64_t now_ns(void) {
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-struct lib_ref { const char *suffix; const char *path; uintptr_t bias; };
+struct lib_ref { const char *suffix; const char *path; };
 
 static int find_lib(struct dl_phdr_info *info, size_t size, void *data) {
     (void)size;
@@ -93,16 +97,17 @@ static int find_lib(struct dl_phdr_info *info, size_t size, void *data) {
     size_t n = name ? strlen(name) : 0, s = strlen(lib->suffix);
     if (n < s || strcmp(name + n - s, lib->suffix) != 0) return 0;
     lib->path = name;
-    lib->bias = info->dlpi_addr;
     return 1;
 }
 
-/* libgui is outside the app's linker namespace (no dlsym), so its exported symbol is read from the file. */
-static uintptr_t elf_symbol(const char *path, const char *symbol) {
+/* libgui is outside the app's linker namespace (no dlsym), so its exported symbol is read from the file,
+ * and so are its first two instructions (`code`): the mapped text may one day be execute-only. */
+static uintptr_t elf_symbol(const char *path, const char *symbol, uint32_t code[2]) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     struct stat st;
     uintptr_t value = 0;
+    int have_code = 0;
     if (fstat(fd, &st) == 0 && st.st_size > (off_t)sizeof(Elf64_Ehdr)) {
         const uint8_t *base = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (base != MAP_FAILED) {
@@ -126,12 +131,23 @@ static uintptr_t elf_symbol(const char *path, const char *symbol) {
                         }
                     }
                 }
+                /* The symbol's address to a file offset, through the PT_LOAD segment holding it. */
+                const Elf64_Phdr *ph = (const Elf64_Phdr *)(base + eh->e_phoff);
+                for (int i = 0; value && eh->e_phoff + (size_t)eh->e_phnum * sizeof(Elf64_Phdr) <= size &&
+                                i < eh->e_phnum && !have_code; i++) {
+                    if (ph[i].p_type != PT_LOAD || value < ph[i].p_vaddr || value + 8 > ph[i].p_vaddr + ph[i].p_filesz)
+                        continue;
+                    const uint64_t at = value - ph[i].p_vaddr + ph[i].p_offset;
+                    if (at + 8 > size) break;
+                    memcpy(code, base + at, 8);
+                    have_code = 1;
+                }
             }
             munmap((void *)base, st.st_size);
         }
     }
     close(fd);
-    return value;
+    return have_code ? value : 0;
 }
 
 /* Where android::SurfaceControl keeps its SurfaceFlinger layer id: read from getLayerId(), which is
@@ -141,12 +157,12 @@ static int layer_id_offset(void) {
     g_layer_off = -1;
     struct lib_ref gui = {.suffix = "/libgui.so"};
     dl_iterate_phdr(find_lib, &gui);
-    uintptr_t sym = gui.path ? elf_symbol(gui.path, "_ZNK7android14SurfaceControl10getLayerIdEv") : 0;
+    uint32_t code[2] = {0, 0};
+    uintptr_t sym = gui.path ? elf_symbol(gui.path, "_ZNK7android14SurfaceControl10getLayerIdEv", code) : 0;
     if (!sym) {
         droiddeck_log("framesched", "not reporting: no SurfaceControl::getLayerId in %s", gui.path ? gui.path : "(libgui not loaded)");
         return -1;
     }
-    const uint32_t *code = (const uint32_t *)(gui.bias + sym);
     if ((code[0] & 0xffc003ffu) != 0xb9400000u || code[1] != 0xd65f03c0u) {
         droiddeck_log("framesched", "not reporting: SurfaceControl::getLayerId is not a field load (%08x %08x)", code[0], code[1]);
         return -1;
@@ -173,6 +189,8 @@ static void reset(void) {
     g_last_ns = g_log_ns = 0;
     g_reported = g_errors = 0;
     g_logged_layer = g_logged_pid = g_logged_tid = 0;
+    g_change_ns = g_check_ns = 0;
+    g_changes = 0;
 }
 
 static int submit(unsigned long request, void *arg) {
@@ -191,8 +209,23 @@ static int thread_exists(int pid, int tid) {
     return access(path, F_OK) == 0;
 }
 
+/* The game's thread has exited: forget it (unless the app has named another meanwhile), so its tid
+ * is not reported for a thread that reuses it, and the compositor's thread is reported until the
+ * app's next scan names one. */
+static void game_thread_gone(uint64_t game) {
+    if (atomic_compare_exchange_strong(&g_game, &game, 0))
+        droiddeck_log("framesched", "the game's thread %d/%d is gone: reporting the compositor thread until another is named",
+                      (int)(game >> 32), (int)(uint32_t)game);
+}
+
 /* Queue for this frame, then the next frame's dequeue at the same time: as seen from SchedGenius,
- * a render thread that starts the next frame as it hands over this one. */
+ * a render thread that starts the next frame as it hands over this one. That is not what it measures
+ * for an app: libmigui dequeues when the app starts drawing, so dequeue-to-queue is the render time.
+ * The compositor only sees the game's frames arrive, so here it is the time between two frames shown,
+ * and a game held at its frame-rate limit or the panel's rate looks like it uses the whole budget;
+ * any jitter reads as a missed frame and may keep the clocks up for nothing (more power, no gain).
+ * Both ioctls run on the compositor's event-loop thread: if xr_fbt waits on the fence or a lock,
+ * presenting waits with it. */
 static int report(int pid, int tid, int layer, int fence_fd, int images, int expected_us, uint64_t hash, int64_t t) {
     struct fbt_frame f = {.pid = pid, .tid = tid, .layer_id = layer, .frame_id = g_frame_id, .fence_fd = fence_fd,
                           .buffer_count = images, .expected_us = expected_us, .name_hash = hash, .time_ns = t};
@@ -229,21 +262,33 @@ void fsf_game_frame(const void *surface_control, const char *layer_name, int fen
     int pid = getpid(), tid = gettid();
     uint64_t game = atomic_load(&g_game);
     int named = mode == FSF_GAME_THREAD && game && !g_refused;
+    const int64_t t = now_ns();
+    if (named && t - g_check_ns >= CHECK_THREAD_NS) {
+        g_check_ns = t;
+        if (!thread_exists((int)(game >> 32), (int)(uint32_t)game)) {
+            game_thread_gone(game);
+            named = 0;
+        }
+    }
     if (named) { pid = (int)(game >> 32); tid = (int)(uint32_t)game; }
     if (!(target_fps >= 10.0f)) target_fps = 60.0f;
     if (target_fps > 240.0f) target_fps = 240.0f;
     const int fps_x10 = (int)(target_fps * 10.0f + 0.5f), expected_us = (int)(1e6f / target_fps + 0.5f);
     const uint64_t hash = name_hash(layer_name);
-    const int64_t t = now_ns();
     if (layer != g_fps_layer || pid != g_fps_pid || fps_x10 != g_fps_x10 || t - g_last_ns > FPS_AGAIN_NS) {
         struct fbt_fps fps = {.pid = pid, .layer_id = layer, .fps_x10 = fps_x10, .time_ns = t};
         if (submit(FBT_FPS, &fps) == 0) { g_fps_layer = layer; g_fps_pid = pid; g_fps_x10 = fps_x10; }
     }
     int r = report(pid, tid, layer, fence_fd, images, expected_us, hash, t);
-    if (r && named && r != -EBADF && thread_exists(pid, tid)) {
-        g_refused = 1;
-        droiddeck_log("framesched", "the kernel turned down the game's thread %d/%d (%s): reporting the compositor thread instead",
-                      pid, tid, strerror(-r));
+    if (r && named && r != -EBADF) {
+        if (thread_exists(pid, tid)) {
+            g_refused = 1;
+            droiddeck_log("framesched", "the kernel turned down the game's thread %d/%d (%s): reporting the compositor thread instead",
+                          pid, tid, strerror(-r));
+        } else {
+            game_thread_gone(game);
+        }
+        named = 0;
         pid = getpid(); tid = gettid();
         g_fps_pid = 0;
         r = report(pid, tid, layer, fence_fd, images, expected_us, hash, t);
@@ -251,12 +296,17 @@ void fsf_game_frame(const void *surface_control, const char *layer_name, int fen
     g_last_ns = t;
     if (r) return;
     g_reported++;
-    if (layer != g_logged_layer || pid != g_logged_pid || tid != g_logged_tid) {
+    const int changed = layer != g_logged_layer || pid != g_logged_pid || tid != g_logged_tid;
+    if (changed && (!g_change_ns || t - g_change_ns >= LOG_CHANGE_NS)) {
         droiddeck_log("framesched", "reporting %s (layer %d, hash %016llx) to SchedGenius at %.1f fps (%d us a frame) "
-                      "as pid %d tid %d%s", layer_name, layer, (unsigned long long)hash, fps_x10 / 10.0, expected_us,
-                      pid, tid, named ? " (the game's busiest thread)" : " (the compositor thread)");
+                      "as pid %d tid %d%s%s", layer_name, layer, (unsigned long long)hash, fps_x10 / 10.0, expected_us,
+                      pid, tid, named ? " (the game's busiest thread)" : " (the compositor thread)",
+                      g_changes ? "; it changed more often than logged" : "");
         g_logged_layer = layer; g_logged_pid = pid; g_logged_tid = tid;
-        g_log_ns = t;
+        g_change_ns = g_log_ns = t;
+        g_changes = 0;
+    } else if (changed) {
+        g_changes++;
     } else if (t - g_log_ns >= LOG_EVERY_NS) {
         droiddeck_log("framesched", "%u frames reported in %.0f s (layer %d, %.1f fps target, tid %d)%s", g_reported,
                       (t - g_log_ns) / 1e9, layer, fps_x10 / 10.0, tid, g_errors ? "; some ioctls failed, see above" : "");

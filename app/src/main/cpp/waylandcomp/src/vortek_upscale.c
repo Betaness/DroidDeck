@@ -937,6 +937,10 @@ direct:
     return VKU_DIRECT;
 }
 
+int vku_pending(int slot) {
+    return slot >= 0 && slot < SC_VORTEK_LAYERS && G.layers[slot].pending != NULL;
+}
+
 void vku_layer_hidden(int slot) {
     if (slot >= 0 && slot < SC_VORTEK_LAYERS) cancel_pending(slot);
 }
