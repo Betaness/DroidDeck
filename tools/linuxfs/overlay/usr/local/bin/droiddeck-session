@@ -1045,7 +1045,9 @@ BUSCONF
     }
     requests=
     if [ -n "${BL_LAUNCH_DIR:-}" ] && [ -d "$BL_LAUNCH_DIR" ]; then
-      rm -f "$BL_LAUNCH_DIR/steam-stop" "$BL_LAUNCH_DIR/steam-game" "$BL_LAUNCH_DIR/steam-game.tmp"
+      # The app clears a leftover game request before the guest starts and may queue a new one as
+      # soon as the first frame is up: a slow start reached this point 15 s later and deleted it.
+      rm -f "$BL_LAUNCH_DIR/steam-stop"
       requests=1
     fi
     (
