@@ -441,6 +441,13 @@ object SessionPrefs {
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 
+    /** [mali-g2] How games reach the GPU on Mali: "vortek" (forwarded, the default) or "hybris" (in-process, [HybrisGpu]). */
+    fun gpuPath(context: Context): String = prefs(context).getString("gpuPath", null) ?: "vortek"
+
+    fun setGpuPath(context: Context, path: String) {
+        prefs(context).edit().putString("gpuPath", path).apply()
+    }
+
     /** Whether a Windows game's busiest thread may share a core with its wineserver (WineServerColocation). */
     fun wineColocate(context: Context): Boolean = prefs(context).getBoolean("wineColocate", false)
 

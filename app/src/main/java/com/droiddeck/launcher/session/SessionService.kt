@@ -744,6 +744,15 @@ class SessionService : Service() {
                 Log.i(TAG, "gpu: MaliBridge instead of Vortek (BL_VK_BRIDGE)")
             } else {
                 Log.i(TAG, "gpu: Vortek forwarding to ${VortekServerComponent.halDriver()}, no gamescope")
+                // Games may run the driver in-process instead (droiddeck-game-env); Steam stays on Vortek.
+                if (HybrisGpu.wanted(this)) {
+                    if (HybrisGpu.installed(this)) {
+                        guest.add(HybrisGpu.ENV + "=" + HybrisGpu.PATH)
+                        Log.i(TAG, "gpu: games run the Mali driver in-process (libhybris)")
+                    } else {
+                        Log.w(TAG, "gpu: in-process GPU asked for, but ${HybrisGpu.GUEST_ICD} is not in the rootfs")
+                    }
+                }
             }
         }
         val tuOverride = tuDebugOverride()
@@ -927,7 +936,7 @@ class SessionService : Service() {
         }
         if (controllersOn) components.add(RumbleComponent().also { it.attach(this) })
         // [mali-g2] The Android system tree, for loading the vendor Vulkan driver in a guest process (libhybris).
-        if (SessionPrefs.androidSystemBinds(this)) {
+        if (SessionPrefs.androidSystemBinds(this) || HybrisGpu.wanted(this)) {
             ANDROID_SYSTEM_DIRS.filter { File(it).exists() }.forEach { binds.add("$it:$it") }
             Log.i(TAG, "android system binds: on")
         }

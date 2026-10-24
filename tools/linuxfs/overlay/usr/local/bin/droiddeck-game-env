@@ -374,6 +374,33 @@ def zink_all_extensions(command, env):
     return dict(env, VORTEK_ZINK_ALL_EXTENSIONS="1")
 
 
+HYBRIS_DIR = "/usr/local/lib/droiddeck-hybris"
+HYBRIS_ICD = HYBRIS_DIR + "/droiddeck_hybris_icd.aarch64.json"
+HYBRIS_PRELOAD = HYBRIS_DIR + "/lib/libhybris-common.so.1"
+ANDROID_VULKAN = "/system/lib64/libvulkan.so"
+
+
+def hybris_gpu(command, env):
+    """[mali-g2] DROIDDECK_GPU_PATH=hybris (the app's gpuPath setting, or a game's environment): the game's
+    processes run the Mali driver themselves through libhybris (mali-g2/hybris) instead of forwarding every
+    Vulkan call to the Vortek server, and hand their frames to the compositor directly. Games only: Steam's
+    web views stay on Vortek. libhybris-common takes static TLS, so it is preloaded rather than dlopened;
+    the driver and Android's libraries come from the Android system tree the app binds in for it."""
+    if env.get("DROIDDECK_GPU_PATH") != "hybris" or env.get("BL_GPU_MODE") != "vortek":
+        return env
+    if len(command) < 2 or command[1] != "waitforexitandrun":
+        return env
+    missing = [path for path in (HYBRIS_ICD, HYBRIS_PRELOAD, ANDROID_VULKAN) if not os.path.exists(path)]
+    if missing:
+        print("droiddeck-game-env: in-process GPU asked for, but %s is missing; Vortek" % missing[0], file=sys.stderr)
+        return env
+    parts = [p for p in re.split(r"[:\s]+", env.get("LD_PRELOAD", "")) if p and p != HYBRIS_PRELOAD]
+    result = dict(env, VK_ICD_FILENAMES=HYBRIS_ICD, VK_DRIVER_FILES=HYBRIS_ICD, LD_PRELOAD=":".join([HYBRIS_PRELOAD] + parts))
+    result.setdefault("VORTEK_PRESENT_SOCKET", os.path.join(env.get("XDG_RUNTIME_DIR") or "/run/droiddeck", "vortek-present"))
+    print("droiddeck-game-env: Vulkan in-process (libhybris), Steam stays on Vortek", file=sys.stderr)
+    return result
+
+
 EVALUATOR_SCRIPT = re.compile(r"(?:^|[\\/])evaluatorscript_[0-9]+\.vdf$", re.IGNORECASE)
 
 
@@ -542,6 +569,7 @@ def main():
         command = offline_without_anticheat(command, env)
     env = frame_rate_limit(command, env)
     env = zink_all_extensions(command, env)
+    env = hybris_gpu(command, env)
     if mic_enabled == "0":
         env["BANNER_AUDIO_DIRECT_MIC"] = "0"
     env = force_ssbs(command, env)
