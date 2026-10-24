@@ -1,0 +1,24 @@
+[mali-g2] A ring waiter never takes the waiter count below zero. The client used to clear the
+request ring's header after the server's request thread had announced itself as a sleeper; the
+decrement after the timeout then left the count one short for good, every later sleep looked like
+no waiter to the client, and each request waited for the 50 ms futex timeout. Now such a wiped
+count heals after one timeout and is logged (the client side is fixed in vortek-0012).
+
+diff --git a/app/src/main/cpp/winlator/src/ring_buffer.c b/app/src/main/cpp/winlator/src/ring_buffer.c
+index 93a568f..41902c4 100644
+--- a/app/src/main/cpp/winlator/src/ring_buffer.c
++++ b/app/src/main/cpp/winlator/src/ring_buffer.c
+@@ -212,7 +212,12 @@ static bool waitUntil(RingBuffer* ring, atomic_uint* word, atomic_uint* waiters,
+         uint32_t observed = atomic_load_explicit(word, memory_order_seq_cst);
+         atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
+         if (!ready(ring, size)) futexWait(word, observed);
+-        atomic_fetch_sub_explicit(waiters, 1, memory_order_seq_cst);
++        /* never below zero: a count wiped while we slept would otherwise stay one short, and every
++         * later sleep would look like no waiter to the writer (each wake then costs the timeout) */
++        uint32_t count = atomic_load_explicit(waiters, memory_order_seq_cst);
++        while (count && !atomic_compare_exchange_weak_explicit(waiters, &count, count - 1, memory_order_seq_cst,
++                                                               memory_order_seq_cst));
++        if (!count) debug_printf("ring: waiter count was cleared under a sleeping waiter (old client), repaired\n");
+         if (ready(ring, size)) return true;
+     }
+ }

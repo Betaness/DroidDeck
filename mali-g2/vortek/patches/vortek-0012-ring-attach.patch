@@ -1,0 +1,92 @@
+[mali-g2] The client maps the rings the server created without clearing them. The server's
+request thread can already sleep on the request ring when the client maps it; clearing the
+header then wiped its waiter count, the count stayed one short for the rest of the connection,
+the client never woke the server again, and every call waited for the 50 ms futex timeout
+(games at 0.1-0.3 fps, or minutes without a window). A waiter also never takes the count below
+zero, so a count that was wiped anyway heals after one timeout.
+
+diff --git a/include/ring_buffer.h b/include/ring_buffer.h
+index eee0d5f..c80d4bb 100644
+--- a/include/ring_buffer.h
++++ b/include/ring_buffer.h
+@@ -29,6 +29,7 @@ extern void RingBuffer_setStatus(RingBuffer* ring, uint32_t status);
+ extern void RingBuffer_unsetStatus(RingBuffer* ring, uint32_t status);
+ extern bool RingBuffer_hasStatus(RingBuffer* ring, uint32_t status);
+ extern RingBuffer* RingBuffer_create(int shmFd, uint32_t bufferSize);
++extern RingBuffer* RingBuffer_attach(int shmFd, uint32_t bufferSize);
+ extern uint32_t RingBuffer_size(RingBuffer* ring);
+ extern uint32_t RingBuffer_freeSpace(RingBuffer* ring);
+ extern bool RingBuffer_read(RingBuffer* ring, void* data, uint32_t size);
+diff --git a/src/main.c b/src/main.c
+index a7768fd..e72ce5a 100755
+--- a/src/main.c
++++ b/src/main.c
+@@ -51,10 +51,10 @@ static bool createVkContext() {
+     recv_fds(serverFd, shmFds, &numFds, NULL, 0);
+     if (numFds != 2) return false;
+     
+-    serverRing = RingBuffer_create(shmFds[0], SERVER_RING_BUFFER_SIZE);
++    serverRing = RingBuffer_attach(shmFds[0], SERVER_RING_BUFFER_SIZE);
+     if (!serverRing) return false;
+     
+-    clientRing = RingBuffer_create(shmFds[1], CLIENT_RING_BUFFER_SIZE);
++    clientRing = RingBuffer_attach(shmFds[1], CLIENT_RING_BUFFER_SIZE);
+     if (!clientRing) return false;
+     
+     close(shmFds[0]);
+diff --git a/src/ring_buffer.c b/src/ring_buffer.c
+index b751c9c..a1f2940 100644
+--- a/src/ring_buffer.c
++++ b/src/ring_buffer.c
+@@ -100,13 +100,13 @@ bool RingBuffer_hasStatus(RingBuffer* ring, uint32_t status) {
+     return (atomic_load_explicit(ring->status, memory_order_seq_cst) & status);
+ }
+ 
+-RingBuffer* RingBuffer_create(int shmFd, uint32_t bufferSize) {
++static RingBuffer* mapRing(int shmFd, uint32_t bufferSize, bool clear) {
+     STRUCT_OFFSETS();
+ 
+     int shmSize = RingBuffer_getSHMemSize(bufferSize);
+     void* sharedData = mmap(NULL, shmSize, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
+     if (sharedData == MAP_FAILED) return NULL;
+-    memset(sharedData, 0, shmSize);
++    if (clear) memset(sharedData, 0, shmSize);
+ 
+     RingBuffer* ring = calloc(1, sizeof(RingBuffer));
+     ring->sharedData = sharedData;
+@@ -118,10 +118,21 @@ RingBuffer* RingBuffer_create(int shmFd, uint32_t bufferSize) {
+     ring->buffer = sharedData + offsetof(struct Offsets, buffer);
+     ring->bufferSize = bufferSize;
+ 
+-    RingBuffer_setStatus(ring, RING_STATUS_IDLE);
++    if (clear) RingBuffer_setStatus(ring, RING_STATUS_IDLE);
+     return ring;
+ }
+ 
++RingBuffer* RingBuffer_create(int shmFd, uint32_t bufferSize) {
++    return mapRing(shmFd, bufferSize, true);
++}
++
++/* [mali-g2] Maps a ring the other side created, leaving its header alone: the server's request
++ * thread may already sleep on the request ring, and clearing the header then wiped its waiter
++ * count, so the client never woke it again and every call waited for the futex timeout (50 ms). */
++RingBuffer* RingBuffer_attach(int shmFd, uint32_t bufferSize) {
++    return mapRing(shmFd, bufferSize, false);
++}
++
+ uint32_t RingBuffer_size(RingBuffer* ring) {
+     return RingBuffer_getTail(ring) - RingBuffer_getHead(ring);
+ }
+@@ -247,7 +258,11 @@ static bool waitUntil(RingBuffer* ring, atomic_uint* word, atomic_uint* waiters,
+         uint32_t observed = atomic_load_explicit(word, memory_order_seq_cst);
+         atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
+         if (!ready(ring, size)) futexWait(word, observed);
+-        atomic_fetch_sub_explicit(waiters, 1, memory_order_seq_cst);
++        /* never below zero: a count wiped while we slept would otherwise stay one short, and every
++         * later sleep would look like no waiter to the writer (each wake then costs the timeout) */
++        uint32_t count = atomic_load_explicit(waiters, memory_order_seq_cst);
++        while (count && !atomic_compare_exchange_weak_explicit(waiters, &count, count - 1, memory_order_seq_cst,
++                                                               memory_order_seq_cst));
+         if (ready(ring, size)) return true;
+     }
+ }
