@@ -1,6 +1,7 @@
 package com.droiddeck.launcher.ui
 
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.FocusRequester
 import android.os.Build
@@ -139,6 +140,7 @@ internal fun SetupPanel(
     a: FrontEndActions,
     onOpenDeveloperOptions: () -> Unit,
     onRequestWirelessAdb: (Boolean) -> Unit,
+    onRequestPairing: () -> Unit = {},
 ) {
     val host = rememberMenuHost()
     val ctx = LocalContext.current
@@ -334,6 +336,9 @@ internal fun SetupPanel(
                                 }
                             }
                         }
+                        if (com.droiddeck.launcher.session.HyperOsGameMode.applies(ctx)) {
+                            SettingsGroup(stringResource(R.string.hyperos_regulator)) { RegulatorCheck(onRequestPairing, onOpenDeveloperOptions) }
+                        }
                         SettingsGroup(stringResource(R.string.setup_runtime)) { runtimeCheck(false) }
                     }
                     1 -> {
@@ -461,6 +466,32 @@ internal fun SetupPanel(
                     GLASSES_TAB -> GlassesSetupPanel()
                 }
             }
+        }
+    }
+}
+
+/** [mali-g2] Whether the launch check could keep HyperOS's game regulator away (HyperOsGameMode). */
+@Composable
+private fun RegulatorCheck(onRequestPairing: () -> Unit, onOpenDeveloperOptions: () -> Unit) {
+    val ctx = LocalContext.current
+    val check by com.droiddeck.launcher.session.HyperOsGameMode.launchCheck.collectAsState()
+    val paired = remember(check) { com.droiddeck.launcher.core.WirelessAdbFix.savedConnectionAddress(ctx) != null }
+    val noConnection = check == com.droiddeck.launcher.session.HyperOsGameMode.LaunchCheck.NO_PAIRING ||
+        check == com.droiddeck.launcher.session.HyperOsGameMode.LaunchCheck.FAILED
+    CheckRow(
+        if (paired && !noConnection) CheckState.OK else CheckState.WARN,
+        stringResource(R.string.hyperos_regulator),
+        when {
+            !paired -> stringResource(R.string.hyperos_regulator_unpaired)
+            noConnection -> stringResource(R.string.hyperos_regulator_off)
+            else -> stringResource(R.string.hyperos_regulator_avoided)
+        },
+        divider = false,
+    ) {
+        when {
+            !paired -> PrimaryButton(stringResource(R.string.hyperos_pair), compact = true, onClick = onRequestPairing)
+            noConnection -> SecondaryButton(stringResource(R.string.setup_dev_options), compact = true, onClick = onOpenDeveloperOptions)
+            else -> SecondaryButton(stringResource(R.string.wadb_pair_again), compact = true, onClick = onRequestPairing)
         }
     }
 }

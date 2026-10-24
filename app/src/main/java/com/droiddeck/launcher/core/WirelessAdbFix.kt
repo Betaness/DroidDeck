@@ -165,6 +165,16 @@ object WirelessAdbFix {
         return resolvedPort.get().takeIf { it in 1..65535 }
     }
 
+    /** A shell over the pairing just made, saved for later connections; the child process limit stays as it is. */
+    fun verifyPairing(context: Context, host: String, port: Int) {
+        loadOrCreateIdentity(context.applicationContext)
+        Kadb.create(host, port).use { adb ->
+            val result = adb.shell("echo ok")
+            check(result.output.trim() == "ok") { result.allOutput.ifBlank { context.getString(R.string.adbfix_command_failed, result.exitCode) } }
+        }
+        saveConnection(context, host, port)
+    }
+
     fun setChildProcessLimit(context: Context, host: String, port: Int, enabled: Boolean) {
         loadOrCreateIdentity(context.applicationContext)
         Kadb.create(host, port).use { adb ->

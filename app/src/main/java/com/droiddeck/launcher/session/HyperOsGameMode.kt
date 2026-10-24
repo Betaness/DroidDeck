@@ -6,6 +6,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.droiddeck.launcher.core.WirelessAdbFix
+import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
  * [mali-g2] HyperOS's game regulator kept off the launcher on the Xring O3.
@@ -33,8 +34,16 @@ object HyperOsGameMode {
     private const val RESTART_GAP_MS = 10 * 60_000L
     private const val COMMAND = "pidof $PACKAGE >/dev/null && am force-stop $PACKAGE && echo stopped"
 
+    /** What the launch check found, for the setup page. */
+    enum class LaunchCheck { NOT_RUN, CLEAR, RESTARTING, LEFT, NO_PAIRING, FAILED }
+
+    val launchCheck = MutableStateFlow(LaunchCheck.NOT_RUN)
+
     private var worker: Thread? = null
     private var launchChecked = false
+
+    /** Whether the regulator is looked for here: the Xring O3, with the setting on. */
+    fun applies(context: Context) = onO3() && SessionPrefs.stopJoyose(context)
 
     /** At a session's start. The line is for the log. */
     @Synchronized
@@ -59,10 +68,17 @@ object HyperOsGameMode {
     fun checkAtLaunch(context: Context) {
         if (launchChecked) return
         launchChecked = true
-        if (!onO3() || !SessionPrefs.stopJoyose(context)) return
+        if (!applies(context)) return
         val app = context.applicationContext
         val shownAt = SystemClock.elapsedRealtime()
         Thread({ checkRegulator(app, shownAt) }, "hyperos-game-regulator").apply { isDaemon = true; start() }
+    }
+
+    /** Right after a pairing: this process was shown long ago, the decision is in the log already. */
+    fun checkNow(context: Context) {
+        if (!applies(context)) return
+        val app = context.applicationContext
+        Thread({ checkRegulator(app, 0L) }, "hyperos-game-regulator").apply { isDaemon = true; start() }
     }
 
     private fun onO3() = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3"
@@ -72,6 +88,7 @@ object HyperOsGameMode {
             val adb = WirelessAdbFix.connectUsingSavedPairing(context)
             if (adb == null) {
                 Log.i(TAG, "no wireless debugging pairing, or wireless debugging is off: the game regulator is not checked")
+                launchCheck.value = LaunchCheck.NO_PAIRING
                 return
             }
             adb.use {
@@ -83,11 +100,13 @@ object HyperOsGameMode {
                 ).output.trim()
                 if (decision.isEmpty()) {
                     Log.i(TAG, "not handed to the game regulator")
+                    launchCheck.value = LaunchCheck.CLEAR
                     return
                 }
                 val prefs = context.getSharedPreferences("session", Context.MODE_PRIVATE)
                 val last = prefs.getLong("regulatorRestartAt", 0L)
                 val now = System.currentTimeMillis()
+                launchCheck.value = LaunchCheck.LEFT
                 when {
                     SessionState.phase != SessionPhase.IDLE ->
                         Log.i(TAG, "handed to the game regulator, but a session runs: left as it is")
@@ -100,6 +119,7 @@ object HyperOsGameMode {
                             return
                         }
                         prefs.edit().putLong("regulatorRestartAt", now).commit()
+                        launchCheck.value = LaunchCheck.RESTARTING
                         Log.i(TAG, "handed to the game regulator (${decision.substringAfter("setSchedGeniusIfNeed ").substringBefore(' ')}): " +
                             "stopping Joyose and starting again")
                         // Detached, so it outlives this process and the connection.
@@ -113,6 +133,7 @@ object HyperOsGameMode {
         } catch (_: InterruptedException) {
         } catch (t: Throwable) {
             Log.w(TAG, "game regulator check failed", t)
+            launchCheck.value = LaunchCheck.FAILED
         }
     }
 

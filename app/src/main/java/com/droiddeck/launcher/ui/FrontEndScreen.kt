@@ -232,6 +232,8 @@ class FrontEndActions(
     val onWirelessAdbPair: (String, Int, String, (String?) -> Unit) -> Unit,
     val onFindWirelessAdbPort: (String, (Int?) -> Unit) -> Unit = { _, done -> done(null) },
     val onWirelessAdbApply: (String, Int, Boolean, (String?) -> Unit) -> Unit,
+    /** [mali-g2] Connect over a new pairing without touching the child process limit (HyperOsGameMode). */
+    val onWirelessAdbConnect: (String, Int, (String?) -> Unit) -> Unit = { _, _, done -> done(null) },
     val onSetPhantomProcessLimit: (Boolean, (String?) -> Unit) -> Unit,
     val onCopyPhantomCommand: (Boolean) -> Unit = {},
     val onDismissPhantomGate: () -> Unit = {},
@@ -398,6 +400,7 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
     var showWirelessAdbFix by rememberSaveable { mutableStateOf(false) }
     var showDeveloperDisplayChoice by rememberSaveable { mutableStateOf(false) }
     var wirelessAdbDesiredEnabled by rememberSaveable { mutableStateOf(false) }
+    var wirelessAdbPairOnly by rememberSaveable { mutableStateOf(false) }
     var appToChooseDisplay by remember { mutableStateOf<HomeApp.LaunchableApp?>(null) }
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
@@ -410,6 +413,11 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
     }
     val requestWirelessAdbFix: (Boolean) -> Unit = { enabled ->
         wirelessAdbDesiredEnabled = enabled
+        wirelessAdbPairOnly = false
+        showWirelessAdbFix = true
+    }
+    val requestPairing: () -> Unit = {
+        wirelessAdbPairOnly = true
         showWirelessAdbFix = true
     }
     LaunchedEffect(s.showPhantomGate, s.phantomProcessStatus) {
@@ -544,6 +552,7 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
                     },
                     onOpenDeveloperOptions = requestDeveloperOptions,
                     onRequestWirelessAdb = requestWirelessAdbFix,
+                    onRequestPairing = requestPairing,
                 )
             }
         }
@@ -592,7 +601,8 @@ private fun FrontEndScreenBody(s: FrontEndState, a: FrontEndActions, page: (@Com
                     onOpenDeveloperOptions = requestDeveloperOptions,
                     onPair = a.onWirelessAdbPair,
                     onFindConnectPort = a.onFindWirelessAdbPort,
-                    onApply = a.onWirelessAdbApply,
+                    onApply = if (wirelessAdbPairOnly) ({ host, port, _, done -> a.onWirelessAdbConnect(host, port, done) }) else a.onWirelessAdbApply,
+                    pairOnly = wirelessAdbPairOnly,
                 )
             }
         }

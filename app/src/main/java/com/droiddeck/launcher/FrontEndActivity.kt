@@ -1058,6 +1058,14 @@ class FrontEndActivity : ComponentActivity() {
                                 }
                             }, "wireless-adb-fix").start()
                         },
+                        onWirelessAdbConnect = { host, port, complete ->
+                            Thread({
+                                val result = runCatching { WirelessAdbFix.verifyPairing(this@FrontEndActivity, host, port) }
+                                val error = result.exceptionOrNull()?.let { it.localizedMessage ?: getString(R.string.main_wadb_command_failed) }
+                                if (error == null) com.droiddeck.launcher.session.HyperOsGameMode.checkNow(this@FrontEndActivity)
+                                ui.post { complete(error) }
+                            }, "wireless-adb-connect").start()
+                        },
                         onSetPhantomProcessLimit = { enabled, complete ->
                             Thread({
                                 val result = runCatching { WirelessAdbFix.setUsingSavedPairing(this@FrontEndActivity, enabled) }

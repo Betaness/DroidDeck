@@ -3047,4 +3047,16 @@
     <string name="spatial_saved_views_hint">Saved views can be recalculated. Start a new calibration to capture in the current tracking frame.</string>
     <string name="spatial_model_checksum_error">Hand model checksum mismatch</string>
     <string name="spatial_opencv_load_error">OpenCV could not load</string>
+    <string name="hyperos_regulator">HyperOS game regulator</string>
+    <string name="hyperos_regulator_avoided">Paired. When HyperOS hands DroidDeck to its game regulator at launch, DroidDeck starts again once to get away from it.</string>
+    <string name="hyperos_regulator_unpaired">Not paired. While you play, HyperOS can hold the CPU or the GPU at its lowest clock (half the frame rate or worse). Pairing wireless debugging lets DroidDeck avoid it.</string>
+    <string name="hyperos_regulator_off">Wireless debugging was off or unreachable at this launch, so the game regulator was not checked. Turn wireless debugging on and open DroidDeck again.</string>
+    <string name="hyperos_pair">Pair</string>
+    <string name="hyperos_pair_title">Pair wireless debugging</string>
+    <string name="hyperos_pair_lede">Show Settings and DroidDeck side by side (split screen or a floating window), then in Settings open Developer options → Wireless debugging → Pair device with pairing code, and enter the address and code it shows here. The child process limit is left as it is.</string>
+    <string name="hyperos_pair_group">Pairing code</string>
+    <string name="hyperos_connect_group">Connect over wireless debugging</string>
+    <string name="hyperos_connect">Connect</string>
+    <string name="hyperos_pair_done_title">Paired</string>
+    <string name="hyperos_pair_done">DroidDeck can now keep HyperOS\'s game regulator away. If it has this launch, DroidDeck starts again in a moment.</string>
 </resources>

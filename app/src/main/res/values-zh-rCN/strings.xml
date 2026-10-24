@@ -2958,4 +2958,16 @@
     <string name="glasses_6dof">6DoF 虚拟屏幕</string>
     <string name="tracking_recovery_look">在光线充足的房间内缓慢环顾四周。\n不要遮挡追踪摄像头，并面向家具等有明显细节的物体。</string>
     <string name="spatial_print_job">DroidDeck ChArUco 30 mm</string>
+    <string name="hyperos_regulator">HyperOS 游戏调频</string>
+    <string name="hyperos_regulator_avoided">已配对。如果启动时 HyperOS 把 DroidDeck 交给游戏调频，DroidDeck 会自动重启一次避开它。</string>
+    <string name="hyperos_regulator_unpaired">未配对。游戏时 HyperOS 可能把 CPU 或 GPU 压在最低频率（帧率减半甚至更低）。配对无线调试后 DroidDeck 可以避开它。</string>
+    <string name="hyperos_regulator_off">这次启动时无线调试没开或连不上，没能检查游戏调频。请打开无线调试，再重新打开 DroidDeck。</string>
+    <string name="hyperos_pair">配对</string>
+    <string name="hyperos_pair_title">配对无线调试</string>
+    <string name="hyperos_pair_lede">把设置和 DroidDeck 并排显示（分屏或小窗），在设置里打开 开发者选项 → 无线调试 → 使用配对码配对设备，把显示的地址和配对码填到这里。不会改动子进程限制。</string>
+    <string name="hyperos_pair_group">配对码</string>
+    <string name="hyperos_connect_group">通过无线调试连接</string>
+    <string name="hyperos_connect">连接</string>
+    <string name="hyperos_pair_done_title">已配对</string>
+    <string name="hyperos_pair_done">DroidDeck 现在可以避开 HyperOS 的游戏调频。如果这次启动已被调频，DroidDeck 稍后会自动重启一次。</string>
 </resources>

@@ -59,6 +59,7 @@ fun WirelessAdbFixPage(
     onPair: (String, Int, String, (String?) -> Unit) -> Unit,
     onFindConnectPort: (String, (Int?) -> Unit) -> Unit,
     onApply: (String, Int, Boolean, (String?) -> Unit) -> Unit,
+    pairOnly: Boolean = false,
 ) {
     val context = LocalContext.current
     val savedAddress = remember { WirelessAdbFix.savedConnectionAddress(context) }
@@ -165,6 +166,7 @@ fun WirelessAdbFixPage(
                 onEditingChanged = { editing = it },
                 focusManager = focusManager,
                 desiredEnabled = desiredEnabled,
+                pairOnly = pairOnly,
                 canPair = pairingEndpoint != null && pairingCode.length == 6,
                 onPair = pairNow,
                 onApply = applyAddress,
@@ -174,12 +176,17 @@ fun WirelessAdbFixPage(
         SettingsPage(
             host = rememberMenuHost(),
             title = when {
+                pairOnly && step == 2 -> stringResource(R.string.hyperos_pair_done_title)
+                pairOnly -> stringResource(R.string.hyperos_pair_title)
                 compactSplit && step < 2 -> stringResource(R.string.wadb_title_wireless)
                 step == 2 -> stringResource(R.string.wadb_title_done)
                 else -> stringResource(R.string.wadb_title)
             },
             eyebrow = stringResource(R.string.setup_title),
             lede = when {
+                pairOnly && step == 2 -> stringResource(R.string.hyperos_pair_done)
+                pairOnly && step == 1 -> stringResource(R.string.wadb_lede1)
+                pairOnly -> stringResource(R.string.hyperos_pair_lede)
                 compactSplit && step == 0 -> stringResource(R.string.wadb_lede_compact0)
                 compactSplit && step == 1 -> stringResource(R.string.wadb_lede_compact1)
                 compactSplit -> stringResource(R.string.wadb_lede_done)
@@ -201,9 +208,13 @@ fun WirelessAdbFixPage(
                         modifier = Modifier.widthIn(max = 680.dp).fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        SettingsGroup(stringResource(R.string.setup_limit), compact = compactSplit) {
+                        SettingsGroup(stringResource(if (pairOnly) R.string.hyperos_regulator else R.string.setup_limit), compact = compactSplit) {
                             Text(
-                                if (desiredEnabled) stringResource(R.string.wadb_confirmed_on) else stringResource(R.string.wadb_confirmed_off),
+                                when {
+                                    pairOnly -> stringResource(R.string.hyperos_pair_done)
+                                    desiredEnabled -> stringResource(R.string.wadb_confirmed_on)
+                                    else -> stringResource(R.string.wadb_confirmed_off)
+                                },
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(14.dp),
                             )
@@ -216,13 +227,15 @@ fun WirelessAdbFixPage(
                         verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         form()
-                        if (!editing) CompactComputerFallback(desiredEnabled)
+                        if (!editing && !pairOnly) CompactComputerFallback(desiredEnabled)
                     }
                 } else {
                     val routes: @Composable () -> Unit = {
                         FallbackOrder(desiredEnabled, busy, onOpenDeveloperOptions)
                     }
-                    if (wide) {
+                    if (pairOnly) {
+                        Column(Modifier.widthIn(max = 600.dp).fillMaxWidth()) { form() }
+                    } else if (wide) {
                         Row(
                             modifier = Modifier.widthIn(max = 900.dp).fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -263,13 +276,14 @@ private fun WirelessStepForm(
     onEditingChanged: (Boolean) -> Unit,
     focusManager: FocusManager,
     desiredEnabled: Boolean,
+    pairOnly: Boolean,
     canPair: Boolean,
     onPair: () -> Unit,
     onApply: () -> Unit,
     onPairAgain: () -> Unit,
 ) {
     if (step == 0) {
-        SettingsGroup(stringResource(R.string.wadb_pair_group), compact = compact) {
+        SettingsGroup(stringResource(if (pairOnly) R.string.hyperos_pair_group else R.string.wadb_pair_group), compact = compact) {
             Column(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = if (compact) 8.dp else 12.dp, vertical = if (compact) 6.dp else 12.dp),
                 verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 6.dp),
@@ -310,7 +324,7 @@ private fun WirelessStepForm(
             }
         }
     } else {
-        SettingsGroup(stringResource(R.string.wadb_apply_group), compact = compact) {
+        SettingsGroup(stringResource(if (pairOnly) R.string.hyperos_connect_group else R.string.wadb_apply_group), compact = compact) {
             Column(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = if (compact) 8.dp else 12.dp, vertical = if (compact) 6.dp else 12.dp),
                 verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 6.dp),
@@ -334,7 +348,11 @@ private fun WirelessStepForm(
                     StatusMessage(busy, message, Modifier.weight(1f), isError = messageIsError)
                     SecondaryButton(stringResource(R.string.wadb_pair_again), compact = compact, enabled = !busy, onClick = onPairAgain)
                     PrimaryButton(
-                        if (desiredEnabled) stringResource(R.string.setup_limit_turn_on) else stringResource(R.string.wadb_turn_off),
+                        when {
+                            pairOnly -> stringResource(R.string.hyperos_connect)
+                            desiredEnabled -> stringResource(R.string.setup_limit_turn_on)
+                            else -> stringResource(R.string.wadb_turn_off)
+                        },
                         compact = compact,
                         enabled = !busy && parseAdbAddress(connectionAddress) != null,
                         onClick = onApply,
