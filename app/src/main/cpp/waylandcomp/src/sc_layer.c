@@ -988,10 +988,15 @@ void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch) {
  * bookkeeping lost track of (a stale full-screen frame stayed over Steam after the server
  * restarted, and the screen looked black). */
 void sc_layer_hide_all_vortek(void) {
+    sc_layer_hide_vortek_unused(0);
+}
+
+/* A presenter is gone while others stay: the same for every layer not in `in_use` (bit per slot). */
+void sc_layer_hide_vortek_unused(unsigned in_use) {
     layers_init();
     for (int slot = 0; slot < SC_VORTEK_LAYERS; slot++) {
         struct layer *l = &g_layers[SC_LAYER_VORTEK + slot];
-        if (!l->sc) continue;
+        if (!l->sc || (in_use & (1u << slot))) continue;
         l->shown = 1;
         hide_layer_on(NULL, l);
     }

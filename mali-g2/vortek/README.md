@@ -33,6 +33,8 @@ Mali 设备（例如 Mali-G2 / v15，Android 17）也能在 DroidDeck 的 Linux 
 | `patches/vortek-0012-*`、`patches/winlator-0017-*` | 环形缓冲区的等待者计数不再被清掉：服务端建好两个环、发出 fd 后马上启动请求线程，客户端以前收到 fd 后又对共享头部做一次 `memset`；请求线程若已自旋完、把 `readWaiters` 记成 1 并睡下，这个计数就被清成 0，超时醒来减 1 后变成 0xFFFFFFFF，此后整条连接上它每次睡着计数都是 0，客户端从不唤醒它，每个请求都等满 50 ms 的 futex 超时（游戏 0.1–0.3 fps、CPU/GPU 空闲，或启动几分钟没有窗口，约每 5–10 次启动一次）。客户端改为 `RingBuffer_attach`（只映射，不清零、不重设 status）；两端的等待者递减都不会低于 0，所以即使计数被清过也只损失一次超时，服务端这时打一行 `ring: waiter count was cleared under a sleeping waiter (old client), repaired`。线上布局和协议不变，新旧客户端、服务端可以混用 |
 | `src/client_x11_present.c/.h` | 客户端的软件 X11 呈现（MIT-SHM / PutImage） |
 | `src/droiddeck_defaults.h` | 客户端默认 socket 路径 `/run/droiddeck/vortek/V0` |
+| `src/spirv_clip_cull.h` | 去掉着色器里 ClipDistance/CullDistance 写入（Mali 编译器遇到会崩），客户端（`droiddeck_maint.c`）和进程内路径（`../hybris`）共用 |
+| `src/zero_copy.c/.h` | 零拷贝出图的线上协议（发给合成器），服务端和进程内路径（`../hybris`）共用；合成器同时接受多个连接（Vortek 服务端和各游戏进程） |
 | `build-client.sh` | 在 aarch64 Linux 上编译客户端和 ICD 清单（CI：`ubuntu-24.04-arm`） |
 | `build-server.sh` | 用 Android NDK 编译服务端（CI：`build` 任务里的 NDK） |
 | `NOTICE`、`LICENSE.LGPL-2.1` | 许可说明，随 APK 放进 guest 的 `/usr/local/share/licenses/droiddeck-vortek/` |

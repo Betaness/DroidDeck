@@ -142,6 +142,13 @@ object SessionFiles {
         // [mali-g2] Vortek's guest ICD (mali-g2/vortek), used with VortekServerComponent on Mali.
         val vortek = (listOf("libvulkan_vortek.so", "vortek_icd.aarch64.json").map { "usr/local/lib/droiddeck-vortek/$it" } +
             listOf("LGPL-2.1", "NOTICE").map { "usr/local/share/licenses/droiddeck-vortek/$it" }).map { it to it }
+        // [mali-g2] The in-process Mali Vulkan path (mali-g2/hybris), for HybrisGpu.
+        val hybris = (listOf(
+            "libdroiddeck_hybris_vk.so", "droiddeck_hybris_icd.aarch64.json", "lib/libhybris-common.so.1", "lib/libhardware.so.2",
+            "lib/libhybris-vulkan-icd.so.0", "lib/libhybris/linker/q.so",
+        ).map { "usr/local/lib/droiddeck-hybris/$it" } +
+            listOf("NOTICE", "LGPL-2.1", "Apache-2.0", "BSD-2-Clause", "SOURCES").map { "usr/local/share/licenses/droiddeck-hybris/$it" })
+            .map { it to it }
         // [mali-g2] MaliBridge's guest ICD, for BL_VK_BRIDGE=malibridge (MaliBridgeComponent).
         val maliBridge = listOf("usr/local/lib/vkbridge/libvulkan_droidbridge.so", "usr/local/share/vkbridge/droidbridge_icd.json",
             "usr/local/share/licenses/malibridge/NOTICE", "usr/local/share/licenses/malibridge/GPL-3").map { it to it }
@@ -150,7 +157,7 @@ object SessionFiles {
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/lib/droiddeck-pipewire.tzst" to "usr/local/lib/droiddeck-pipewire.tzst",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + x11Font.map { it to it } + vr + fexPreloads + vortek + maliBridge).filter { (asset, _) ->
+        ) + mangoapp + msitools.map { it to it } + x11Font.map { it to it } + vr + fexPreloads + vortek + hybris + maliBridge).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }

@@ -113,8 +113,36 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # [mali-g2] The in-process Mali path (mali-g2/hybris, off unless the session pref gpuPath is "hybris"):
+  # libhybris and the guest's ICD, glibc aarch64 like the Vortek client. The APK builds without it.
+  hybris:
+    name: libhybris Vulkan (mali-g2)
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build libhybris and libdroiddeck_hybris_vk.so
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq autoconf automake libtool pkg-config make gcc g++ git libvulkan-dev libxcb1-dev \
+            libxcb-shm0-dev >/dev/null
+          JOBS=4 bash mali-g2/hybris/build.sh "$PWD/hybris-guest"
+          find hybris-guest -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hybris-guest
+          path: hybris-guest
+          if-no-files-found: error
+          retention-days: 14
+
   build:
-    needs: [xbox, vortek]
+    needs: [xbox, vortek, hybris]
     name: Compile and test APK
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -623,6 +651,23 @@ jobs:
             mali-g2/vortek/build-server.sh "$PWD/app/src/main/jniLibs/arm64-v8a/libvortekserver.so"
           rm -rf mali-g2/vortek/work mali-g2/vortek/out
           ls -l "$D/usr/local/lib/droiddeck-vortek" app/src/main/jniLibs/arm64-v8a/libvortekserver.so
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: hybris-guest
+          path: hybris-guest
+
+      - name: In-process Mali Vulkan for games (mali-g2/hybris, gpuPath=hybris)
+        run: |
+          set -euo pipefail
+          if [ -f hybris-guest/usr/local/lib/droiddeck-hybris/libdroiddeck_hybris_vk.so ]; then
+            cp -r hybris-guest/. app/src/main/assets/linuxfs/
+            find app/src/main/assets/linuxfs/usr/local/lib/droiddeck-hybris -type f | sort
+          else
+            echo "::warning::no hybris-guest artifact: the APK goes without the in-process GPU path"
+          fi
+          rm -rf hybris-guest
 
       - name: MaliBridge server and guest ICD (mali-g2, BL_VK_BRIDGE=malibridge)
         run: |

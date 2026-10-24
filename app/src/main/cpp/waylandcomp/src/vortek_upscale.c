@@ -566,7 +566,7 @@ static struct src_img *src_get(const struct vku_frame *f, const char **why) {
     if (desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM && desc.format != AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM &&
         desc.format != AHB_FORMAT_BGRA8) {
         droiddeck_log("vortek", "zero-copy upscale: swapchain %u keeps its frames as they are: AHardwareBuffer format %#x "
-                      "is not 8-bit RGBA", f->chain, desc.format);
+                      "is not 8-bit RGBA", VP_CHAIN_ID(f->chain), desc.format);
         *why = "its frames are not 8-bit RGBA (HDR)";
         return NULL;
     }
@@ -577,7 +577,7 @@ static struct src_img *src_get(const struct vku_frame *f, const char **why) {
     }
     if (!free_e->img) {
         droiddeck_log("vortek", "zero-copy upscale: swapchain %u image %u (%ux%u, format %#x) could not be imported for "
-                      "sampling; that swapchain is shown as it is", f->chain, f->index, desc.width, desc.height, desc.format);
+                      "sampling; that swapchain is shown as it is", VP_CHAIN_ID(f->chain), f->index, desc.width, desc.height, desc.format);
         *why = "its buffers cannot be sampled";
         return NULL;
     }
@@ -801,7 +801,7 @@ static int run_job(struct job *j, int z, struct ASurfaceTransaction *batch) {
         G.said_ph != g_stat.ph) {
         G.said_filter = j->filter; G.said_bw = g_stat.bw; G.said_bh = g_stat.bh; G.said_pw = g_stat.pw; G.said_ph = g_stat.ph;
         droiddeck_log("vortek", "zero-copy upscale: swapchain %u with %s, %dx%d of its %dx%d frame -> %dx%d on the screen%s",
-                      j->chain, filter_names[j->filter], g_stat.bw, g_stat.bh, j->bw, j->bh, g_stat.pw, g_stat.ph,
+                      VP_CHAIN_ID(j->chain), filter_names[j->filter], g_stat.bw, g_stat.bh, j->bw, j->bh, g_stat.pw, g_stat.ph,
                       j->filter == F_SHARPEN ? " (sharpened at its own size, the display scales it)" : "");
     }
     return 0;

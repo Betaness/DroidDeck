@@ -1263,3 +1263,36 @@ class ForceSsbsTest(unittest.TestCase):
                 self.assertEqual(MODULE["force_ssbs"]([str(x86 / "proton")], on), on)
             finally:
                 g["SSBS_LIB"] = old
+
+    def test_hybris_gpu_moves_only_games_to_the_in_process_driver_when_its_files_are_there(self):
+        hybris = MODULE["hybris_gpu"]
+        g = hybris.__globals__
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {name: Path(tmp) / name for name in ("icd.json", "libhybris-common.so.1", "libvulkan.so")}
+            for path in files.values():
+                path.write_bytes(b"")
+            old = {name: g[name] for name in ("HYBRIS_ICD", "HYBRIS_PRELOAD", "ANDROID_VULKAN")}
+            g.update(HYBRIS_ICD=str(files["icd.json"]), HYBRIS_PRELOAD=str(files["libhybris-common.so.1"]),
+                     ANDROID_VULKAN=str(files["libvulkan.so"]))
+            arm = Path(tmp) / "arm"
+            (arm / "files/lib/wine/aarch64-unix").mkdir(parents=True)
+            x86 = Path(tmp) / "x86"
+            (x86 / "files/lib/wine/x86_64-unix").mkdir(parents=True)
+            try:
+                game = [str(arm / "proton"), "waitforexitandrun", "Game.exe"]
+                env = {"DROIDDECK_GPU_PATH": "hybris", "BL_GPU_MODE": "vortek", "VK_ICD_FILENAMES": "/vortek.json",
+                       "LD_PRELOAD": "/usr/local/lib/libssbs.so", "XDG_RUNTIME_DIR": "/run/droiddeck"}
+                got = hybris(game, env)
+                self.assertEqual(got["VK_ICD_FILENAMES"], str(files["icd.json"]))
+                self.assertEqual(got["VK_DRIVER_FILES"], str(files["icd.json"]))
+                self.assertEqual(got["LD_PRELOAD"], str(files["libhybris-common.so.1"]) + ":/usr/local/lib/libssbs.so")
+                self.assertEqual(got["VORTEK_PRESENT_SOCKET"], "/run/droiddeck/vortek-present")
+                self.assertEqual(hybris(game, got)["LD_PRELOAD"], got["LD_PRELOAD"])
+                self.assertEqual(hybris([str(arm / "proton"), "run", "iscriptevaluator.exe"], env), env)
+                self.assertEqual(hybris([str(x86 / "proton"), "waitforexitandrun", "Game.exe"], env), env)
+                for off in ({"DROIDDECK_GPU_PATH": "vortek"}, {"BL_GPU_MODE": "adreno"}):
+                    self.assertEqual(hybris(game, dict(env, **off)), dict(env, **off))
+                files["libvulkan.so"].unlink()
+                self.assertEqual(hybris(game, env), env)
+            finally:
+                g.update(old)
