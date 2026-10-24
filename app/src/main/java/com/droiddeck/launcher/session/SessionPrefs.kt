@@ -456,6 +456,9 @@ object SessionPrefs {
     /** [mali-g2] The thread FrameSchedFeed names for the game layer: "compositor" (the one presenting it) or "game" (its busiest thread). */
     fun feedFrameSchedThread(context: Context): String = prefs(context).getString("feedFrameSchedThread", "compositor") ?: "compositor"
 
+    /** [mali-g2] Clock floors asked of HyperOS's MiBridge during a session, e.g. "gpu=1"; empty is off (MiBridgeBoost). */
+    fun miBridgeBoost(context: Context): String = prefs(context).getString("miBridgeBoost", "") ?: ""
+
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 
