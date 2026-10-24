@@ -83,7 +83,7 @@ static uintptr_t elf_symbol(const char *path, const char *symbol) {
  * frames to SchedGenius when system_server names the package as the top game; SchedGenius then sizes the
  * GPU clock by those layers, which carry neither the game's frames nor its GPU work. FrameSchedPolicy's
  * first byte is its "initialized" flag, checked by notifyFrameSched and set only by its constructor.
- * The process name (a libc++ string right after the pid) is compared first so another layout is left alone.
+ * The pid and process name stored after it (a libc++ string) are compared first so another layout is left alone.
  * Returns 1 when reports were turned off, 0 when libmigui is not loaded, negative when it does not match.
  */
 JNIEXPORT jint JNICALL
@@ -110,9 +110,11 @@ Java_com_droiddeck_launcher_session_FrameSchedOptOut_nativeDisable(JNIEnv *env, 
         len = str[0] >> 1;
         data = (const char *)str + 1;
     }
-    int matches = *(const int32_t *)(policy + 4) == getpid() && len == want && data && memcmp(data, name, want) == 0;
+    /* Read from /proc/<pid>/cmdline with its NUL padding. */
+    int named = data && len >= want && memcmp(data, name, want) == 0 && (len == want || data[want] == 0);
     (*env)->ReleaseStringUTFChars(env, process, name);
-    if (!matches) return -4;
+    if (*(const int32_t *)(policy + 4) != getpid()) return -4;
+    if (!named) return -6;
     if (__atomic_load_n(policy, __ATOMIC_ACQUIRE) != 1) return -5;
     __atomic_store_n(policy, 0, __ATOMIC_RELEASE);
     return 1;
