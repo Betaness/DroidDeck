@@ -1,0 +1,32 @@
+libhybris-common exports only libhybris' own entry points (hybris_*, android_* and the like):
+it is preloaded into every process of a game, where its strlcpy/strlcat and other generic helpers
+would interpose glibc's.
+
+--- a/hybris/common/Makefile.am
++++ b/hybris/common/Makefile.am
+@@ -124,4 +124,5 @@
+ 	-lc \
+ 	-lstdc++ \
+ 	-lpthread \
++	-Wl,--version-script,$(srcdir)/common.ver \
+ 	-version-info "$(LT_CURRENT)":"$(LT_REVISION)":"$(LT_AGE)"
+--- /dev/null
++++ b/hybris/common/common.ver
+@@ -0,0 +1,17 @@
++/* DroidDeck: libhybris-common is LD_PRELOADed into every process of a game's Proton tree, so it
++ * exports only libhybris' own entry points. Its copies of strlcpy/strlcat and the other generic
++ * helpers (strendswith, native_handle_*, runtime_cache_*, open_redirects, std:: instantiations)
++ * stay local and cannot interpose glibc or any other library; the hook table still hands them to
++ * Android code. my_property_* stays for libandroid-properties. */
++{
++  global:
++    hybris_*;
++    _hybris_*;
++    __hybris_*;
++    HYBRIS_*;
++    android_*;
++    _android_*;
++    my_property_*;
++  local:
++    *;
++};
