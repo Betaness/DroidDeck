@@ -3,6 +3,7 @@
 
 usage: xr-qos.py get TID...
        xr-qos.py set MODE TID...      MODE: vip (6, VIP), rt (9, RT), off, or LEVEL:TYPE[:rtg]
+                                      (off also puts a thread left SCHED_RR back to SCHED_OTHER)
        xr-qos.py pin CPUS TID...      CPUS like 8-9 or 0-9 (sched_setaffinity of single threads)
        xr-qos.py watch SECONDS [--fps N] TID...
 
@@ -20,11 +21,19 @@ HZ = os.sysconf("SC_CLK_TCK")
 
 
 def value(mode):
+    """The ioctl's value for MODE; ValueError for one libxqos would refuse (as XrThreadQos.parse)."""
     if mode in MODES:
         level, kind = MODES[mode]
         return level | kind << 4
     parts = mode.split(":")
-    return int(parts[0]) | int(parts[1]) << 4 | (1 << 6 if parts[2:] == ["rtg"] else 0)
+    if len(parts) not in (2, 3) or (len(parts) == 3 and parts[2] != "rtg"):
+        raise ValueError(f"{mode}: not vip, rt, off or LEVEL:TYPE[:rtg]")
+    level, kind = int(parts[0]), int(parts[1])
+    if level not in range(3, 11) or kind not in range(3):
+        raise ValueError(f"{mode}: levels are 3-10, types 0 (normal), 1 (RT) and 2 (VIP)")
+    if (level == 6 and kind != 2) or (level >= 7 and kind == 0):
+        raise ValueError(f"{mode}: level 6 goes with the VIP type only, 7-10 not with the normal type")
+    return level | kind << 4 | (1 << 6 if len(parts) == 3 else 0)
 
 
 def stat(tid):
@@ -57,12 +66,20 @@ def ioctl(fd, cmd, tid, val=0):
 def main():
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd in ("get", "set"):
+        try:
+            val = value(args[0]) if cmd == "set" else None
+        except ValueError as e:
+            sys.exit(f"xr-qos.py: {e}")
         fd = os.open("/dev/xr_fbt", os.O_RDWR)
         tids = [int(t) for t in (args if cmd == "get" else args[1:])]
         for tid in tids:
             try:
                 if cmd == "set":
-                    ioctl(fd, SET, tid, value(args[0]))
+                    ioctl(fd, SET, tid, val)
+                    # A thread given an RT level twice keeps SCHED_RR once cleared (as XrThreadQos.clear).
+                    if val == 0 and stat(tid)[3] & 0xff != os.SCHED_OTHER:
+                        os.sched_setscheduler(tid, os.SCHED_OTHER, os.sched_param(0))
+                        print(f"{tid}: put back to SCHED_OTHER")
                 print(f"{tid} {stat(tid)[0]}: qos 0x{ioctl(fd, GET, tid):x}, policy {stat(tid)[3]}")
             except OSError as e:
                 print(f"{tid}: {e}")

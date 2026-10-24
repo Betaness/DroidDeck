@@ -32,6 +32,10 @@ internal class XrThreadQos private constructor(private val mode: Mode) {
     private val raised = HashSet<Int>()
     private val refused = HashSet<Int>()
 
+    /** A level the kernel took: the thread's start time (to tell a reused tid), what the level read back as, and when. */
+    private class Given(val started: Long?, var reads: Int, var atMs: Long)
+    private val given = HashMap<Int, Given>()
+
     /** Gives [tid] the level; returns a line for the log saying what the kernel made of it. */
     fun apply(tid: Int): String {
         val before = policy(tid)
@@ -42,13 +46,38 @@ internal class XrThreadQos private constructor(private val mode: Mode) {
         }
         val after = policy(tid)
         if (mode.type == TYPE_RT && before != null && before and SCHED_MASK == SCHED_OTHER) raised += tid
-        return "xr qos $mode on $tid: reads ${XrQosNative.nativeGet(tid).let { if (it < 0) "errno ${-it}" else "0x" + Integer.toHexString(it) }}" +
-            ", policy ${describe(before)} -> ${describe(after)}"
+        val reads = XrQosNative.nativeGet(tid)
+        given[tid] = Given(started(tid), reads, System.currentTimeMillis())
+        return "xr qos $mode on $tid: reads ${hex(reads)}, policy ${describe(before)} -> ${describe(after)}"
+    }
+
+    /**
+     * Reads the levels given to [tids] back: one that no longer reads what it did when set (a timeout of the
+     * kernel's, or the system setting the thread's level itself) is logged and set again. Lines for the log.
+     */
+    fun verify(tids: Set<Int>): List<String> = tids.mapNotNull { tid ->
+        val g = given[tid] ?: return@mapNotNull null
+        if (g.started == null || started(tid) != g.started) return@mapNotNull null // gone; cleared when it leaves the set
+        val now = XrQosNative.nativeGet(tid)
+        if (now < 0 || now == g.reads) return@mapNotNull null
+        val was = g.reads
+        val secs = (System.currentTimeMillis() - g.atMs) / 1000
+        val result = XrQosNative.nativeSet(tid, mode.value)
+        g.reads = XrQosNative.nativeGet(tid)
+        g.atMs = System.currentTimeMillis()
+        "xr qos on $tid reads ${hex(now)} ${secs}s after it read ${hex(was)}: " +
+            if (result < 0) "setting it again failed, errno ${-result}" else "set again, reads ${hex(g.reads)}"
     }
 
     /** Takes the level from [tid] again; null when the thread is gone or never had it. */
     fun clear(tid: Int): String? {
         if (refused.remove(tid)) return null
+        val g = given.remove(tid)
+        if (g?.started != null && started(tid) != g.started) {
+            // The tid now names another thread of this UID (the one given the level exited): left alone.
+            raised.remove(tid)
+            return null
+        }
         val result = XrQosNative.nativeSet(tid, 0)
         val wasOther = raised.remove(tid)
         if (result < 0) return policy(tid)?.let { "xr qos clear failed for $tid: errno ${-result}" }
@@ -95,12 +124,19 @@ internal class XrThreadQos private constructor(private val mode: Mode) {
         }
 
         /** The policy field of the thread's stat line (41st), or null when it is gone. /proc/<tid> works for any thread. */
-        private fun policy(tid: Int): Int? = try {
+        private fun policy(tid: Int): Int? = statField(tid, 41)?.toInt()
+
+        /** The thread's start time (the 22nd field, clock ticks since boot), or null when it is gone. */
+        private fun started(tid: Int): Long? = statField(tid, 22)
+
+        private fun statField(tid: Int, field: Int): Long? = try {
             val line = File("/proc/$tid/stat").readText()
-            line.substring(line.lastIndexOf(')') + 2).split(' ')[38].toInt()
+            line.substring(line.lastIndexOf(')') + 2).split(' ')[field - 3].toLong()
         } catch (_: Exception) {
             null
         }
+
+        private fun hex(value: Int) = if (value < 0) "errno ${-value}" else "0x" + Integer.toHexString(value)
 
         private fun describe(policy: Int?): String = when (policy?.and(SCHED_MASK)) {
             null -> "?"

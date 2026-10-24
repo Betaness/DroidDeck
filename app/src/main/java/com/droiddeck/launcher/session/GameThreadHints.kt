@@ -58,6 +58,8 @@ object GameThreadHints {
     private const val PACE_WINDOW_S = 3
     private const val PACE_LEAVE_S = 10
     private const val PACE_TOLERANCE = 0.08
+    private const val QOS_VERIFY_SCANS = 10 // the QoS levels given are read back every ten seconds
+    private const val PREVIOUS_WORKER_MS = 7_000L // ClusterSteer's taskset waits up to 5 s
 
     /** Busy, but not the game: the app itself and the Steam client, whose UI would otherwise hold the prime cores. */
     private val NOT_GAMES = setOf("steam", "steamwebhelper")
@@ -68,7 +70,9 @@ object GameThreadHints {
     @Synchronized
     fun start(context: Context): String {
         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
-        // Measured on the Odin 3 (CQ8725S) and Xiaomi's Xring O3; another HAL may boost differently, or not at all.
+        // The hint sessions were measured boosting on the Odin 3 (CQ8725S); on Xiaomi's Xring O3 they reach
+        // nothing (see XrThreadQos), but the scan drives ClusterSteer, XrThreadQos and FrameSchedFeed there.
+        // Another HAL may boost differently, or not at all.
         if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL !in HINTED_SOCS) return "game thread hints: not on this SoC"
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
@@ -79,10 +83,31 @@ object GameThreadHints {
             Log.w(TAG, "xr qos unavailable", t)
             null
         }
-        worker?.interrupt()
-        worker = Thread({ run(hm, pm, qos) }, "game-thread-hints").apply { isDaemon = true; start() }
+        // [mali-g2] Only where a frame regulator was seen holding a cluster's clock (see ClusterSteer), and not
+        // with xr qos: moving whole processes to the little cores would take the boosted threads off the cores
+        // their level puts them on, and the cluster experiments need the affinities left as set by hand.
+        val steerWanted = Build.SOC_MODEL == "O3" && SessionPrefs.clusterSteer(context)
+        val steer = steerWanted && qos == null
+        val previous = worker
+        previous?.interrupt()
+        worker = Thread({ runAfter(previous, hm, pm, qos, steer) }, "game-thread-hints").apply { isDaemon = true; start() }
         // AOSP's example power HAL answers 1 ms; one that acts on hints reports its own rate.
-        return "game thread hints: watching (hint rate ${hm.preferredUpdateRateNanos} ns, xr qos ${qos ?: "off"})"
+        return "game thread hints: watching (hint rate ${hm.preferredUpdateRateNanos} ns, xr qos ${qos ?: "off"}" +
+            (if (Build.SOC_MODEL == "O3") ", cluster steering " + when {
+                steer -> "on"
+                steerWanted -> "off with xr qos"
+                else -> "off"
+            } else "") + ")"
+    }
+
+    /** The last session's worker undoes its QoS levels and affinities first, so they do not land on this one's. */
+    private fun runAfter(previous: Thread?, hm: PerformanceHintManager, pm: PowerManager, qos: XrThreadQos?, steer: Boolean) {
+        try {
+            previous?.join(PREVIOUS_WORKER_MS)
+        } catch (_: InterruptedException) {
+            return
+        }
+        run(hm, pm, qos, steer)
     }
 
     /** At a session's end. */
@@ -92,10 +117,9 @@ object GameThreadHints {
         worker = null
     }
 
-    private fun run(hm: PerformanceHintManager, pm: PowerManager, qos: XrThreadQos?) {
+    private fun run(hm: PerformanceHintManager, pm: PowerManager, qos: XrThreadQos?, steerOn: Boolean) {
         val scanner = Scanner()
-        // [mali-g2] Only where a frame regulator was seen holding a cluster's clock (see ClusterSteer).
-        val steer = if (Build.SOC_MODEL == "O3") ClusterSteer.forDevice() else null
+        val steer = if (steerOn) ClusterSteer.forDevice() else null
         var session: PerformanceHintManager.Session? = null
         var boosted = emptySet<Int>()
         var qosOn = emptySet<Int>()
@@ -132,6 +156,10 @@ object GameThreadHints {
                     }
                     // Apart from the hint session, which a thread exiting in between fails as a whole.
                     if (qos != null && next != qosOn) qosOn = retarget(qos, qosOn, next)
+                    if (qos != null && tick % (SCAN_EVERY * QOS_VERIFY_SCANS) == 1) {
+                        runCatching { qos.verify(qosOn) }.onSuccess { lines -> lines.forEach { Log.i(TAG, it) } }
+                            .onFailure { Log.w(TAG, "xr qos read-back", it) }
+                    }
                 }
                 session?.reportActualWorkDuration(TARGET_NS * 3 / 2)
                 Thread.sleep(REPORT_MS)
@@ -140,16 +168,24 @@ object GameThreadHints {
         } catch (t: Throwable) {
             Log.w(TAG, "stopped", t)
         } finally {
-            session?.close()
+            runCatching { session?.close() }
             if (qos != null) retarget(qos, qosOn, emptySet())
-            steer?.release()
+            runCatching { steer?.release() }.onFailure { Log.w(TAG, "cluster steering release", it) }
         }
     }
 
-    /** The QoS level taken from the threads of [on] not in [next] and given to those new in it (once, taken or not); returns [next]. */
+    /**
+     * The QoS level taken from the threads of [on] not in [next] and given to those new in it (once, taken or not); returns [next].
+     * Never throws: it runs in the worker's finally, and a missing JNI symbol must not take the app down.
+     */
     private fun retarget(qos: XrThreadQos, on: Set<Int>, next: Set<Int>): Set<Int> {
-        (on - next).forEach { tid -> qos.clear(tid)?.let { Log.i(TAG, it) } }
-        (next - on).forEach { tid -> Log.i(TAG, "${readName("/proc/$tid/comm")}: ${qos.apply(tid)}") }
+        (on - next).forEach { tid ->
+            runCatching { qos.clear(tid) }.onSuccess { it?.let { line -> Log.i(TAG, line) } }.onFailure { Log.w(TAG, "xr qos clear $tid", it) }
+        }
+        (next - on).forEach { tid ->
+            runCatching { qos.apply(tid) }.onSuccess { Log.i(TAG, "${readName("/proc/$tid/comm")}: $it") }
+                .onFailure { Log.w(TAG, "xr qos $tid", it) }
+        }
         return next
     }
 

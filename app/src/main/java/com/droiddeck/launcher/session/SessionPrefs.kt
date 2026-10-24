@@ -435,6 +435,12 @@ object SessionPrefs {
     /** Whether the game's busiest threads are named to the power HAL for a boost (GameThreadHints). */
     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
 
+    /**
+     * [mali-g2] Whether GameThreadHints moves the game's processes off a CPU cluster held at a low clock on the Xring O3
+     * (ClusterSteer). Off for cluster experiments; it is also left off while xringThreadQos is set.
+     */
+    fun clusterSteer(context: Context): Boolean = prefs(context).getBoolean("clusterSteer", true)
+
     /** [mali-g2] The HyperOS QoS level GameThreadHints gives the threads it boosts on the Xring O3 (XrThreadQos): off, vip, rt or level:type. */
     fun xringThreadQos(context: Context): String = prefs(context).getString("xringThreadQos", "off") ?: "off"
 
