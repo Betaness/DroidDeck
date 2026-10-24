@@ -1,0 +1,2 @@
+# The X core font for Steam's update window, usr/share/fonts/misc/wqy-microhei.ttc (droiddeck-fonts lists it).
+fb1fb152d1ce4452bb5aa3b7438074a165b6f1edc2abc4be90b7f74dc3eb3775  https://archive.archlinux.org/packages/w/wqy-microhei/wqy-microhei-0.2.0_beta-12-any.pkg.tar.zst

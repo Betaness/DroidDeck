@@ -32,3 +32,27 @@ if ! cmp -s "$owned_conf.new" "$owned_conf" 2>/dev/null; then
   echo "== fontconfig: wrote DejaVu defaults"
 fi
 rm -f "$owned_conf.new"
+
+# Steam's update window draws with X core fonts, the first XLFD it finds of a fixed list
+# (-mutt-clearlyu-medium-r-normal--*-120-*-*-p-*-iso10646-1 first); the runtime has none beyond the
+# server's Latin built-ins. Xwayland's default font path starts with /usr/share/fonts/misc, so the
+# bundled font is listed there under that name too. It must be TrueType: libXfont2 takes CFF fonts
+# such as Android's Noto Sans CJK for bitmap-only ones and cannot open them.
+x11_dir=$root/usr/share/fonts/misc
+x11_font=wqy-microhei.ttc
+if [ -f "$x11_dir/$x11_font" ]; then
+  x11_list=$(
+    tail -n +2 "$x11_dir/fonts.dir" 2>/dev/null | grep -v "^$x11_font "
+    printf '%s %s\n' "$x11_font" '-wenquanyi-wenquanyi micro hei-medium-r-normal--0-0-0-0-p-0-iso10646-1' \
+      "$x11_font" '-mutt-clearlyu-medium-r-normal--0-0-0-0-p-0-iso10646-1'
+  )
+  printf '%s\n%s\n' "$(grep -c . <<<"$x11_list")" "$x11_list" > "$x11_dir/fonts.dir.new"
+  if ! cmp -s "$x11_dir/fonts.dir.new" "$x11_dir/fonts.dir" 2>/dev/null; then
+    mv -f "$x11_dir/fonts.dir.new" "$x11_dir/fonts.dir"
+    echo "== X core fonts: $x11_font listed in ${x11_dir#"$root"}"
+    if [ "$root" = / ] && command -v fc-cache >/dev/null 2>&1; then
+      fc-cache /usr/share/fonts >/dev/null 2>&1
+    fi
+  fi
+  rm -f "$x11_dir/fonts.dir.new"
+fi

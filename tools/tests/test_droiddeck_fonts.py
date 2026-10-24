@@ -66,6 +66,40 @@ class DroidDeckFontsTest(unittest.TestCase):
         self.run_fonts()
         self.assertEqual(before, owned.stat().st_mtime_ns)
 
+    def x11_dir(self):
+        return self.root / "usr/share/fonts/misc"
+
+    def test_without_the_bundled_font_no_core_font_dir_is_made(self):
+        self.run_fonts()
+        self.assertFalse(self.x11_dir().exists())
+
+    def test_bundled_font_answers_the_update_window_pattern(self):
+        self.x11_dir().mkdir(parents=True)
+        (self.x11_dir() / "wqy-microhei.ttc").write_text("font")
+        self.run_fonts()
+        self.assertEqual([
+            "2",
+            "wqy-microhei.ttc -wenquanyi-wenquanyi micro hei-medium-r-normal--0-0-0-0-p-0-iso10646-1",
+            "wqy-microhei.ttc -mutt-clearlyu-medium-r-normal--0-0-0-0-p-0-iso10646-1",
+        ], (self.x11_dir() / "fonts.dir").read_text().splitlines())
+        before = (self.x11_dir() / "fonts.dir").stat().st_mtime_ns
+        self.run_fonts()
+        self.assertEqual(before, (self.x11_dir() / "fonts.dir").stat().st_mtime_ns)
+        self.assertFalse((self.x11_dir() / "fonts.dir.new").exists())
+
+    def test_fonts_a_package_listed_are_kept(self):
+        self.x11_dir().mkdir(parents=True)
+        (self.x11_dir() / "wqy-microhei.ttc").write_text("font")
+        (self.x11_dir() / "fonts.dir").write_text(
+            "2\n6x13.pcf.gz -misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1\n"
+            "wqy-microhei.ttc -old-entry-medium-r-normal--0-0-0-0-p-0-iso10646-1\n")
+        self.run_fonts()
+        lines = (self.x11_dir() / "fonts.dir").read_text().splitlines()
+        self.assertEqual("3", lines[0])
+        self.assertEqual("6x13.pcf.gz -misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso10646-1", lines[1])
+        self.assertNotIn("old-entry", "\n".join(lines))
+        self.assertTrue(lines[-1].startswith("wqy-microhei.ttc -mutt-clearlyu-"))
+
     def test_the_session_runs_the_bootstrap_before_it_starts_a_program(self):
         text = SESSION.read_text()
         self.assertIn("/usr/local/bin/droiddeck-fonts", text)
