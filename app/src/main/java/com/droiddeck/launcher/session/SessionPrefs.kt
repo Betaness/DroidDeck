@@ -435,6 +435,9 @@ object SessionPrefs {
     /** Whether the game's busiest threads are named to the power HAL for a boost (GameThreadHints). */
     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
 
+    /** [mali-g2] The HyperOS QoS level GameThreadHints gives the threads it boosts on the Xring O3 (XrThreadQos): off, vip, rt or level:type. */
+    fun xringThreadQos(context: Context): String = prefs(context).getString("xringThreadQos", "off") ?: "off"
+
     /** [mali-g2] Whether HyperOS's game regulator is kept off the app: Joyose stopped at launch and during a session (HyperOsGameMode). */
     fun stopJoyose(context: Context): Boolean = prefs(context).getBoolean("stopJoyose", true)
 

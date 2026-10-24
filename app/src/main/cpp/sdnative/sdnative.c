@@ -3,9 +3,11 @@
 #include <fcntl.h>
 #include <jni.h>
 #include <link.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -118,4 +120,63 @@ Java_com_droiddeck_launcher_session_FrameSchedOptOut_nativeDisable(JNIEnv *env, 
     if (__atomic_load_n(policy, __ATOMIC_ACQUIRE) != 1) return -5;
     __atomic_store_n(policy, 0, __ATOMIC_RELEASE);
     return 1;
+}
+
+/*
+ * [mali-g2] Thread QoS on the Xring O3: the ioctls of /dev/xr_fbt that HyperOS's libxqos issues for
+ * setTidQosLevel/getTidQos when ro.vendor.qos.v1.enable is unset (libhwui and libgui mark their render
+ * threads with it from inside every app). The argument is {value, tid}; value packs the level (bits 0-3),
+ * the scheduling type (bits 4-5: normal, RT, VIP) and the RTG bits (6-7). The node is 0666 and SELinux
+ * lets every app domain issue 'x' ioctls on it; the kernel takes tids of the caller's own UID only (EINVAL
+ * otherwise), and the guest's threads are this app's. Each returns 0 (or the value read) or -errno.
+ */
+#define XR_QOS_SET_TID_LEVEL _IOW('x', 7, uint64_t)
+#define XR_QOS_GET_TID _IOWR('x', 9, uint64_t)
+
+static int xr_fbt_fd(void) {
+    static int fd = -1;
+    int cur = __atomic_load_n(&fd, __ATOMIC_ACQUIRE);
+    if (cur >= 0) return cur;
+    int opened = open("/dev/xr_fbt", O_RDWR | O_CLOEXEC);
+    if (opened < 0) return -errno;
+    int expected = -1;
+    if (!__atomic_compare_exchange_n(&fd, &expected, opened, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        close(opened);
+        return expected;
+    }
+    return opened;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droiddeck_launcher_session_XrQosNative_nativeSet(JNIEnv *env, jclass clazz, jint tid, jint value) {
+    (void)env;
+    (void)clazz;
+    int fd = xr_fbt_fd();
+    if (fd < 0) return fd;
+    uint32_t arg[2] = {(uint32_t)value, (uint32_t)tid};
+    return ioctl(fd, XR_QOS_SET_TID_LEVEL, arg) < 0 ? -errno : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droiddeck_launcher_session_XrQosNative_nativeGet(JNIEnv *env, jclass clazz, jint tid) {
+    (void)env;
+    (void)clazz;
+    int fd = xr_fbt_fd();
+    if (fd < 0) return fd;
+    uint32_t arg[2] = {0, (uint32_t)tid};
+    if (ioctl(fd, XR_QOS_GET_TID, arg) < 0) return -errno;
+    return (jint)(arg[0] & 0x7fffffff);
+}
+
+/*
+ * Clearing the level puts back the policy a thread had when an RT level made it SCHED_RR, unless it was
+ * given an RT level twice. An unprivileged caller may always drop its own UID's threads to SCHED_OTHER;
+ * the nice value is kept.
+ */
+JNIEXPORT jint JNICALL
+Java_com_droiddeck_launcher_session_XrQosNative_nativeSchedOther(JNIEnv *env, jclass clazz, jint tid) {
+    (void)env;
+    (void)clazz;
+    struct sched_param param = {0};
+    return sched_setscheduler(tid, SCHED_OTHER, &param) < 0 ? -errno : 0;
 }
