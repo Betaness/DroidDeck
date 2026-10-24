@@ -441,6 +441,9 @@ object SessionPrefs {
     /** [mali-g2] Whether this app's frames are kept from HyperOS's frame governor, which sets the GPU clock by them (FrameSchedOptOut). */
     fun frameSchedOptOut(context: Context): Boolean = prefs(context).getBoolean("frameSchedOptOut", true)
 
+    /** [mali-g2] Clock floors asked of HyperOS's MiBridge during a session, e.g. "gpu=1"; empty is off (MiBridgeBoost). */
+    fun miBridgeBoost(context: Context): String = prefs(context).getString("miBridgeBoost", "") ?: ""
+
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 

@@ -428,6 +428,7 @@ class SessionService : Service() {
         Log.i(TAG, GpuClockPin.start(this))
         Log.i(TAG, GameThreadHints.start(this))
         Log.i(TAG, HyperOsGameMode.start(this))
+        Log.i(TAG, MiBridgeBoost.start(this))
         Log.i(TAG, WineServerColocation.start(this))
 
         val size = SessionState.outputSize
@@ -1702,6 +1703,7 @@ class SessionService : Service() {
         GpuClockPin.stop(this)
         GameThreadHints.stop()
         HyperOsGameMode.stop()
+        MiBridgeBoost.stop()
         WineServerColocation.stop()
         SessionEvents.transition(SessionPhase.STOPPING, "session.stopping", mapOf("status" to status))
         suspendOperationPending = false
@@ -1778,6 +1780,7 @@ class SessionService : Service() {
         stopSession(0)
         GameThreadHints.stop() // also when the session never got as far as running
         HyperOsGameMode.stop()
+        MiBridgeBoost.stop()
         WineServerColocation.stop()
         if (screenReceiverRegistered) {
             unregisterReceiver(screenReceiver)

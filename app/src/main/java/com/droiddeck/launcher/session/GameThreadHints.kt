@@ -64,7 +64,8 @@ object GameThreadHints {
     @Synchronized
     fun start(context: Context): String {
         if (!SessionPrefs.gameThreadHints(context)) return "game thread hints: off"
-        // Measured on the Odin 3 (CQ8725S) and Xiaomi's Xring O3; another HAL may boost differently, or not at all.
+        // Measured on the Odin 3 (CQ8725S); another HAL may boost differently, or not at all. The Xring O3's
+        // power HAL is a stub that drops the reports: there only ClusterSteer, run by this worker, acts.
         if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL !in HINTED_SOCS) return "game thread hints: not on this SoC"
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
