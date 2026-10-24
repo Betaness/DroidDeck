@@ -9,7 +9,9 @@
 #   zero-copy   mock_compositor.c as the compositor: AHardwareBuffer images, acquire and release
 #               fences, pixels checked through CPU-readable buffers (DROIDDECK_HYBRIS_AHB_CPU_READ=1)
 #   zero-copy-late  the same, the mock releasing without fences
-#   zero-copy-afbc  the same, buffers as the session allocates them (pixels not readable)
+#   zero-copy-afbc  buffers as the session allocates them (likely AFBC: pixels not checked)
+#   cover-partly, cover-fully  another window over the window: X11 copies, paced frames, back
+#   vkcube      vkcube zero-copy, its last frame in out/tests/vkcube.ppm
 #   resize      the window shrinks halfway: VK_SUBOPTIMAL_KHR, swapchain recreated
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -63,8 +65,31 @@ run copy SC_EXPECT_COPY=1
 run copy-rgba SC_EXPECT_COPY=1 SC_FORMAT=rgba
 run_zc zero-copy early DROIDDECK_HYBRIS_AHB_CPU_READ=1 VORTEK_X11_STATS=1
 run_zc zero-copy-late late DROIDDECK_HYBRIS_AHB_CPU_READ=1
+export MOCK_CHECK=0
 run_zc zero-copy-afbc early
+unset MOCK_CHECK
 run resize SC_RESIZE=1 SC_EXPECT_COPY=1
+export MOCK_GAPS=1
+run_zc cover-partly early SC_COVER=partly SC_FRAMES=180 DROIDDECK_HYBRIS_AHB_CPU_READ=1
+grep -q 'now through X11, partly covered by' "$TMP/cover-partly.log" || failed="$failed cover-partly(no-X11-path)"
+run_zc cover-fully early SC_COVER=fully SC_FRAMES=180 DROIDDECK_HYBRIS_AHB_CPU_READ=1
+grep -q 'now hidden, frames paced' "$TMP/cover-fully.log" || failed="$failed cover-fully(not-paced)"
+unset MOCK_GAPS
+if command -v vkcube >/dev/null; then
+    # A real application (textures, depth, its own swapchain handling); its last frame goes to vkcube.ppm.
+    sock=$TMP/present-vkcube.sock
+    MOCK_CHECK=0 MOCK_DUMP="$BIN/vkcube.ppm" sh "$HERE/run.sh" "$BIN/mock_compositor" "$sock" 1 >"$TMP/mock-vkcube.log" 2>&1 &
+    mpid=$!
+    i=0
+    while [ ! -S "$sock" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    echo "=== vkcube"
+    VORTEK_PRESENT_SOCKET=$sock DROIDDECK_HYBRIS_AHB_CPU_READ=1 timeout 120 sh "$HERE/run.sh" vkcube --c 300 >"$TMP/vkcube.log" 2>&1 || failed="$failed vkcube"
+    grep -E '^hybris' "$TMP/vkcube.log"
+    i=0
+    while kill -0 $mpid 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    grep '^MOCK' "$TMP/mock-vkcube.log"
+    grep -q 'MOCK-RESULT ok' "$TMP/mock-vkcube.log" || failed="$failed vkcube(mock)"
+fi
 
 kill $xpid 2>/dev/null
 wait $xpid 2>/dev/null

@@ -4,7 +4,8 @@
  * marker tests/mock_compositor.c checks on the zero-copy path. Without a compositor the frames are
  * copied into the window, and the window's centre pixel is compared with the last frame at the end.
  *   SC_FRAMES (default 120), SC_SIZE=WxH (default 640x360), SC_FORMAT=bgra|rgba, SC_RESIZE=1 resizes
- *   the window halfway and expects VK_SUBOPTIMAL_KHR, then recreates the swapchain.
+ *   the window halfway and expects VK_SUBOPTIMAL_KHR, then recreates the swapchain, SC_COVER=partly|fully
+ *   maps another window over this one for the middle third of the frames.
  * Prints SC-PASS / SC-FAIL and the mean acquire, record+submit and present times.
  *
  * This library is free software; you can redistribute it and/or modify it
@@ -68,6 +69,8 @@ int main(void) {
     if (getenv("SC_SIZE")) sscanf(getenv("SC_SIZE"), "%ux%u", &width, &height);
     bool rgba = getenv("SC_FORMAT") && !strcmp(getenv("SC_FORMAT"), "rgba");
     bool resize = getenv("SC_RESIZE") && atoi(getenv("SC_RESIZE"));
+    const char* cover = getenv("SC_COVER");
+    xcb_window_t coverWindow = 0;
     format = rgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
 
     xcb_connection_t* conn = xcb_connect(NULL, NULL);
@@ -125,6 +128,19 @@ int main(void) {
         if (resize && f == frames / 2) {
             uint32_t values[] = {width / 2, height / 2};
             xcb_configure_window(conn, window, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values);
+            free(xcb_get_input_focus_reply(conn, xcb_get_input_focus(conn), NULL));
+        }
+        /* SC_COVER=partly|fully: another window over this one for the middle third of the frames. */
+        if (cover && f == frames / 3) {
+            bool fully = !strcmp(cover, "fully");
+            coverWindow = xcb_generate_id(conn);
+            xcb_create_window(conn, XCB_COPY_FROM_PARENT, coverWindow, screen->root, fully ? 0 : 200, fully ? 0 : 200,
+                              fully ? 1280 : 200, fully ? 720 : 100, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0, NULL);
+            xcb_map_window(conn, coverWindow);
+            free(xcb_get_input_focus_reply(conn, xcb_get_input_focus(conn), NULL));
+        }
+        if (cover && f == 2 * frames / 3) {
+            xcb_unmap_window(conn, coverWindow);
             free(xcb_get_input_focus_reply(conn, xcb_get_input_focus(conn), NULL));
         }
         int slot = f % SLOTS;

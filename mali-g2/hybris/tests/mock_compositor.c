@@ -8,6 +8,9 @@
  *     (B = 0xa5) and that frame numbers (R + 256 G) advance; keeps the image "on screen" and releases
  *     the one shown before. MOCK_RELEASE=early (default) hands a dup of the new present's acquire
  *     fence back as release fence, MOCK_RELEASE=late releases without a fence after it signalled.
+ *     MOCK_GAPS=1 accepts frames skipped (shown through X11 meanwhile) as long as they advance.
+ *     MOCK_CHECK=0 skips the marker check (any other application), MOCK_DUMP=<file> writes each
+ *     presented buffer to a PPM file.
  * Prints "MOCK chain ..." per chain and "MOCK-RESULT ok|fail" when a client disconnects.
  *
  * This library is free software; you can redistribute it and/or modify it
@@ -90,6 +93,31 @@ static void sendMsg(int fd, const Msg* m, int passFd) {
     sendmsg(fd, &h, MSG_NOSIGNAL);
 }
 
+/* MOCK_DUMP=<file>: the presented buffer as a PPM picture, rewritten at every present. */
+static void dump(AHardwareBuffer* b, const char* path) {
+    AHardwareBuffer_Desc d;
+    AHardwareBuffer_describe(b, &d);
+    void* px = NULL;
+    if (AHardwareBuffer_lock(b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, NULL, &px) != 0 || !px) return;
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE* f = fopen(tmp, "wb");
+    if (f) {
+        bool rgba = d.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+        fprintf(f, "P6\n%u %u\n255\n", d.width, d.height);
+        for (uint32_t y = 0; y < d.height; y++) {
+            const uint8_t* row = (const uint8_t*)px + (size_t)y * d.stride * 4;
+            for (uint32_t x = 0; x < d.width; x++) {
+                uint8_t rgb[3] = {row[x * 4 + (rgba ? 0 : 2)], row[x * 4 + 1], row[x * 4 + (rgba ? 2 : 0)]};
+                fwrite(rgb, 1, 3, f);
+            }
+        }
+        fclose(f);
+        rename(tmp, path);
+    }
+    AHardwareBuffer_unlock(b, NULL);
+}
+
 /* The centre pixel as B | G << 8 | R << 16 (the buffers are BGRA or RGBA); -1: not readable. */
 static long centrePixel(AHardwareBuffer* b, bool* rgba) {
     AHardwareBuffer_Desc d;
@@ -105,6 +133,8 @@ static long centrePixel(AHardwareBuffer* b, bool* rgba) {
 
 static bool serve(int c, bool early) {
     bool ok = true;
+    bool check = !getenv("MOCK_CHECK") || atoi(getenv("MOCK_CHECK"));
+    bool gaps = getenv("MOCK_GAPS") && atoi(getenv("MOCK_GAPS"));
     for (;;) {
         Msg m;
         int fd;
@@ -136,12 +166,13 @@ static bool serve(int c, bool early) {
             }
             else ch->noFence++;
             bool rgba;
-            long px = centrePixel(ch->bufs[m.index], &rgba);
+            long px = check ? centrePixel(ch->bufs[m.index], &rgba) : -1;
+            if (getenv("MOCK_DUMP")) dump(ch->bufs[m.index], getenv("MOCK_DUMP"));
             if (px >= 0) {
                 ch->checked++;
                 int frame = (int)((px >> 16) & 0xff) | (int)(px & 0xff00);
                 if ((px & 0xff) != 0xa5) ch->badPixel++;
-                else if (ch->lastFrame >= 0 && frame != ch->lastFrame + 1) ch->outOfOrder++;
+                else if (ch->lastFrame >= 0 && (gaps ? frame <= ch->lastFrame : frame != ch->lastFrame + 1)) ch->outOfOrder++;
                 ch->lastFrame = frame;
             }
             if (ch->shown >= 0 && ch->shown != (int)m.index) {

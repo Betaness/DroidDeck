@@ -1513,7 +1513,7 @@ static VkResult presentZeroCopyLocked(Swapchain* sc, VkQueue queue, uint32_t ima
     if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
         if (sc->zeroCopy == 1) fprintf(stderr, "hybris-x11: zero-copy stopped, presenting through X11\n");
         sc->zeroCopy = -1;
-        sc->x11Why = "the compositor declined it";
+        sc->x11Why = !sc->owner ? "no zero-copy for this swapchain" : "the compositor declined it";
     }
     else if (result == VK_SUCCESS && sc->zeroCopy == 0) {
         sc->zeroCopy = 1;
