@@ -5,7 +5,8 @@
  * copied into the window, and the window's centre pixel is compared with the last frame at the end.
  *   SC_FRAMES (default 120), SC_SIZE=WxH (default 640x360), SC_POS=X,Y (default 20,30), SC_FORMAT=bgra|rgba, SC_RESIZE=1 resizes
  *   the window halfway and expects VK_SUBOPTIMAL_KHR, then recreates the swapchain, SC_COVER=partly|fully
- *   maps another window over this one for the middle third of the frames.
+ *   maps another window over this one for the middle third of the frames, SC_QUEUES=N takes N queues,
+ *   SC_SUBMIT_THREAD=1 submits from a second thread all along.
  * Prints SC-PASS / SC-FAIL and the mean acquire, record+submit and present times.
  *
  * This library is free software; you can redistribute it and/or modify it
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 
 #define CHECK(x) do { VkResult r_ = (x); if (r_ < 0) { printf("SC-FAIL %s -> %d\n", #x, r_); exit(1); } } while (0)
@@ -30,6 +32,29 @@ static double now(void) {
 
 static VkDevice device;
 static VkPhysicalDevice physical;
+static VkQueue queue;
+/* The application's own queue lock: SC_SUBMIT_THREAD=1 submits from a second thread meanwhile, as an
+ * engine with a submission thread does; acquire is not under it (it uses no application queue). */
+static pthread_mutex_t queueLock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int stopSubmitting;
+static unsigned threadSubmits;
+
+static void* submitThread(void* arg) {
+    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence;
+    if (vkCreateFence(device, &fci, NULL, &fence) != VK_SUCCESS) return NULL;
+    while (!stopSubmitting) {
+        pthread_mutex_lock(&queueLock);
+        VkResult r = vkQueueSubmit(queue, 0, NULL, fence);
+        pthread_mutex_unlock(&queueLock);
+        if (r != VK_SUCCESS) break;
+        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(device, 1, &fence);
+        threadSubmits++;
+    }
+    vkDestroyFence(device, fence, NULL);
+    return NULL;
+}
 static VkSurfaceKHR surface;
 static VkFormat format;
 static VkSwapchainKHR swapchain;
@@ -97,13 +122,17 @@ int main(void) {
     CHECK(vkGetPhysicalDeviceSurfaceSupportKHR(physical, 0, surface, &supported));
     if (!supported) { printf("SC-FAIL family 0 cannot present\n"); return 1; }
 
-    float priority = 1;
-    VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &priority};
+    /* SC_QUEUES=N asks for N queues of family 0; with all of them taken the ICD shares one for acquire. */
+    float priorities[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    uint32_t queues = getenv("SC_QUEUES") ? (uint32_t)atoi(getenv("SC_QUEUES")) : 1;
+    VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, queues < 1 ? 1 : queues > 16 ? 16 : queues, priorities};
     const char* deviceExtensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qi, 0, NULL, 1, deviceExtensions};
     CHECK(vkCreateDevice(physical, &di, NULL, &device));
-    VkQueue queue;
     vkGetDeviceQueue(device, 0, 0, &queue);
+    pthread_t submitter;
+    bool threaded = getenv("SC_SUBMIT_THREAD") && atoi(getenv("SC_SUBMIT_THREAD"));
+    if (threaded) pthread_create(&submitter, NULL, submitThread, NULL);
     createSwapchain();
 
     VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, 0};
@@ -175,14 +204,20 @@ int main(void) {
         CHECK(vkEndCommandBuffer(cmd));
         VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &acquired[slot], &stage, 1, &cmd, 1, &rendered[slot]};
+        pthread_mutex_lock(&queueLock);
         CHECK(vkQueueSubmit(queue, 1, &submit, done[slot]));
+        pthread_mutex_unlock(&queueLock);
         double t2 = now();
         VkPresentInfoKHR present = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &rendered[slot], 1, &swapchain, &index, NULL};
+        pthread_mutex_lock(&queueLock);
         VkResult r = vkQueuePresentKHR(queue, &present);
+        pthread_mutex_unlock(&queueLock);
         double t3 = now();
         if (r == VK_SUBOPTIMAL_KHR) {
             suboptimal++;
+            pthread_mutex_lock(&queueLock);
             CHECK(vkDeviceWaitIdle(device));
+            pthread_mutex_unlock(&queueLock);
             createSwapchain();
             recreated++;
         }
@@ -193,6 +228,11 @@ int main(void) {
         tAcquire += t1 - t0;
         tSubmit += t2 - t1;
         tPresent += t3 - t2;
+    }
+    if (threaded) {
+        stopSubmitting = 1;
+        pthread_join(submitter, NULL);
+        printf("submission thread: %u submits meanwhile\n", threadSubmits);
     }
     CHECK(vkDeviceWaitIdle(device));
     printf("%d frames: acquire %.3f ms, record+submit %.3f ms, present %.3f ms (means); %d suboptimal, %d recreated\n", frames,

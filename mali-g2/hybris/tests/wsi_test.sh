@@ -9,6 +9,8 @@
 #   zero-copy   mock_compositor.c as the compositor: AHardwareBuffer images, acquire and release
 #               fences, pixels checked through CPU-readable buffers (DROIDDECK_HYBRIS_AHB_CPU_READ=1)
 #   zero-copy-late  the same, the mock releasing without fences
+#   zero-copy-shared-queue  the application takes every queue and submits from a second thread too:
+#               acquire shares a queue, under a lock
 #   zero-copy-afbc  buffers as the session allocates them (likely AFBC: pixels not checked)
 #   cover-partly, cover-fully  another window over the window: X11 copies, paced frames, back
 #   vkcube      vkcube zero-copy, its last frame in out/tests/vkcube.ppm
@@ -21,7 +23,7 @@ GUEST_DIR=${GUEST_DIR:-/usr/local/lib/droiddeck-hybris}
 BIN=$ROOT/out/tests
 mkdir -p "$BIN"
 STAGE_INC=$ROOT/work/stage$GUEST_DIR/include
-cc -O2 -Wall -o "$BIN/swapchain_test" "$HERE/swapchain_test.c" -lvulkan -lxcb || exit 1
+cc -O2 -Wall -o "$BIN/swapchain_test" "$HERE/swapchain_test.c" -lvulkan -lxcb -lpthread || exit 1
 cc -O2 -Wall -I"$ROOT/src/compat" -I"$STAGE_INC" -o "$BIN/mock_compositor" "$HERE/mock_compositor.c" "$ROOT/src/ahb.c" \
     "$OUT$GUEST_DIR/lib/libhybris-common.so.1" -lpthread || exit 1
 
@@ -65,6 +67,8 @@ run copy SC_EXPECT_COPY=1
 run copy-rgba SC_EXPECT_COPY=1 SC_FORMAT=rgba
 run_zc zero-copy early DROIDDECK_HYBRIS_AHB_CPU_READ=1 VORTEK_X11_STATS=1
 run_zc zero-copy-late late DROIDDECK_HYBRIS_AHB_CPU_READ=1
+run_zc zero-copy-shared-queue early DROIDDECK_HYBRIS_AHB_CPU_READ=1 SC_QUEUES=4 SC_SUBMIT_THREAD=1
+grep -q 'a shared queue for acquire' "$TMP/zero-copy-shared-queue.log" || failed="$failed zero-copy-shared-queue(not-shared)"
 export MOCK_CHECK=0
 run_zc zero-copy-afbc early
 unset MOCK_CHECK
