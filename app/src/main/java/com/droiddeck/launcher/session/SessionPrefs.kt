@@ -434,7 +434,7 @@ object SessionPrefs {
     /** Whether the game's busiest threads are named to the power HAL for a boost (GameThreadHints). */
     fun gameThreadHints(context: Context): Boolean = prefs(context).getBoolean("gameThreadHints", true)
 
-    /** [mali-g2] Whether Xiaomi's Joyose is force-stopped during a session (HyperOsGameMode). */
+    /** [mali-g2] Whether HyperOS's game regulator is kept off the app: Joyose stopped at launch and during a session (HyperOsGameMode). */
     fun stopJoyose(context: Context): Boolean = prefs(context).getBoolean("stopJoyose", true)
 
     /** Whether a Windows game's busiest thread may share a core with its wineserver (WineServerColocation). */
