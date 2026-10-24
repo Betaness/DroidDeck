@@ -300,6 +300,13 @@ def without_pack(chosen_env, env):
 SSBS_LIB = "/usr/local/lib/libssbs.so"
 
 
+def arm64_proton(command):
+    """Whether command runs an ARM64 Proton (aarch64 Wine), the only kind whose unix side can load
+    aarch64 libraries; other Protons (x86_64 GE-Proton and the like) run under FEX."""
+    proton = os.path.dirname(command[0]) if command else ""
+    return os.path.isdir(os.path.join(proton, "files/lib/wine/aarch64-unix"))
+
+
 def force_ssbs(command, env):
     """DROIDDECK_FORCE_SSBS=1 (a game's or the shared environment): preload libssbs.so into this
     Proton's Wine, which then keeps PSTATE.SSBS set across signal returns - speculative store
@@ -307,8 +314,7 @@ def force_ssbs(command, env):
     library is aarch64 and only arm64 Wine has the signal path it fixes."""
     if env.get("DROIDDECK_FORCE_SSBS", "").lower() not in ("1", "on", "true", "yes"):
         return env
-    proton = os.path.dirname(command[0]) if command else ""
-    if not os.path.isdir(os.path.join(proton, "files/lib/wine/aarch64-unix")):
+    if not arm64_proton(command):
         print("droiddeck-game-env: force SSBS asked for, but this Proton is not an ARM64 one; left off", file=sys.stderr)
         return env
     if not os.path.isfile(SSBS_LIB):
@@ -389,6 +395,11 @@ def hybris_gpu(command, env):
     if env.get("DROIDDECK_GPU_PATH") != "hybris" or env.get("BL_GPU_MODE") != "vortek":
         return env
     if len(command) < 2 or command[1] != "waitforexitandrun":
+        return env
+    if not arm64_proton(command):
+        # An x86_64 Proton's Wine runs under FEX: its ld.so ignores the aarch64 preload, and the aarch64 ICD
+        # would at best reach it through FEX's Vulkan thunk, untested. Vortek works there.
+        print("droiddeck-game-env: in-process GPU asked for, but this Proton is not an ARM64 one; Vortek", file=sys.stderr)
         return env
     missing = [path for path in (HYBRIS_ICD, HYBRIS_PRELOAD, ANDROID_VULKAN) if not os.path.exists(path)]
     if missing:
