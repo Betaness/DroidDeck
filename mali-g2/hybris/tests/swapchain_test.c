@@ -3,7 +3,7 @@
  * tests/run.sh): each frame clears the image to R = frame & 0xff, G = frame >> 8, B = 0xa5, the
  * marker tests/mock_compositor.c checks on the zero-copy path. Without a compositor the frames are
  * copied into the window, and the window's centre pixel is compared with the last frame at the end.
- *   SC_FRAMES (default 120), SC_SIZE=WxH (default 640x360), SC_FORMAT=bgra|rgba, SC_RESIZE=1 resizes
+ *   SC_FRAMES (default 120), SC_SIZE=WxH (default 640x360), SC_POS=X,Y (default 20,30), SC_FORMAT=bgra|rgba, SC_RESIZE=1 resizes
  *   the window halfway and expects VK_SUBOPTIMAL_KHR, then recreates the swapchain, SC_COVER=partly|fully
  *   maps another window over this one for the middle third of the frames.
  * Prints SC-PASS / SC-FAIL and the mean acquire, record+submit and present times.
@@ -77,7 +77,9 @@ int main(void) {
     if (xcb_connection_has_error(conn)) { printf("SC-FAIL no X display\n"); return 1; }
     xcb_screen_t* screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
     xcb_window_t window = xcb_generate_id(conn);
-    xcb_create_window(conn, XCB_COPY_FROM_PARENT, window, screen->root, 20, 30, (uint16_t)width, (uint16_t)height, 0,
+    int posX = 20, posY = 30;
+    if (getenv("SC_POS")) sscanf(getenv("SC_POS"), "%d,%d", &posX, &posY);
+    xcb_create_window(conn, XCB_COPY_FROM_PARENT, window, screen->root, (int16_t)posX, (int16_t)posY, (uint16_t)width, (uint16_t)height, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0, NULL);
     xcb_map_window(conn, window);
     xcb_flush(conn);
