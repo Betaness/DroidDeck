@@ -21,18 +21,33 @@ if [ -n "${BL_LOG:-}" ] && [ -z "${BL_INSIDE:-}" ]; then
   echo "== rootfs: $(cat /.version 2>/dev/null || echo unversioned)"
 fi
 
+# Besides C.UTF-8: the Steam client sets en_US.UTF-8 for itself, and a game is started with
+# LC_CTYPE/LC_MESSAGES for its language (seen in the log for English: en_US.UTF-8); Wine takes its
+# Windows locale, and with it the codepage, from those. The zh/ja/ko entries are there for the other
+# languages on the expectation that they map the same way. The stamp names only the locales that
+# were built, so one that failed is tried again at the next start.
 prepare_locale() {
-  local dir=/usr/lib/locale stamp=/usr/lib/locale/.droiddeck-archive want have= pkg
+  local dir=/usr/lib/locale stamp=/usr/lib/locale/.droiddeck-archive want have= pkg locale built= failed=
+  local -a locales=(en_US.UTF-8 zh_CN.UTF-8 zh_TW.UTF-8 ja_JP.UTF-8 ko_KR.UTF-8)
   pkg=(/var/lib/pacman/local/glibc-[0-9]*)
-  want=${pkg[0]##*/}
+  pkg=${pkg[0]##*/}
+  want="$pkg ${locales[*]}"
   [ -f "$stamp" ] && read -r have < "$stamp"
   [ "$have" = "$want" ] && [ -f "$dir/locale-archive" ] && [ ! "$dir/locale-archive" -nt "$stamp" ] && return 0
   [ -d "$dir/C.utf8" ] && command -v localedef >/dev/null 2>&1 || return 0
   DROIDDECK_LINK_RENAME=1 localedef --add-to-archive --replace "$dir/C.utf8" >/dev/null 2>&1 || return 0
+  for locale in "${locales[@]}"; do
+    if [ -f "/usr/share/i18n/locales/${locale%%.*}" ] &&
+      DROIDDECK_LINK_RENAME=1 localedef --replace -i "${locale%%.*}" -f UTF-8 "$locale" >/dev/null 2>&1; then
+      built+=" $locale"
+    else
+      failed+=" $locale"
+    fi
+  done
   rm -f /usr/lib/gconv/gconv-modules.cache
   command -v iconvconfig >/dev/null 2>&1 && iconvconfig >/dev/null 2>&1
-  printf '%s\n' "$want" > "$stamp"
-  echo "== locale archive built for $want"
+  printf '%s\n' "$pkg$built" > "$stamp"
+  echo "== locale archive built for $pkg$built${failed:+ (could not build:$failed, trying again next start)}"
 }
 [ -z "${BL_INSIDE:-}" ] && prepare_locale
 
