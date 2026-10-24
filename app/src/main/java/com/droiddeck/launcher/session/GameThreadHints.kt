@@ -40,6 +40,10 @@ import kotlin.math.abs
  * rate), so a CPU-bound game near 60 fps on a 120 Hz panel is just slow. Counting it as paced trapped
  * Duckov: a dip to ~60 fps (a loading screen) let its main thread go from a 4.2 GHz prime core to a
  * mid core, where it stayed at 58-60 fps instead of 73.
+ *
+ * [mali-g2] On the Xring O3 the hint sessions do nothing: its power HAL is AOSP's example service (see
+ * XrThreadQos). There the boosted threads may also be given one of HyperOS's own thread QoS levels
+ * (pref xringThreadQos, off until measured), taken away again when they leave the set.
  */
 object GameThreadHints {
     private val HINTED_SOCS = setOf("CQ8725S", "O3")
@@ -69,9 +73,16 @@ object GameThreadHints {
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
         val pm = context.getSystemService(PowerManager::class.java)
+        val qos = try {
+            XrThreadQos.forSession(context)
+        } catch (t: Throwable) {
+            Log.w(TAG, "xr qos unavailable", t)
+            null
+        }
         worker?.interrupt()
-        worker = Thread({ run(hm, pm) }, "game-thread-hints").apply { isDaemon = true; start() }
-        return "game thread hints: watching"
+        worker = Thread({ run(hm, pm, qos) }, "game-thread-hints").apply { isDaemon = true; start() }
+        // AOSP's example power HAL answers 1 ms; one that acts on hints reports its own rate.
+        return "game thread hints: watching (hint rate ${hm.preferredUpdateRateNanos} ns, xr qos ${qos ?: "off"})"
     }
 
     /** At a session's end. */
@@ -81,12 +92,13 @@ object GameThreadHints {
         worker = null
     }
 
-    private fun run(hm: PerformanceHintManager, pm: PowerManager) {
+    private fun run(hm: PerformanceHintManager, pm: PowerManager, qos: XrThreadQos?) {
         val scanner = Scanner()
         // [mali-g2] Only where a frame regulator was seen holding a cluster's clock (see ClusterSteer).
         val steer = if (Build.SOC_MODEL == "O3") ClusterSteer.forDevice() else null
         var session: PerformanceHintManager.Session? = null
         var boosted = emptySet<Int>()
+        var qosOn = emptySet<Int>()
         val frames = ArrayDeque<Long>()
         var pacedFor = 0
         var tick = 0
@@ -117,6 +129,8 @@ object GameThreadHints {
                             next.joinToString { "${readName("/proc/$it/comm")}/$it ${((busy[it] ?: 0.0) * 100).toInt()}%" }.ifEmpty { "nothing" } +
                             " (game ${fps.toInt()} fps${if (paced) ", holding pace" else ""})")
                     }
+                    // Apart from the hint session, which a thread exiting in between fails as a whole.
+                    if (qos != null && next != qosOn) qosOn = retarget(qos, qosOn, next)
                 }
                 session?.reportActualWorkDuration(TARGET_NS * 3 / 2)
                 Thread.sleep(REPORT_MS)
@@ -126,8 +140,20 @@ object GameThreadHints {
             Log.w(TAG, "stopped", t)
         } finally {
             session?.close()
+            if (qos != null) retarget(qos, qosOn, emptySet())
             steer?.release()
         }
+    }
+
+    /** The QoS level taken from the threads of [on] not in [next] and given to those new in it; returns the threads that have it. */
+    private fun retarget(qos: XrThreadQos, on: Set<Int>, next: Set<Int>): Set<Int> {
+        (on - next).forEach { tid -> qos.clear(tid)?.let { Log.i(TAG, it) } }
+        val added = (next - on).filter { tid ->
+            val (ok, line) = qos.apply(tid)
+            Log.i(TAG, "${readName("/proc/$tid/comm")}: $line")
+            ok
+        }
+        return (on intersect next) + added
     }
 
     /** A new session over [tids] in place of [session]; null for none. The set changes seldom, so no setThreads. */
