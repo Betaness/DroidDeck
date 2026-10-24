@@ -30,20 +30,25 @@ internal class XrThreadQos private constructor(private val mode: Mode) {
 
     /** Threads that were SCHED_OTHER before an RT level made them SCHED_RR. */
     private val raised = HashSet<Int>()
+    private val refused = HashSet<Int>()
 
-    /** Gives [tid] the level: whether the kernel took it, and a line for the log saying what it made of it. */
-    fun apply(tid: Int): Pair<Boolean, String> {
+    /** Gives [tid] the level; returns a line for the log saying what the kernel made of it. */
+    fun apply(tid: Int): String {
         val before = policy(tid)
         val result = XrQosNative.nativeSet(tid, mode.value)
-        if (result < 0) return false to "xr qos $mode refused for $tid: errno ${-result}"
+        if (result < 0) {
+            refused += tid
+            return "xr qos $mode refused for $tid: errno ${-result}"
+        }
         val after = policy(tid)
         if (mode.type == TYPE_RT && before != null && before and SCHED_MASK == SCHED_OTHER) raised += tid
-        return true to "xr qos $mode on $tid: reads ${XrQosNative.nativeGet(tid).let { if (it < 0) "errno ${-it}" else "0x" + Integer.toHexString(it) }}" +
+        return "xr qos $mode on $tid: reads ${XrQosNative.nativeGet(tid).let { if (it < 0) "errno ${-it}" else "0x" + Integer.toHexString(it) }}" +
             ", policy ${describe(before)} -> ${describe(after)}"
     }
 
-    /** Takes the level from [tid] again; null when the thread is gone. */
+    /** Takes the level from [tid] again; null when the thread is gone or never had it. */
     fun clear(tid: Int): String? {
+        if (refused.remove(tid)) return null
         val result = XrQosNative.nativeSet(tid, 0)
         val wasOther = raised.remove(tid)
         if (result < 0) return policy(tid)?.let { "xr qos clear failed for $tid: errno ${-result}" }

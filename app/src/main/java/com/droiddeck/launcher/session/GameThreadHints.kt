@@ -145,15 +145,11 @@ object GameThreadHints {
         }
     }
 
-    /** The QoS level taken from the threads of [on] not in [next] and given to those new in it; returns the threads that have it. */
+    /** The QoS level taken from the threads of [on] not in [next] and given to those new in it (once, taken or not); returns [next]. */
     private fun retarget(qos: XrThreadQos, on: Set<Int>, next: Set<Int>): Set<Int> {
         (on - next).forEach { tid -> qos.clear(tid)?.let { Log.i(TAG, it) } }
-        val added = (next - on).filter { tid ->
-            val (ok, line) = qos.apply(tid)
-            Log.i(TAG, "${readName("/proc/$tid/comm")}: $line")
-            ok
-        }
-        return (on intersect next) + added
+        (next - on).forEach { tid -> Log.i(TAG, "${readName("/proc/$tid/comm")}: ${qos.apply(tid)}") }
+        return next
     }
 
     /** A new session over [tids] in place of [session]; null for none. The set changes seldom, so no setThreads. */
