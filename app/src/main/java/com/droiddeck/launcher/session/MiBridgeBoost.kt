@@ -18,9 +18,14 @@ import java.lang.reflect.Method
  * request (level 1, 2, 3); a CPU request is refused while the board sensor reads 40 C or more. Only packages
  * in the system setting mibridge_authorized_pkg_list (a cloud-fed list) are served. The app may not edit
  * that setting, the shell user may: so the package is added through the wireless debugging pairing at a
- * session's start, and taken out again at the first session after the setting here is cleared. Being listed
- * only lets the app ask. The floors are system-wide clock requests, so the game in the session's child
- * processes gets them too; they lapse by themselves when the app stops renewing them.
+ * session's start, and taken out again at the first session after the setting here is cleared (and the
+ * pairing works; clearing the app's data or uninstalling it leaves the package listed). Being listed lets the
+ * app ask MirimThirdPartyPolicy; PowerKeeper (MiSpeedUtils) also hands the listed uids to the native
+ * miuiboosterservice, and skips that while the list is empty or unset, so when this package was the only
+ * entry its uid stays there until a reboot after it is taken out. The floors are system-wide clock requests,
+ * so the game in the session's child processes gets them too; they lapse by themselves when the app stops
+ * renewing them. A cloud update rewriting the list takes the grant away mid-session: a request refused for
+ * want of it has the package listed and the permission checked again, at most once a minute.
  *
  * The setting [SessionPrefs.miBridgeBoost] names what to hold, e.g. "gpu=1" or "gpu=1,ddr=1,cpu=1";
  * empty is off. Which clocks the levels map to is not known yet: uniperf's tables are not readable.
@@ -30,15 +35,22 @@ object MiBridgeBoost {
     private const val SETTING = "mibridge_authorized_pkg_list"
     private const val JAR = "/system_ext/framework/MiuiBooster.jar"
     private const val ADDED = "miBridgeAuthorized" // session prefs: this app put itself in SETTING
-    private const val RENEW_EARLY_MS = 300L
+    private const val POLL_MS = 250L
+    private const val REFUSED_RETRY_MS = 5_000L
+    private const val REGRANT_EVERY_MS = 60_000L
+    /** MiuiBooster's own refusal: its static permission flag is unset, or the uid is not the caller's. */
+    private const val NOT_PERMITTED = -2
     private val MAX_TIMEOUT_MS = intArrayOf(0, 10_000, 5_000, 1_500)
     private val PACKAGE_LIST = Regex("[A-Za-z0-9._,]*")
 
     internal data class Hold(val kind: String, val level: Int) {
         val method get() = kind.replaceFirstChar { it.uppercaseChar() }
         val timeoutMs get() = MAX_TIMEOUT_MS[level]
+        /** Renewed halfway: level 3's 1.5 s leaves a few binder and HAL calls no room nearer its end. */
+        val renewMs get() = timeoutMs / 2L
     }
 
+    @Volatile
     private var worker: Thread? = null
 
     /** "gpu=1,cpu=2" as holds; null when malformed. Each kind once, levels 1-3. */
@@ -78,7 +90,8 @@ object MiBridgeBoost {
         val holds = parse(spec) ?: return "mibridge: cannot read '$spec'"
         worker?.interrupt()
         worker = Thread({ run(app, holds) }, "mibridge-boost").apply { isDaemon = true; start() }
-        return "mibridge: holding ${holds.joinToString { "${it.kind} level ${it.level}" }}"
+        // Granted or not is known only later, from the worker: the MiBridgeBoost lines in the app's log.
+        return "mibridge: asking for ${holds.joinToString { "${it.kind} level ${it.level}" }} (see the MiBridgeBoost lines for the outcome)"
     }
 
     /** At a session's end. */
@@ -88,10 +101,13 @@ object MiBridgeBoost {
         worker = null
     }
 
+    /** Whether this thread is still the session's worker: stop() may have been missed in kadb's blocking I/O. */
+    private fun current() = !Thread.currentThread().isInterrupted && worker === Thread.currentThread()
+
     private fun run(context: Context, holds: List<Hold>) {
         var authorized = false
         withShell(context) { authorized = authorize(context, it) }
-        if (!authorized) return
+        if (!authorized || !current()) return
         try {
             hold(context, holds)
         } catch (_: InterruptedException) {
@@ -132,7 +148,12 @@ object MiBridgeBoost {
         if (!prefs.getBoolean(ADDED, false)) return
         val list = adb.shell("settings get system $SETTING").output.trim().let { if (it == "null") "" else it }
         val next = withoutPackage(list, context.packageName)
-        if (next != null && PACKAGE_LIST.matches(next)) {
+        if (next != null && !PACKAGE_LIST.matches(next)) {
+            // Tried again at the next session.
+            Log.w(TAG, "unexpected $SETTING '$list': this package left in it")
+            return
+        }
+        if (next != null) {
             adb.shell(if (next.isEmpty()) "settings delete system $SETTING" else "settings put system $SETTING '$next'")
             Log.i(TAG, "taken out of $SETTING again")
         }
@@ -145,13 +166,14 @@ object MiBridgeBoost {
         val uid = Process.myUid()
         val check = booster.javaClass.getMethod("checkPermission", String::class.java, Int::class.javaPrimitiveType)
         // system_server reads the setting again on its own thread; give it a moment.
-        var granted = false
-        for (attempt in 0 until 10) {
-            granted = check.invoke(booster, context.packageName, uid) as Boolean
-            if (granted) break
-            Thread.sleep(500)
+        fun granted(): Boolean {
+            for (attempt in 0 until 10) {
+                if (check.invoke(booster, context.packageName, uid) as Boolean) return true
+                Thread.sleep(500)
+            }
+            return false
         }
-        if (!granted) {
+        if (!granted()) {
             Log.w(TAG, "not granted by MirimThirdPartyPolicy")
             return
         }
@@ -160,18 +182,34 @@ object MiBridgeBoost {
         val cancels = holds.map { booster.javaClass.getMethod("cancel${it.method}HighFreq", int) }
         val renewAt = LongArray(holds.size)
         val last = IntArray(holds.size) { Int.MIN_VALUE }
+        var regrantAt = 0L
         try {
-            while (!Thread.currentThread().isInterrupted) {
-                val now = SystemClock.elapsedRealtime()
+            while (current()) {
+                var now = SystemClock.elapsedRealtime()
+                var notPermitted = false
                 requests.forEachIndexed { i, (h, request: Method) ->
                     if (now < renewAt[i]) return@forEachIndexed
                     val r = request.invoke(booster, uid, h.level, h.timeoutMs) as Int
-                    // 0 granted; -1 refused (a hot board for the CPU, or uniperf); -2 no answer
+                    // 0 granted; -1 refused by system_server (a hot board for the CPU, the grant gone, or uniperf);
+                    // -2 refused by MiuiBooster itself (its permission flag unset, or another uid)
                     if (r != last[i]) Log.i(TAG, "${h.kind} level ${h.level}: ${if (r == 0) "granted" else "refused ($r)"}")
                     last[i] = r
-                    renewAt[i] = now + if (r == 0) h.timeoutMs - RENEW_EARLY_MS else 5_000L
+                    renewAt[i] = now + if (r == 0) h.renewMs else REFUSED_RETRY_MS
+                    if (r == NOT_PERMITTED || (r != 0 && h.kind != "cpu")) notPermitted = true
                 }
-                Thread.sleep(250)
+                // A grant taken away (a cloud update rewrote the list): listed and checked again, once a minute at most.
+                if (notPermitted && now >= regrantAt) {
+                    regrantAt = now + REGRANT_EVERY_MS
+                    if (!(check.invoke(booster, context.packageName, uid) as Boolean)) {
+                        var listed = false
+                        withShell(context) { listed = authorize(context, it) }
+                        val again = listed && current() && granted()
+                        Log.i(TAG, "permission gone mid-session: " + if (again) "granted again" else "not granted again")
+                        if (again) renewAt.fill(0L)
+                    }
+                    now = SystemClock.elapsedRealtime()
+                }
+                Thread.sleep(((renewAt.minOrNull() ?: now) - now).coerceIn(10L, POLL_MS))
             }
         } catch (_: InterruptedException) {
         } finally {

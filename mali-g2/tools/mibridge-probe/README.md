@@ -14,3 +14,6 @@ adb push mbprobe.dex /data/local/tmp/
 adb shell CLASSPATH=/data/local/tmp/mbprobe.dex:/system_ext/framework/MiuiBooster.jar \
     app_process /system/bin MbProbe hold gpu 1 30
 ```
+
+`hold` renews its request halfway through the timeout system_server grants the level (10, 5 or 1.5 s),
+and prints the CPU clocks once a second.

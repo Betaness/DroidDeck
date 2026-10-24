@@ -14,7 +14,7 @@ import java.lang.reflect.Method;
  *
  *   check [package]                 checkPermission (default package com.android.shell)
  *   sample <seconds>                CPU policy min/max/cur once a second, no request
- *   hold <cpu|gpu|ddr> <level> <s>  request level 1..3, renewed before its timeout, for s seconds
+ *   hold <cpu|gpu|ddr> <level> <s>  request level 1..3, renewed halfway through its timeout, for s seconds
  */
 public final class MbProbe {
     private static final int[] POLICIES = {0, 4, 8};
@@ -40,6 +40,11 @@ public final class MbProbe {
                 return;
             }
             case "hold": {
+                if (args.length != 4 || !(args[1].equals("cpu") || args[1].equals("gpu") || args[1].equals("ddr"))
+                        || !args[2].matches("[123]") || !args[3].matches("[0-9]+")) {
+                    System.out.println("usage: hold <cpu|gpu|ddr> <1|2|3> <seconds>");
+                    return;
+                }
                 Object booster = booster();
                 String kind = args[1];
                 int level = Integer.parseInt(args[2]);
@@ -52,16 +57,22 @@ public final class MbProbe {
                 Method request = booster.getClass().getMethod("request" + suffix + "HighFreq", int.class, int.class, int.class);
                 Method cancel = booster.getClass().getMethod("cancel" + suffix + "HighFreq", int.class);
                 int timeout = MAX_TIMEOUT_MS[level];
-                long renewAt = 0;
+                long renewAt = 0, printAt = 0;
                 try {
                     while (System.currentTimeMillis() < until) {
-                        if (System.currentTimeMillis() >= renewAt) {
+                        long now = System.currentTimeMillis();
+                        if (now >= renewAt) {
                             Object r = request.invoke(booster, uid(), level, timeout);
                             System.out.println("request" + suffix + "HighFreq(level " + level + ", " + timeout + " ms) = " + r);
-                            renewAt = System.currentTimeMillis() + timeout - 300;
+                            // Halfway, so the next request lands well before system_server lets the handle go.
+                            renewAt = now + timeout / 2;
                         }
-                        System.out.println(clocks());
-                        Thread.sleep(Math.min(1000, timeout / 2));
+                        if (now >= printAt) {
+                            System.out.println(clocks());
+                            printAt = now + 1000;
+                        }
+                        long next = Math.min(Math.min(renewAt, printAt), until);
+                        Thread.sleep(Math.max(10, next - System.currentTimeMillis()));
                     }
                 } finally {
                     System.out.println("cancel" + suffix + "HighFreq = " + cancel.invoke(booster, uid()));

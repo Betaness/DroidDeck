@@ -195,6 +195,10 @@ This is the only system path found through which an untrusted app can raise floo
 
 - That list comes from cloud config (PowerKeeper `MiBridgeAuthorizedPkgList`). Today it holds WeChat,
   Weibo, Douyin, the Xiaomi launcher and others.
+- It has a second reader: PowerKeeper's `MiSpeedUtils` hands the listed uids to the native
+  `miuiboosterservice` (binder transaction 29), and skips that while the list is empty or unset. So when
+  the app's package was the only entry, taking it out (`settings delete`) leaves its uid authorized in
+  `miuiboosterservice` until a reboot. Being listed is more than leave to ask MirimThirdPartyPolicy.
 - The shell user should be able to add a package with `settings put system`. Shell is exempt from the
   system-table restrictions; this is not yet tried here.
 - The app can do that through its saved wireless debugging pairing, the same way HyperOsGameMode works.
@@ -215,7 +219,11 @@ This is the only system path found through which an untrusted app can raise floo
 - `checkPermission(pkg, uid)` grants all bits to a listed uid.
 - `requestCpuHighFreq`, `requestGpuHighFreq`, `requestDdrHighFreq` take a level from 1 to 3 and a timeout.
   The timeout is capped at 10 s for level 1, 5 s for level 2 and 1.5 s for level 3, and the request must
-  be renewed.
+  be renewed. MiBridgeBoost and the probe renew halfway through the timeout: renewing 300 ms before it
+  left level 3 about 50 ms to spare, and the probe's first version slept past the timeout every time.
+- A request returns 0 when granted, -1 when system_server refuses it (a hot board for the CPU, a grant
+  gone, uniperf), and -2 when the client library refuses it itself (its static permission flag is unset,
+  or the uid is not the caller's).
 - CPU requests are refused while `thermal_message/board_sensor_temp` is at or above
   `persist.sys.miuibooster.thermalbreaklimit` (40 °C).
 - `requestBindCore` sets affinity, which the app can already do.
@@ -229,8 +237,11 @@ This is the only system path found through which an untrusted app can raise floo
 - What frequency each level means is in uniperf's tables, which cannot be read. Experiment E1 measures it.
 - **Child processes:** yes for the frequency floors, which are system-wide. For priority, only for the tids
   passed.
-- **Risk.** The list is cloud-managed, so a cloud update can drop the entry; add it again per session. Expect
-  more heat. Leftover requests lapse in 10 s or less. SCHED_FIFO on a busy Wine thread can starve other
+- **Risk.** The list is cloud-managed, so a cloud update can drop the entry; add it again per session (and
+  MiBridgeBoost adds it again and re-checks the permission, at most once a minute, when a request is
+  refused mid-session). Expect more heat. Leftover requests lapse in 10 s or less. Clearing the app's
+  data or uninstalling it leaves the package in the list: take it out by hand
+  (`settings get`/`put system mibridge_authorized_pkg_list`). SCHED_FIFO on a busy Wine thread can starve other
   threads on that core, so it is not used here.
 
 **Implemented here:** default-off `MiBridgeBoost` (pref `session/miBridgeBoost`, e.g. `gpu=1`), and the
@@ -332,6 +343,7 @@ adb logcat -d -s MirimThirdPartyFreq MirimThirdPartyAuthRegistry MiBridge | tail
 export DROIDDECK_PACKAGE=com.droiddeck.launcher.g2
 tools/droiddeckctl prefs set session miBridgeBoost gpu=1      # then gpu=3, cpu=1, "gpu=1,ddr=1"
 # session log / logcat -s MiBridgeBoost: "added to mibridge_authorized_pkg_list", "gpu level 1: granted"
+# The session's start line only says what is asked for; granted or refused is in the MiBridgeBoost lines.
 ```
 
 - **Run:** A/B against an empty setting, as in E2.
