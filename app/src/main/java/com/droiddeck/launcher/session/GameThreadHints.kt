@@ -65,6 +65,8 @@ object GameThreadHints {
     private val NOT_GAMES = setOf("steam", "steamwebhelper")
 
     private var worker: Thread? = null
+    /** The worker stop() interrupted, which may still be undoing its QoS levels and affinities. */
+    private var retired: Thread? = null
 
     /** At a session's start. The line is for the log. */
     @Synchronized
@@ -88,8 +90,9 @@ object GameThreadHints {
         // their level puts them on, and the cluster experiments need the affinities left as set by hand.
         val steerWanted = Build.SOC_MODEL == "O3" && SessionPrefs.clusterSteer(context)
         val steer = steerWanted && qos == null
-        val previous = worker
+        val previous = worker ?: retired
         previous?.interrupt()
+        retired = null
         worker = Thread({ runAfter(previous, hm, pm, qos, steer) }, "game-thread-hints").apply { isDaemon = true; start() }
         // AOSP's example power HAL answers 1 ms; one that acts on hints reports its own rate.
         return "game thread hints: watching (hint rate ${hm.preferredUpdateRateNanos} ns, xr qos ${qos ?: "off"}" +
@@ -114,6 +117,7 @@ object GameThreadHints {
     @Synchronized
     fun stop() {
         worker?.interrupt()
+        worker?.let { retired = it }
         worker = null
     }
 
