@@ -438,6 +438,9 @@ object SessionPrefs {
     /** [mali-g2] Whether HyperOS's game regulator is kept off the app: Joyose stopped at launch and during a session (HyperOsGameMode). */
     fun stopJoyose(context: Context): Boolean = prefs(context).getBoolean("stopJoyose", true)
 
+    /** [mali-g2] Whether this app's frames are kept from HyperOS's frame governor, which sets the GPU clock by them (FrameSchedOptOut). */
+    fun frameSchedOptOut(context: Context): Boolean = prefs(context).getBoolean("frameSchedOptOut", true)
+
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 

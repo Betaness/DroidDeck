@@ -26,6 +26,7 @@ class App : Application() {
             return
         }
         if (process == "$packageName:vr_recovery" || process == "$packageName:rgb_diagnostic") return
+        if (process != null) com.droiddeck.launcher.session.FrameSchedOptOut.apply(this, process)
         CrashHandler.install(this)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: android.app.Activity) =
