@@ -273,6 +273,11 @@ volatile int g_fps_limit;
 
 volatile int g_hide_shell;
 
+// Set while a game has the focus: touches reach it as the pointer. Xwayland turns a
+// touch into core button events only, never raw ones, so a game that reads the mouse
+// through raw input or DirectInput would see the cursor move and no clicks.
+volatile int g_touch_as_pointer;
+
 volatile int g_zero_copy;
 static int g_zero_copy_paused;
 static int g_zero_copy_fx_skip_said;
@@ -2871,9 +2876,10 @@ static void touch_down(int id, double x, double y) {
     if (!any_active) {
         char name[160];
         describe(target, name, sizeof(name));
-        droiddeck_log("touch", "%s gets %s", name, has_touch ? "touch" : "the pointer (it takes no touch)");
+        droiddeck_log("touch", "%s gets %s", name, !has_touch ? "the pointer (it takes no touch)"
+                      : g_touch_as_pointer ? "the pointer (a game has the focus)" : "touch");
     }
-    if (!has_touch) {
+    if (!has_touch || g_touch_as_pointer) {
         if (any_active) return;
         g_touch_points[id].surface = target;
         g_touch_points[id].pointer_fallback = 1;

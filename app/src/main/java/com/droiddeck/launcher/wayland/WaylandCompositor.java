@@ -176,6 +176,9 @@ public final class WaylandCompositor {
 
     public static native void nativeSetHideShell(boolean hide);
 
+    /** Touches reach the focused client as the pointer (left button) instead of as touch. */
+    public static native void nativeSetTouchAsPointer(boolean on);
+
     public static native void nativeSetOutputRefreshRate(float hz);
 
     public static native void nativeSetZeroCopy(boolean on);
