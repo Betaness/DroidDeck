@@ -271,6 +271,21 @@ for license in NOTICE GPL-2 GPL-3 LGPL-2.1 7zip-License 7zip-unRarLicense; do
         "${linuxfs_dir}/usr/local/share/licenses/droiddeck-msitools/${license}"
 done
 
+font_pkgs="${staging_dir}/font-pkgs"
+font_licenses="${linuxfs_dir}/usr/local/share/licenses/wqy-microhei"
+mkdir -p "${font_pkgs}" "${linuxfs_dir}/usr/share/fonts/misc" "${font_licenses}"
+while read -r package_sha256 package_url; do
+    [[ -n "${package_url}" ]] || continue
+    package_archive=$(cached "${package_sha256}" "$(basename "${package_url}")" \
+        bash -c 'curl -fsSL --retry 3 -o "$out" "$0"' "${package_url}")
+    zstd -dc "${package_archive}" | tar -xf - -C "${font_pkgs}"
+done < <(grep -v '^#' "${repo_root}/tools/linuxfs/fonts/packages.txt")
+install -m644 "${font_pkgs}/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc" \
+    "${linuxfs_dir}/usr/share/fonts/misc/wqy-microhei.ttc"
+install -m644 "${font_pkgs}/usr/share/licenses/wqy-microhei/FONTEXCEPTION" "${font_licenses}/FONTEXCEPTION"
+install -m644 "${repo_root}/tools/linuxfs/fonts/NOTICE" "${font_licenses}/NOTICE"
+install -m644 "${repo_root}/tools/msitools/licenses/GPL-3" "${font_licenses}/GPL-3"
+
 mango_dir="${linuxfs_dir}/usr/local/lib/mangoapp"
 mango_pkgs="${staging_dir}/mango-pkgs"
 mkdir -p "${mango_dir}" "${mango_pkgs}"

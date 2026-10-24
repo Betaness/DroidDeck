@@ -1,0 +1,25 @@
+X core font for the Steam client's update window (usr/share/fonts/misc/wqy-microhei.ttc), from
+Arch Linux's wqy-microhei 0.2.0_beta-12 package, unchanged:
+
+  wqy-microhei.ttc   WenQuanYi Micro Hei 0.2.0-beta
+                     Apache-2.0, or GPL-3.0 with the font embedding exception (FONTEXCEPTION)
+                     http://wenq.org/wqy2/index.cgi?MicroHei
+
+Copyright notices, as the font's name table carries them (both faces):
+
+  Digitized data copyright © 2007, Google Corporation.
+  Copyright © 2008-2009 WenQuanYi Board of Trustees (http://wenq.org/) and Qianqian Fang
+
+  Droid is a trademark of Google and may be registered in certain jurisdictions.
+
+and as upstream's README.txt (wqy-microhei-0.2.0-beta.tar.gz) states them:
+
+  Digitized data copyright © 2007, Google Corporation.
+  Copyright © 2008-2009, WenQuanYi Project Board of Trustees, All rights reserved.
+  Droid Sans Fallback extension interface (http://wenq.org/index.cgi?Fontopia(cn)),
+  copyright © 2008-2009 mozbug and Qianqian Fang
+
+The font is derived from Google's Droid Sans Fallback, Droid Sans and Droid Sans Mono.
+
+The package: https://archive.archlinux.org/packages/w/wqy-microhei/ (see tools/linuxfs/fonts/packages.txt).
+The GPL-3.0 text and the exception are beside this file.

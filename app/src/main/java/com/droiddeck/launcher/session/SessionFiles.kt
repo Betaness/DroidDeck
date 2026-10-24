@@ -118,6 +118,8 @@ object SessionFiles {
         val msitools = listOf("msiinfo", "cabextract", "7z", "7z.so", "libmsi-1.0.so.0", "libgsf-1.so.114", "libgcab-1.0.so.0")
             .map { "usr/local/lib/droiddeck-msitools/$it" } +
             listOf("NOTICE", "GPL-2", "GPL-3", "LGPL-2.1", "7zip-License", "7zip-unRarLicense").map { "usr/local/share/licenses/droiddeck-msitools/$it" }
+        val x11Font = listOf("usr/share/fonts/misc/wqy-microhei.ttc") +
+            listOf("NOTICE", "FONTEXCEPTION", "GPL-3").map { "usr/local/share/licenses/wqy-microhei/$it" }
         val handModels = listOf("left", "right").flatMap { side ->
             listOf("droiddeck_hand_$side.json", "hand.mtl", "hand.png", "hand_open.obj", "hand_fist.obj", "thumb_index_open.obj",
                 "thumb_index_pinch.obj")
@@ -148,7 +150,7 @@ object SessionFiles {
             "usr/local/lib/droiddeck/uruntime" to "usr/local/lib/droiddeck/uruntime",
             "usr/local/lib/droiddeck-pipewire.tzst" to "usr/local/lib/droiddeck-pipewire.tzst",
             "usr/local/share/licenses/uruntime/LICENSE" to "usr/local/share/licenses/uruntime/LICENSE",
-        ) + mangoapp + msitools.map { it to it } + vr + fexPreloads + vortek + maliBridge).filter { (asset, _) ->
+        ) + mangoapp + msitools.map { it to it } + x11Font.map { it to it } + vr + fexPreloads + vortek + maliBridge).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }

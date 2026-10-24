@@ -86,6 +86,9 @@ def required():
     paths += ['assets/linuxfs/i386/libfaultreport.so']
     paths += ['assets/linuxfs/usr/local/lib/droiddeck-msitools/' + name for name in
               ['msiinfo', 'cabextract', '7z', '7z.so', 'libmsi-1.0.so.0', 'libgsf-1.so.114', 'libgcab-1.0.so.0']]
+    paths += ['assets/linuxfs/usr/share/fonts/misc/wqy-microhei.ttc']
+    paths += ['assets/linuxfs/usr/local/share/licenses/wqy-microhei/' + name for name in
+              ['NOTICE', 'FONTEXCEPTION', 'GPL-3']]
     paths += ['assets/linuxfs/usr/local/lib/droiddeck-vr/' + name for name in
               ['droiddeck/bin/linuxarm64/driver_droiddeck.so', 'droiddeck/bin/linuxarm64/xr-display-mode',
                'droiddeck/driver.vrdrivermanifest',
