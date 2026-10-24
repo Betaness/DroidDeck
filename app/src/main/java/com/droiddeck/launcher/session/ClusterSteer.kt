@@ -16,12 +16,18 @@ import java.util.concurrent.TimeUnit
  * and ran up to 3.1 GHz. Duckov at 1704x1136 ran 27 fps there with its threads on the mid cores,
  * 47 fps with its main thread on 0-3, and 69 fps with all its threads and the Vortek server on 0-3.
  *
+ * Without the game regulator the mid and prime cores were held too, at random: in one process the mid
+ * cores ran 2.3 GHz under the game, in the next 0.9-1.3 GHz, and the prime cores stayed at their 1.11 GHz
+ * floor with the game pinned to them (Duckov 36 and 33 fps there, 68 on cores 0-3 at 3.1 GHz). The cores
+ * are Arm C1-Pro (0-3, capacity 479 at 3.15 GHz), C1-Premium (4-7, 825 at 3.69) and C1-Ultra (8-9, 1024).
+ *
  * Once a second, the busiest thread of the session is checked. It counts when it is busy above [BUSY] on a
- * cluster whose clock stays in the bottom [HELD_SHARE] of its range: a governor raises the clock under
- * such a thread. After [HELD_S] such seconds, every thread of the session's busiest processes moves to
- * the lowest-capacity cluster. Threads started later inherit their creator's cores; a process that
- * joins the busiest is moved too. Every [RETRY_S] seconds they get every core back, in case the regulator
- * let go; if the cluster is still held, they move again [HELD_S] seconds later.
+ * cluster that delivers less than the lowest-capacity cluster would at its full clock: its capacity scaled
+ * by its clock against its maximum ([slower]). After [HELD_S] such seconds, every thread of the session's
+ * busiest processes moves to the lowest-capacity cluster. Threads started later inherit their creator's
+ * cores; a process that joins the busiest is moved too. After [RETRY_S] seconds they get every core back,
+ * in case the cluster was let go; when it is held again at once, the next retry waits twice as long, up
+ * to [RETRY_MAX_S] (each retry cost ten seconds at half the frame rate).
  */
 internal class ClusterSteer(private val clusters: List<Cluster>) {
     internal data class Cluster(val cpus: List<Int>, val policy: File, val capacity: Int) {
@@ -35,20 +41,32 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
     internal class Decider {
         var steered = false
             private set
+        /** Seconds the next stay on the target lasts before every core is given back. */
+        var retryAfter = RETRY_S
+            private set
         private var heldFor = 0
         private var steeredFor = 0
+        private var releasedFor = -1 // seconds since the last release, -1 before any
 
         fun tick(busyOnHeldCluster: Boolean): Action {
             if (steered) {
-                if (++steeredFor < RETRY_S) return Action.NONE
+                if (++steeredFor < retryAfter) return Action.NONE
                 steered = false
                 heldFor = 0
+                releasedFor = 0
                 return Action.RELEASE
             }
+            if (releasedFor >= 0) releasedFor++
             heldFor = if (busyOnHeldCluster) heldFor + 1 else 0
-            if (heldFor < HELD_S) return Action.NONE
+            if (heldFor < HELD_S) {
+                // A cluster that stayed free after a retry: the next time starts from the shortest wait again.
+                if (releasedFor > RETRY_S) retryAfter = RETRY_S
+                return Action.NONE
+            }
+            retryAfter = if (releasedFor in 0..HELD_S + 2) (retryAfter * 2).coerceAtMost(RETRY_MAX_S) else RETRY_S
             steered = true
             steeredFor = 0
+            releasedFor = -1
             return Action.STEER
         }
     }
@@ -65,7 +83,7 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
     fun tick(top: List<Int>, busiest: Triple<Int, Int, Double>?): String? {
         val target = target ?: return null
         val cluster = busiest?.let { (pid, tid, _) -> cpuOf(pid, tid)?.let { cpu -> clusters.firstOrNull { cpu in it.cpus } } }
-        val heldKhz = if (cluster != null && cluster != target && busiest.third >= BUSY) heldClock(cluster) else null
+        val heldKhz = if (cluster != null && cluster != target && busiest.third >= BUSY) slowerClock(cluster, target) else null
         return when (decider.tick(heldKhz != null)) {
             Action.STEER -> {
                 top.forEach { move(it, target.mask) }
@@ -75,7 +93,7 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
             }
             Action.RELEASE -> {
                 release()
-                "every core back, to see whether the clock is still held"
+                "every core back, to see whether the clock is still held (next stay ${decider.retryAfter} s if it is)"
             }
             Action.NONE -> {
                 if (decider.steered) top.forEach { pid -> if (threadCount(pid) != moved[pid]) move(pid, target.mask) }
@@ -94,24 +112,23 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
         if (taskset(mask, pid)) moved[pid] = threadCount(pid) else moved.remove(pid)
     }
 
-    /** The cluster's clock when it is held, else null. */
-    private fun heldClock(c: Cluster): Long? {
+    /** The cluster's clock when it delivers less than [target] would at its full clock, else null. */
+    private fun slowerClock(c: Cluster, target: Cluster): Long? {
         val cur = khz(c.policy, "scaling_cur_freq") ?: return null
-        val min = khz(c.policy, "scaling_min_freq") ?: return null
         val max = khz(c.policy, "cpuinfo_max_freq") ?: return null
-        return cur.takeIf { held(it, min, max) }
+        return cur.takeIf { slower(c.capacity, it, max, target.capacity) }
     }
 
     companion object {
         private const val TAG = "ClusterSteer"
         internal const val BUSY = 0.6
-        internal const val HELD_SHARE = 0.25
         internal const val HELD_S = 3
         internal const val RETRY_S = 60
+        internal const val RETRY_MAX_S = 480
 
-        /** A clock in the bottom [HELD_SHARE] of the cluster's range. */
-        internal fun held(curKhz: Long, minKhz: Long, maxKhz: Long): Boolean =
-            maxKhz > minKhz && curKhz <= minKhz + (maxKhz - minKhz) * HELD_SHARE
+        /** A cluster of [capacity] at [curKhz] of [maxKhz] does less than one of [targetCapacity] at its full clock. */
+        internal fun slower(capacity: Int, curKhz: Long, maxKhz: Long, targetCapacity: Int): Boolean =
+            maxKhz > 0 && capacity * curKhz < targetCapacity * maxKhz
 
         /** The device's clusters from cpufreq, or null when fewer than two can be told apart. */
         fun forDevice(): ClusterSteer? {
