@@ -42,8 +42,10 @@ import kotlin.math.abs
  * mid core, where it stayed at 58-60 fps instead of 73.
  *
  * [mali-g2] On the Xring O3 the hint sessions do nothing: its power HAL is AOSP's example service (see
- * XrThreadQos). There the boosted threads may also be given one of HyperOS's own thread QoS levels
- * (pref xringThreadQos, off until measured), taken away again when they leave the set.
+ * XrThreadQos), so none are opened there while it answers the example's 1 ms update rate ([stubPowerHal]);
+ * firmware with a HAL of its own gets them back. The scan still runs for ClusterSteer and FrameSchedFeed,
+ * and the threads it picks may be given one of HyperOS's own thread QoS levels (pref xringThreadQos, off
+ * until measured), taken away again when they leave the set.
  */
 object GameThreadHints {
     private val HINTED_SOCS = setOf("CQ8725S", "O3")
@@ -60,6 +62,8 @@ object GameThreadHints {
     private const val PACE_TOLERANCE = 0.08
     private const val QOS_VERIFY_SCANS = 10 // the QoS levels given are read back every ten seconds
     private const val PREVIOUS_WORKER_MS = 7_000L // ClusterSteer's taskset waits up to 5 s
+    /** The update rate AOSP's example power HAL reports; one that acts on hints reports its own. */
+    private const val EXAMPLE_HAL_RATE_NS = 1_000_000L
 
     /** Busy, but not the game: the app itself and the Steam client, whose UI would otherwise hold the prime cores. */
     private val NOT_GAMES = setOf("steam", "steamwebhelper")
@@ -79,6 +83,10 @@ object GameThreadHints {
         val hm = context.getSystemService(PerformanceHintManager::class.java)
             ?: return "game thread hints: no PerformanceHintManager"
         val pm = context.getSystemService(PowerManager::class.java)
+        val rate = runCatching { hm.preferredUpdateRateNanos }.getOrDefault(-1L)
+        // [mali-g2] A session on the example HAL costs twenty binder calls a second for nothing, and A/B runs
+        // credited it with what the scan's other users (cluster steering, xr qos) did.
+        val hints = !stubPowerHal(Build.SOC_MODEL, rate)
         val qos = try {
             XrThreadQos.forSession(context)
         } catch (t: Throwable) {
@@ -93,9 +101,9 @@ object GameThreadHints {
         val previous = worker ?: retired
         previous?.interrupt()
         retired = null
-        worker = Thread({ runAfter(previous, hm, pm, qos, steer) }, "game-thread-hints").apply { isDaemon = true; start() }
-        // AOSP's example power HAL answers 1 ms; one that acts on hints reports its own rate.
-        return "game thread hints: watching (hint rate ${hm.preferredUpdateRateNanos} ns, xr qos ${qos ?: "off"}" +
+        worker = Thread({ runAfter(previous, hm.takeIf { hints }, pm, qos, steer) }, "game-thread-hints").apply { isDaemon = true; start() }
+        return "game thread hints: watching (hint rate $rate ns${if (hints) "" else ", example power HAL: no hint sessions"}, " +
+            "xr qos ${qos ?: "off"}" +
             (if (Build.SOC_MODEL == "O3") ", cluster steering " + when {
                 steer -> "on"
                 steerWanted -> "off with xr qos"
@@ -104,7 +112,7 @@ object GameThreadHints {
     }
 
     /** The last session's worker undoes its QoS levels and affinities first, so they do not land on this one's. */
-    private fun runAfter(previous: Thread?, hm: PerformanceHintManager, pm: PowerManager, qos: XrThreadQos?, steer: Boolean) {
+    private fun runAfter(previous: Thread?, hm: PerformanceHintManager?, pm: PowerManager, qos: XrThreadQos?, steer: Boolean) {
         try {
             previous?.join(PREVIOUS_WORKER_MS)
         } catch (_: InterruptedException) {
@@ -121,7 +129,8 @@ object GameThreadHints {
         worker = null
     }
 
-    private fun run(hm: PerformanceHintManager, pm: PowerManager, qos: XrThreadQos?, steerOn: Boolean) {
+    /** [hm] null: the threads are picked as usual, for xr qos and the log, but no hint session is opened. */
+    private fun run(hm: PerformanceHintManager?, pm: PowerManager, qos: XrThreadQos?, steerOn: Boolean) {
         val scanner = Scanner()
         val steer = if (steerOn) ClusterSteer.forDevice() else null
         var session: PerformanceHintManager.Session? = null
@@ -151,10 +160,13 @@ object GameThreadHints {
                         else -> pick(boosted, busy)
                     }
                     if (next != boosted) {
-                        session = update(hm, session, next)
-                        // No session means a thread exited in between: tried again next second.
-                        boosted = if (session == null) emptySet() else next
-                        Log.i(TAG, (if (session == null && next.isNotEmpty()) "no session for " else "boosting ") +
+                        if (hm != null) {
+                            session = update(hm, session, next)
+                            // No session means a thread exited in between: tried again next second.
+                            boosted = if (session == null) emptySet() else next
+                        } else boosted = next
+                        Log.i(TAG, (if (hm != null && session == null && next.isNotEmpty()) "no session for "
+                            else if (hm == null && qos == null) "busiest game threads " else "boosting ") +
                             next.joinToString { "${readName("/proc/$it/comm")}/$it ${((busy[it] ?: 0.0) * 100).toInt()}%" }.ifEmpty { "nothing" } +
                             " (game ${fps.toInt()} fps${if (paced) ", holding pace" else ""})")
                     }
@@ -209,6 +221,13 @@ object GameThreadHints {
             null
         }
     }
+
+    /**
+     * [mali-g2] Whether hint sessions would reach AOSP's example power HAL, which acts on none: the Xring O3
+     * ([soc]) answering the example's 1 ms [preferredRateNs]. Only there - elsewhere 1 ms says nothing of the HAL.
+     */
+    internal fun stubPowerHal(soc: String, preferredRateNs: Long): Boolean =
+        soc == "O3" && preferredRateNs == EXAMPLE_HAL_RATE_NS
 
     /**
      * Whether a game presenting [fps] frames a second keeps up: within [PACE_TOLERANCE] of the

@@ -37,4 +37,11 @@ class GameThreadHintsTest {
         assertFalse(GameThreadHints.holdsPace(59.0, 120.0))   // Duckov on a mid core: keep boosting
         assertFalse(GameThreadHints.holdsPace(30.0, 120.0))
     }
+
+    @Test fun `no hint sessions for the O3's example power HAL only`() {
+        assertTrue(GameThreadHints.stubPowerHal("O3", 1_000_000L))
+        assertFalse(GameThreadHints.stubPowerHal("O3", 16_666_666L))  // a HAL of its own in later firmware
+        assertFalse(GameThreadHints.stubPowerHal("O3", -1L))          // the rate could not be read
+        assertFalse(GameThreadHints.stubPowerHal("CQ8725S", 1_000_000L))
+    }
 }
