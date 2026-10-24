@@ -13,33 +13,10 @@ class SyncBackendTest {
     private val context: Context = RuntimeEnvironment.getApplication()
 
     @Test
-    fun aFreshInstallStartsOnNtsync() {
-        assertEquals(SessionPrefs.SYNC_NTSYNC, SessionPrefs.syncBackend(context))
-        assertEquals(false, SessionPrefs.fsyncFirst(context))
-        SessionPrefs.applyNtsyncDefault(context)
-        assertEquals(SessionPrefs.SYNC_NTSYNC, SessionPrefs.syncBackend(context))
-    }
-
-    @Test
-    fun anEarlierChoiceMovesToNtsyncOnce() {
-        for (earlier in listOf(SessionPrefs.SYNC_ESYNC, SessionPrefs.SYNC_FSYNC, SessionPrefs.SYNC_WINESERVER)) {
-            context.getSharedPreferences("session", Context.MODE_PRIVATE).edit().clear().commit()
-            SessionPrefs.setSyncBackend(context, earlier)
-            SessionPrefs.applyNtsyncDefault(context)
-            assertEquals(SessionPrefs.SYNC_NTSYNC, SessionPrefs.syncBackend(context))
-        }
-    }
-
-    @Test
-    fun aChoiceMadeAfterTheMoveIsKept() {
-        SessionPrefs.setSyncBackend(context, SessionPrefs.SYNC_ESYNC)
-        SessionPrefs.applyNtsyncDefault(context)
-        SessionPrefs.setSyncBackend(context, SessionPrefs.SYNC_ESYNC)
-        SessionPrefs.applyNtsyncDefault(context)
+    fun aFreshInstallStartsOnEsync() {
+        // [mali-g2] Esync with the semaphore pool stays the default here (SessionPrefs.fastSync).
         assertEquals(SessionPrefs.SYNC_ESYNC, SessionPrefs.syncBackend(context))
-        SessionPrefs.setSyncBackend(context, SessionPrefs.SYNC_WINESERVER)
-        SessionPrefs.applyNtsyncDefault(context)
-        assertEquals(SessionPrefs.SYNC_WINESERVER, SessionPrefs.syncBackend(context))
+        assertEquals(false, SessionPrefs.fsyncFirst(context))
     }
 
     @Test
