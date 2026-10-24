@@ -13,6 +13,7 @@
 #include "droiddeck_ext.h"
 #include "ahb_swapchain.h"
 #include "sc_layer.h"
+#include "frame_sched_feed.h"
 #include "effects_chain.h"
 #include "cardboard.h"
 #include "droiddeck_color.h"
@@ -324,6 +325,19 @@ JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetLayerFrameRate(JNIEnv *env, jclass clazz, jfloat hz) {
     (void)env; (void)clazz;
     sc_layer_set_frame_rate((float)hz);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetFrameSchedFeed(JNIEnv *env, jclass clazz, jint mode) {
+    (void)env; (void)clazz;
+    fsf_set_mode(mode);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetFrameSchedThread(JNIEnv *env, jclass clazz, jint pid,
+                                                                                jint tid) {
+    (void)env; (void)clazz;
+    fsf_set_game_thread(pid, tid);
 }
 
 JNIEXPORT void JNICALL

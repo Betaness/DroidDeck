@@ -441,6 +441,12 @@ object SessionPrefs {
     /** [mali-g2] Whether this app's frames are kept from HyperOS's frame governor, which sets the GPU clock by them (FrameSchedOptOut). */
     fun frameSchedOptOut(context: Context): Boolean = prefs(context).getBoolean("frameSchedOptOut", true)
 
+    /** [mali-g2] Whether the game layer's frames are reported to HyperOS's frame governor, so it raises clocks when the game falls behind (FrameSchedFeed). */
+    fun feedFrameSched(context: Context): Boolean = prefs(context).getBoolean("feedFrameSched", false)
+
+    /** [mali-g2] The thread FrameSchedFeed names for the game layer: "compositor" (the one presenting it) or "game" (its busiest thread). */
+    fun feedFrameSchedThread(context: Context): String = prefs(context).getString("feedFrameSchedThread", "compositor") ?: "compositor"
+
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 

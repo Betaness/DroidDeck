@@ -100,8 +100,9 @@ object GameThreadHints {
                     val paced = frames.size > PACE_WINDOW_S &&
                         holdsPace(fps, SessionState.refreshHz.toDouble(), SessionState.fpsLimit)
                     pacedFor = if (paced) pacedFor + 1 else 0
-                    steer?.tick(scanner.top, busy.maxByOrNull { it.value }?.let { (tid, share) -> scanner.owner[tid]?.let { Triple(it, tid, share) } })
-                        ?.let { Log.i(TAG, "cluster steering: $it (game ${fps.toInt()} fps)") }
+                    val busiest = busy.maxByOrNull { it.value }?.let { (tid, share) -> scanner.owner[tid]?.let { Triple(it, tid, share) } }
+                    steer?.tick(scanner.top, busiest)?.let { Log.i(TAG, "cluster steering: $it (game ${fps.toInt()} fps)") }
+                    busiest?.let { (pid, tid, _) -> FrameSchedFeed.gameThread(pid, tid) }
                     // Not SEVERE: the Odin 3 reports it once its skin reaches 50 C, a couple of minutes into any game.
                     val spare = pm.isPowerSaveMode || pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL
                     val next = when {
