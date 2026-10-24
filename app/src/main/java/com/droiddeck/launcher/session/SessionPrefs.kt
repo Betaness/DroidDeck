@@ -378,7 +378,8 @@ object SessionPrefs {
         prefs(context).edit().putBoolean("noXalia", on).apply()
     }
 
-    fun fastSync(context: Context): Boolean = prefs(context).getBoolean("fastSync", true)
+    // [mali-g2] Not upstream's ntsync default: esync with the semaphore pool measured +20% on Duckov here.
+    fun fastSync(context: Context): Boolean = prefs(context).getBoolean("fastSync", false)
 
     fun setFastSync(context: Context, on: Boolean) {
         prefs(context).edit().putBoolean("fastSync", on).apply()
@@ -410,17 +411,6 @@ object SessionPrefs {
             .putBoolean("fastSync", backend == SYNC_NTSYNC)
             .putBoolean("fsyncFirst", backend == SYNC_FSYNC)
             .putBoolean("syncFallback", backend != SYNC_WINESERVER)
-            .apply()
-    }
-
-    fun applyNtsyncDefault(context: Context) {
-        val prefs = prefs(context)
-        if (prefs.getBoolean("ntsyncDefaultV1", false)) return
-        prefs.edit()
-            .putBoolean("fastSync", true)
-            .putBoolean("fsyncFirst", false)
-            .putBoolean("syncFallback", true)
-            .putBoolean("ntsyncDefaultV1", true)
             .apply()
     }
 
