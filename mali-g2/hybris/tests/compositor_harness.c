@@ -34,7 +34,7 @@ void droiddeck_log(const char* tag, const char* fmt, ...) {
     printf("\n");
     va_end(ap);
     if (strstr(fmt, "presenter %d disconnected")) disconnected++;
-    if (strstr(fmt, "zero-copy refused")) refused++;
+    if (strstr(fmt, "zero-copy refused") && !strstr(fmt, "id too large")) refused++; /* that one: presenter_probe */
 }
 
 void droiddeck_count_game_frame(void) { frames++; }
@@ -64,9 +64,12 @@ void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction* batch) {
     shown[slot] = NULL;
 }
 
-void sc_layer_hide_all_vortek(void) {
-    for (int i = 0; i < SC_VORTEK_LAYERS; i++) sc_layer_hide_vortek(i, NULL);
+void sc_layer_hide_vortek_unused(unsigned in_use) {
+    for (int i = 0; i < SC_VORTEK_LAYERS; i++)
+        if (!(in_use & (1u << i))) sc_layer_hide_vortek(i, NULL);
 }
+
+void sc_layer_hide_all_vortek(void) { sc_layer_hide_vortek_unused(0); }
 
 int vku_present(const struct vku_frame* f, int acquire_fd, struct ASurfaceTransaction* batch, const char** why) { return VKU_DIRECT; }
 void vku_init(struct wl_event_loop* loop) { (void)loop; }

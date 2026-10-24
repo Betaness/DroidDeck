@@ -32,11 +32,16 @@ static int g_listen_fd = -1;
  * processes running the Mali driver themselves (mali-g2/hybris). Chain ids are the clients' own; here
  * a chain is known by a key that adds the connection's slot and generation (a release for a chain of a
  * connection that is gone must not reach the next client in its slot):
- * bits 29-31 slot + 1, 24-28 generation, 0-23 the client's id. */
+ * bits 29-31 slot + 1, 24-28 generation, 0-23 the client's id (VP_CHAIN_ID). Clients count their ids
+ * up from 1; one that does not fit is refused rather than mistaken for another. With the Vortek server
+ * alone everything goes as with a single connection: a presenter connecting again replaces its old
+ * connection, and the last one leaving takes every Vortek layer down. */
 #define VP_MAX_CONNS 7
+#define VP_MAX_CLIENT_CHAIN 0xffffffu
 struct vp_conn {
     int fd;                   /* -1: free */
     uint32_t gen;
+    pid_t pid;                /* the presenting process, 0 if unknown */
     struct wl_event_source *src;
 };
 static struct vp_conn g_conns[VP_MAX_CONNS] = {[0 ... VP_MAX_CONNS - 1] = {.fd = -1}};
@@ -54,10 +59,6 @@ static int key_conn_locked(uint32_t key) {
     return conn;
 }
 
-static int any_connection(void) {
-    for (int i = 0; i < VP_MAX_CONNS; i++) if (g_conns[i].fd >= 0) return 1;
-    return 0;
-}
 static int g_scene_w, g_scene_h;
 void droiddeck_count_game_frame(void);
 static unsigned g_stat_frames;
@@ -176,7 +177,7 @@ static void send_mode(int conn) {
 
 static void refuse(uint32_t chain, const char *why) {
     send_to_chain(VP_MSG_REFUSED, chain, 0, -1);
-    droiddeck_log("vortek", "zero-copy refused for swapchain %u (client %u): %s", chain & 0xffffffu, chain >> 29, why);
+    droiddeck_log("vortek", "zero-copy refused for swapchain %u (presenter %u): %s", VP_CHAIN_ID(chain), chain >> 29, why);
 }
 
 static struct ASurfaceTransaction *batch(void) {
@@ -262,6 +263,17 @@ static int key_of_conn(uint32_t key, int conn) {
     return key && (int)(key >> 29) - 1 == conn && ((key >> 24) & 0x1fu) == (g_conns[conn].gen & 0x1fu);
 }
 
+/* After a presenter left: every Vortek layer that no remaining presenter's window is on leaves the
+ * screen, also one the bookkeeping lost track of; with no presenter left, all of them, as before
+ * there were several. Outside a batch: sc_layer applies these on their own. */
+static void hide_lost_layers(void) {
+    unsigned in_use = 0;
+    for (int i = 0; i < VP_LAYERS; i++)
+        if (g_show[i].chain) in_use |= 1u << i;
+    if (!in_use) sc_layer_hide_all_vortek();
+    else sc_layer_hide_vortek_unused(in_use);
+}
+
 /* Takes the connection's frames off the screen and forgets its chains. */
 static void drop_connection(int conn) {
     if (conn < 0 || conn >= VP_MAX_CONNS || g_conns[conn].fd < 0) return;
@@ -277,8 +289,9 @@ static void drop_connection(int conn) {
     pthread_mutex_lock(&g_conn_lock);
     close(g_conns[conn].fd);
     g_conns[conn].fd = -1;
+    g_conns[conn].pid = 0;
     pthread_mutex_unlock(&g_conn_lock);
-    if (!any_connection() && !g_batching) sc_layer_hide_all_vortek();
+    if (!g_batching) hide_lost_layers();
     droiddeck_log("vortek", "zero-copy presenter %d disconnected", conn + 1);
 }
 
@@ -298,7 +311,7 @@ static void on_create(int fd, const struct vp_msg *m) {
         if (i < VP_MAX_IMAGES) ahb[i] = b;
         else if (b) AHardwareBuffer_release(b);
     }
-    int complete = c && n > 0 && n <= VP_MAX_IMAGES && (m->chain & 0xffffffu);
+    int complete = c && n > 0 && n <= VP_MAX_IMAGES && VP_CHAIN_ID(m->chain);
     for (uint32_t i = 0; complete && i < n; i++) complete = ahb[i] != NULL;
     if (!complete) {
         for (uint32_t i = 0; i < n && i < VP_MAX_IMAGES; i++) if (ahb[i]) AHardwareBuffer_release(ahb[i]);
@@ -310,7 +323,7 @@ static void on_create(int fd, const struct vp_msg *m) {
     c->w = m->width;
     c->h = m->height;
     memcpy(c->ahb, ahb, sizeof(ahb));
-    droiddeck_log("vortek", "zero-copy swapchain %u of presenter %u: %ux%u, %u AHardwareBuffers", c->id & 0xffffffu, c->id >> 29,
+    droiddeck_log("vortek", "zero-copy swapchain %u of presenter %u: %ux%u, %u AHardwareBuffers", VP_CHAIN_ID(c->id), c->id >> 29,
                   c->w, c->h, c->n);
 }
 
@@ -391,8 +404,8 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
     }
     g_stat_frames++;
     if (up == VKU_DIRECT && why && why != c->direct_said)
-        droiddeck_log("effects", "zero-copy layer: swapchain %u (%ux%u) shown without the scaling filter: %s", c->id,
-                      c->w, c->h, why);
+        droiddeck_log("effects", "zero-copy layer: swapchain %u (%ux%u) shown without the scaling filter: %s",
+                      VP_CHAIN_ID(c->id), c->w, c->h, why);
     if (up == VKU_DIRECT) c->direct_said = why;
     /* The frame-rate counters follow the biggest window on a layer (the game, or Steam's main view). */
     int64_t area = (int64_t)m->w * m->h, biggest = 0;
@@ -425,12 +438,33 @@ static double now_s(void) {
 /* CLOCK_MONOTONIC, the clock of the client's "(t=...)" log lines (the guest shares the kernel's). */
 static void trace_msg(const struct vp_msg *m) {
     static const char *const names[] = {"?", "CREATE", "PRESENT", "HIDE", "DESTROY", "?", "?", "?", "RESTACK"};
-    droiddeck_log("vortek", "trace t=%.4f %s chain %u index %u key %08x%08x top 0x%x", now_s(),
-                  m->type < sizeof(names) / sizeof(names[0]) ? names[m->type] : "?", m->chain, m->index,
-                  m->key_hi, m->key_lo, m->toplevel);
+    droiddeck_log("vortek", "trace t=%.4f %s chain %u index %u key %08x%08x top 0x%x presenter %u", now_s(),
+                  m->type < sizeof(names) / sizeof(names[0]) ? names[m->type] : "?", VP_CHAIN_ID(m->chain), m->index,
+                  m->key_hi, m->key_lo, m->toplevel, m->chain >> 29);
+}
+
+/* A chain id the key cannot hold: refused, its buffers and fences taken off the socket and given back. */
+static void on_unkeyable(int conn, int fd, const struct vp_msg *m, int got_fd) {
+    if (got_fd >= 0) close(got_fd);
+    if (m->type == VP_MSG_CHAIN_CREATE)
+        for (uint32_t i = 0; i < m->image_count; i++) {
+            AHardwareBuffer *b = NULL;
+            if (AHardwareBuffer_recvHandleFromUnixSocket(fd, &b) == 0 && b) AHardwareBuffer_release(b);
+        }
+    if (m->type != VP_MSG_CHAIN_CREATE && m->type != VP_MSG_PRESENT) return;
+    struct vp_msg r = {.type = m->type == VP_MSG_PRESENT ? VP_MSG_RELEASE : VP_MSG_REFUSED, .chain = m->chain, .index = m->index};
+    pthread_mutex_lock(&g_conn_lock);
+    send_msg(g_conns[conn].fd, &r, -1);
+    pthread_mutex_unlock(&g_conn_lock);
+    if (m->type == VP_MSG_CHAIN_CREATE)
+        droiddeck_log("vortek", "zero-copy refused for swapchain %u (presenter %d): id too large", m->chain, conn + 1);
 }
 
 static void on_msg(int conn, int fd, const struct vp_msg *msg, int got_fd) {
+    if (msg->chain > VP_MAX_CLIENT_CHAIN) {
+        on_unkeyable(conn, fd, msg, got_fd);
+        return;
+    }
     struct vp_msg keyed = *msg;
     keyed.chain = chain_key(conn, msg->chain);
     const struct vp_msg *m = &keyed;
@@ -490,7 +524,7 @@ static int on_conn(int fd, uint32_t mask, void *data) {
     g_batching = 0;
     if (g_trace && g_batch) droiddeck_log("vortek", "trace t=%.4f applied %d message%s", now_s(), n, n == 1 ? "" : "s");
     batch_apply();
-    if (dropped && !any_connection()) sc_layer_hide_all_vortek(); /* dropped in the loop: after its batch */
+    if (dropped) hide_lost_layers(); /* dropped in the loop: after its batch */
     return 0;
 }
 
@@ -498,6 +532,13 @@ static int on_listen(int fd, uint32_t mask, void *data) {
     (void)mask; (void)data;
     int c = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
     if (c < 0) return 0;
+    struct ucred cred = {0};
+    socklen_t cred_len = sizeof(cred);
+    if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) cred.pid = 0;
+    /* A process presents over one connection: a new one from it replaces the old (a presenter that
+     * reconnects, as the Vortek server does after a failed send). */
+    for (int i = 0; i < VP_MAX_CONNS; i++)
+        if (cred.pid > 0 && g_conns[i].fd >= 0 && g_conns[i].pid == cred.pid) drop_connection(i);
     int conn = -1;
     for (int i = 0; i < VP_MAX_CONNS && conn < 0; i++) if (g_conns[i].fd < 0) conn = i;
     if (conn < 0) {
@@ -508,6 +549,7 @@ static int on_listen(int fd, uint32_t mask, void *data) {
     pthread_mutex_lock(&g_conn_lock);
     g_conns[conn].fd = c;
     g_conns[conn].gen = ++g_conn_gen;
+    g_conns[conn].pid = cred.pid;
     pthread_mutex_unlock(&g_conn_lock);
     g_conns[conn].src = wl_event_loop_add_fd(g_loop, c, WL_EVENT_READABLE, on_conn, (void *)(intptr_t)conn);
     const char *trace = getenv("VORTEK_PRESENT_TRACE");

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Several processes presenting zero-copy to the compositor at once (the Vortek server and in-process
 # games in a session): compositor_harness.c runs the compositor's own vortek_present.c, two
-# swapchain_test windows side by side present to it together, a third comes and goes meanwhile.
+# swapchain_test windows side by side present to it together, a third comes and goes meanwhile, then
+# presenter_probe.c reconnects from one process and announces a swapchain id too large for the keys.
 # Each must get its own buffers back (a release routed to the wrong presenter stalls acquire for 2 s).
 # Run after build.sh and tests/wsi_test.sh (which builds swapchain_test), on a host as for wsi_test.sh.
 set -u
@@ -15,6 +16,7 @@ mkdir -p "$BIN"
 cc -O2 -Wall -Wno-unused-parameter -D_GNU_SOURCE -include stdio.h -I"$ROOT/src/compat" -I"$COMP" -I"$ROOT/work/stage$GUEST_DIR/include" \
     -o "$BIN/compositor_harness" "$HERE/compositor_harness.c" "$COMP/vortek_present.c" "$ROOT/src/ahb.c" \
     "$OUT$GUEST_DIR/lib/libhybris-common.so.1" -lwayland-server -lpthread || exit 1
+cc -O2 -Wall -I"$COMP" -o "$BIN/presenter_probe" "$HERE/presenter_probe.c" || exit 1
 [ -x "$BIN/swapchain_test" ] || { echo "run tests/wsi_test.sh first"; exit 1; }
 
 TMP=$(mktemp -d /tmp/hybris-comp.XXXXXX)
@@ -26,7 +28,7 @@ i=0
 while [ ! -e /tmp/.X11-unix/X$disp ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 export DISPLAY=:$disp
 
-XDG_RUNTIME_DIR=$TMP sh "$HERE/run.sh" "$BIN/compositor_harness" 3 >"$TMP/harness.log" 2>&1 &
+XDG_RUNTIME_DIR=$TMP sh "$HERE/run.sh" "$BIN/compositor_harness" 5 >"$TMP/harness.log" 2>&1 &
 hpid=$!
 i=0
 while [ ! -S "$TMP/vortek-present" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
@@ -38,6 +40,8 @@ bpid=$!
 sleep 2
 SC_FRAMES=60 SC_POS=0,370 SC_SIZE=320x200 sh "$HERE/run.sh" "$BIN/swapchain_test" >"$TMP/c.log" 2>&1
 crc=$?
+"$BIN/presenter_probe" >"$TMP/probe.log" 2>&1
+prc=$?
 wait $apid; arc=$?
 wait $bpid; brc=$?
 i=0
@@ -49,7 +53,9 @@ for t in a b c; do
     grep -E 'frames:|SC-|hybris-x11: window.*now|no image released|acquire waited' "$TMP/$t.log"
     grep -q 'no image released' "$TMP/$t.log" && rc=1
 done
-[ $arc -eq 0 ] && [ $brc -eq 0 ] && [ $crc -eq 0 ] || rc=1
+echo "--- presenter_probe"
+cat "$TMP/probe.log"
+[ $arc -eq 0 ] && [ $brc -eq 0 ] && [ $crc -eq 0 ] && [ $prc -eq 0 ] || rc=1
 echo "--- compositor"
 grep -E 'HARNESS|presenter [0-9]+ (dis)?connected|refused' "$TMP/harness.log"
 grep -q 'HARNESS-RESULT ok' "$TMP/harness.log" || rc=1

@@ -51,7 +51,8 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
   `VORTEK_PRESENT_SOCKET=$XDG_RUNTIME_DIR/vortek-present`。缺文件或 `/system/lib64/libvulkan.so` 时退回 Vortek。
 - `SessionFiles` 每次会话从 APK 放进 rootfs（有才放）；CI 的 `hybris` 任务（`continue-on-error`）编出后放进 APK。
 - 合成器（`waylandcomp/src/vortek_present.c`）现在同时接受最多 7 个零拷贝连接（Vortek 服务端 + 各游戏进程），
-  链 id 按连接区分，释放消息发回所属连接。
+  链 id 按连接区分，释放消息发回所属连接。只有 Vortek 服务端一个连接时行为和以前一样：同一进程重连会替换旧连接，
+  最后一个连接断开时收起所有 Vortek 图层；还有别的连接时，收起没有窗口在用的图层（包括记账丢失的）。
 
 ## 测试（PalmCode 的 Ubuntu 里能跑；需要能读到 /system、/vendor、/apex）
 
@@ -61,7 +62,8 @@ sh tests/run.sh vulkaninfo --summary
 sh tests/run.sh /path/to/compute_glibc        # 私有原型的计算测试，结果和 /opt/hybris 原型一致
 sh tests/wsi_test.sh               # Xvfb 上：X11 拷贝（BGRA/RGBA）、零拷贝（mock 合成器验像素）、改窗口大小、
                                    # 部分/完全遮挡切换、vkcube 零拷贝（最后一帧在 out/tests/vkcube.ppm）
-sh tests/compositor_test.sh        # 合成器自己的 vortek_present.c（SurfaceControl 打桩）同时服务 3 个进程
+sh tests/compositor_test.sh        # 合成器自己的 vortek_present.c（SurfaceControl 打桩）同时服务 3 个进程，
+                                   # 再用 presenter_probe 测同进程重连和放不进链 key 的 id
 glslangValidator -V --vn clip_vert -o out/tests/clip_vert.h tests/clip.vert && cc -Iout/tests -o out/tests/clip_test tests/clip_test.c -lvulkan
 sh tests/run.sh out/tests/clip_test           # 写 ClipDistance 的管线；VORTEK_KEEP_CLIP_DISTANCE=1 时驱动段错误
 ```
@@ -76,5 +78,6 @@ sh tests/run.sh out/tests/clip_test           # 写 ClipDistance 的管线；VOR
 
 ## 许可
 
-`libdroiddeck_hybris_vk.so`：LGPL-2.1 或更高（含 Vortek 的代码）。libhybris：Apache-2.0，链接器（q.so）来自 bionic，BSD-2-Clause（部分 Apache-2.0）。
+`libdroiddeck_hybris_vk.so`：LGPL-2.1 或更高（含 Vortek 的代码）。libhybris：Apache-2.0，链接器（q.so）来自 bionic，BSD-2-Clause（部分 Apache-2.0）；
+另有 strlcpy/strlcat（ISC）、integrity_sha256.c（MIT）、bionic_asm_arm64.h（BSD-3-Clause），声明全文在 `NOTICE`。
 android-headers：Apache-2.0。运行时加载的安卓系统库和驱动来自设备本身，不随 APK 分发。详见 `NOTICE`。
