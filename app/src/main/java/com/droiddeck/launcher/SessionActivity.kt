@@ -714,11 +714,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     },
                 )
                 LaunchedEffect(AgentGuest.focusRevision) {
+                    var gameFocused = false
                     val nextGame = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                         if (SessionState.mode == SessionService.MODE_RUN) SessionState.program?.let { "program:$it" }
                         else {
                             val snapshot = AgentGuest.focus(this@SessionActivity)
                             val focused = snapshot?.optLong("focusedApp")?.takeIf { it > 0 && it != 769L }
+                            gameFocused = focused != null
                             val windows = snapshot?.optJSONArray("focusableApps")
                             focused?.toString() ?: windows?.let { values ->
                                 (0 until values.length()).map { values.optLong(it) }
@@ -727,6 +729,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                         }
                     }
                     if (nextGame != gestureGame) { gestureGame = nextGame; refreshGestureConfig() }
+                    if (CompositorHost.isStarted) WaylandCompositor.nativeSetTouchAsPointer(
+                        gameFocused && SessionPrefs.gameTouchAsPointer(this@SessionActivity))
                 }
                 LaunchedEffect(drawerOpen, pcKeyboardOpen, achievementsOpen, gestureSettingsOpen, pipUi, SessionState.suspended) {
                     if (drawerOpen || pcKeyboardOpen || achievementsOpen || gestureSettingsOpen || pipUi || SessionState.suspended) {

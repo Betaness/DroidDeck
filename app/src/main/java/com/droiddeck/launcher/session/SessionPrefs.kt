@@ -232,6 +232,10 @@ object SessionPrefs {
     const val TOUCH_GESTURES = "gestures"
     const val TOUCH_OFF = "off"
 
+    // While a Steam game has the focus, touches go to it as the left mouse button: games that read
+    // the mouse through DirectInput or raw input get no clicks from Xwayland's touch emulation.
+    fun gameTouchAsPointer(context: Context): Boolean = prefs(context).getBoolean("gameTouchAsPointer", true)
+
     fun touchMode(context: Context): String = prefs(context).getString("touch", TOUCH_AUTO) ?: TOUCH_AUTO
 
     fun setTouchMode(context: Context, mode: String) {

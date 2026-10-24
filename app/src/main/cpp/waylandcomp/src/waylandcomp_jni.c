@@ -30,6 +30,7 @@ extern void droiddeck_wayland_output_resized(void);
 extern void droiddeck_wayland_set_output_refresh_rate(int mhz);
 extern volatile int g_fps_limit;
 extern volatile int g_hide_shell;
+extern volatile int g_touch_as_pointer;
 extern volatile int g_zero_copy;
 extern volatile unsigned g_zero_copy_last;
 extern volatile int g_ubwc;
@@ -288,6 +289,11 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeVsync(JNIEnv *env, j
 JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetHideShell(JNIEnv *env, jclass clazz, jboolean hide) {
     g_hide_shell = hide ? 1 : 0;
+}
+
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetTouchAsPointer(JNIEnv *env, jclass clazz, jboolean on) {
+    g_touch_as_pointer = on ? 1 : 0;
 }
 
 JNIEXPORT void JNICALL
