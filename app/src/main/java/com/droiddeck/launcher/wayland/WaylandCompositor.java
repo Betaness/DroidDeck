@@ -190,6 +190,11 @@ public final class WaylandCompositor {
 
     public static native void nativeSetLayerFrameRate(float hz);
 
+    /** [mali-g2] FrameSchedFeed: 0 off, 1 as the compositor thread, 2 as the game's busiest thread. */
+    public static native void nativeSetFrameSchedFeed(int mode);
+
+    public static native void nativeSetFrameSchedThread(int pid, int tid);
+
     private static volatile java.io.File sessionLogFile;
 
     public static void setSessionLogFile(java.io.File file) {

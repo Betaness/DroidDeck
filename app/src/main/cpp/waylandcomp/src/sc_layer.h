@@ -35,6 +35,8 @@ int sc_layer_present_ahb(AHardwareBuffer *ahb, int w, int h, int acquire_fd, voi
                          int scene_w, int scene_h, const struct droiddeck_color *color, uint32_t ahb_format);
 
 void sc_layer_set_frame_rate(float fps);
+/* The rate the game layers vote for (the session's frame-rate limit, else the panel's), 0: none. */
+float sc_layer_frame_rate_want(void);
 
 int sc_layer_overlay_affordable(void);
 
@@ -64,6 +66,8 @@ int sc_layer_vortek_pool_trim(int slot);
 int sc_layer_present_vortek_pooled(int slot, int z, int idx, int acquire_fd, const int r[8],
                                    struct ASurfaceTransaction *batch);
 void sc_layer_hide_all_vortek(void);
+/* [mali-g2] Vortek layer `slot`'s ASurfaceControl (NULL before its first frame) and name. */
+const void *sc_layer_vortek_surface(int slot, const char **name);
 void sc_layer_hide_vortek(int slot, struct ASurfaceTransaction *batch);
 void sc_layer_vortek_z(int slot, int z, struct ASurfaceTransaction *batch);
 int sc_layer_base_black(int width, int height);

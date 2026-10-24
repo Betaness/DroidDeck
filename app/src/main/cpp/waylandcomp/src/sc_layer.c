@@ -136,6 +136,8 @@ void sc_layer_set_frame_rate(float fps) {
     atomic_store(&g_fps_want, fps > 0.0f ? fps : 0.0f);
 }
 
+float sc_layer_frame_rate_want(void) { return atomic_load(&g_fps_want); }
+
 
 #define POOL_MAX 5
 
@@ -882,6 +884,12 @@ int sc_layer_present_vortek(int slot, int z, AHardwareBuffer *ahb, int buf_w, in
 unavailable:
     if (acquire_fd >= 0) close(acquire_fd);
     return -1;
+}
+
+const void *sc_layer_vortek_surface(int slot, const char **name) {
+    struct layer *l = (slot >= 0 && slot < SC_VORTEK_LAYERS) ? layer_of(SC_LAYER_VORTEK + slot) : NULL;
+    if (name) *name = l ? l->name : NULL;
+    return l ? l->sc : NULL;
 }
 
 int sc_layer_vortek_pool_take(int slot, int w, int h, struct vkp_image **img, int *wait_fd) {

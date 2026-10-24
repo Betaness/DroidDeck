@@ -1,6 +1,7 @@
 #include "vortek_present.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 
 #include "sc_layer.h"
 #include "droiddeck_ext.h"
+#include "frame_sched_feed.h"
 #include "vortek_upscale.h"
 
 #define VP_MAX_CHAINS 32
@@ -331,6 +333,8 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
                                  .buf_w = (int)c->w, .buf_h = (int)c->h, .x = x, .y = y, .w = w, .h = h,
                                  .scene_w = g_scene_w, .scene_h = g_scene_h, .main_window = main_window(slot, m)};
     const char *why = NULL;
+    /* Both paths below consume the fence; the frame-governor report wants it too. */
+    const int feed_fd = fsf_enabled() && vf.main_window && acquire_fd >= 0 ? fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0) : -1;
     const int up = vku_present(&vf, acquire_fd, batch(), &why);
     int r = 0;
     if (up == VKU_DIRECT)
@@ -338,6 +342,7 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
                                     token_of(m->chain, m->index), x, y, w, h, g_scene_w, g_scene_h, batch());
     if (r == 0 && up != VKU_TAKEN && g_batch) g_batch_buffers |= 1u << slot;
     if (r != 0) {
+        if (feed_fd >= 0) close(feed_fd);
         vortek_present_release(m->chain, m->index, -1);
         if (fresh) {
             /* Not on the screen: the slot stays free, or keeps the window it had. */
@@ -357,6 +362,12 @@ static void on_present(const struct vp_msg *m, int acquire_fd) {
         if (g_show[i].chain && (int64_t)g_show[i].rect[2] * g_show[i].rect[3] > biggest)
             biggest = (int64_t)g_show[i].rect[2] * g_show[i].rect[3];
     if (area >= biggest) droiddeck_count_game_frame();
+    if (area >= biggest && vf.main_window && fsf_enabled()) {
+        const char *name = NULL;
+        const void *sc = sc_layer_vortek_surface(slot, &name);
+        fsf_game_frame(sc, name, feed_fd, (int)c->n, sc_layer_frame_rate_want());
+    }
+    if (feed_fd >= 0) close(feed_fd);
     if (!g_first_logged) {
         g_first_logged = 1;
         droiddeck_log("vortek", "game frames shown zero-copy: %ux%u buffer over the window at %d,%d %dx%d (X root %ux%u, scene %dx%d)",
