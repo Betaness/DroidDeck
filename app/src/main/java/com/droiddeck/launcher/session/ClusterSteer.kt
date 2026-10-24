@@ -93,7 +93,8 @@ internal class ClusterSteer(private val clusters: List<Cluster>) {
             }
             Action.RELEASE -> {
                 release()
-                "every core back, to see whether the clock is still held (next stay ${decider.retryAfter} s if it is)"
+                "every core back, to see whether the clock is still held " +
+                    "(if it is at once, the next stay is ${(decider.retryAfter * 2).coerceAtMost(RETRY_MAX_S)} s)"
             }
             Action.NONE -> {
                 if (decider.steered) top.forEach { pid -> if (threadCount(pid) != moved[pid]) move(pid, target.mask) }

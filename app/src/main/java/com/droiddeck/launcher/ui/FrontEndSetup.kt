@@ -169,7 +169,9 @@ internal fun SetupPanel(
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
     val gpu = remember { com.droiddeck.launcher.gpu.GpuInfo.detect() }
-    val gpuOk = gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED
+    // [mali-g2] A Mali (or other non-Adreno) GPU runs through Vortek's forwarding to its own Vulkan driver.
+    val vortek = remember { com.droiddeck.launcher.session.VortekServerComponent.available(ctx) }
+    val gpuOk = gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED || vortek
     val gpuName = remember { DeviceSupport.gpuName(ctx) }
     val limitBlocks = PhantomProcessLimit.blocksSteam(s.phantomProcessStatus)
     val signedIn = s.offlineAccount != null
@@ -223,12 +225,15 @@ internal fun SetupPanel(
                         val gpuCheck: @Composable (Boolean) -> Unit = { divider ->
                             CheckRow(
                                 if (gpuOk) CheckState.OK else CheckState.WARN,
-                                when (gpu.support) {
+                                when {
+                                    vortek -> stringResource(R.string.setup_gpu_supported)
+                                    else -> when (gpu.support) {
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
                                     else -> stringResource(R.string.setup_gpu_unsupported)
+                                    }
                                 },
-                                when (gpu.support) {
+                                if (vortek) stringResource(R.string.setup_gpu_detail, gpuName, "Vortek") else when (gpu.support) {
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
                                     com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
                                     else -> stringResource(R.string.setup_gpu_unsupported_detail, gpuName)

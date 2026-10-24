@@ -184,7 +184,7 @@ fun WirelessAdbFixPage(
             },
             eyebrow = stringResource(R.string.setup_title),
             lede = when {
-                pairOnly && step == 2 -> stringResource(R.string.hyperos_pair_done)
+                pairOnly && step == 2 -> stringResource(R.string.hyperos_regulator_avoided)
                 pairOnly && step == 1 -> stringResource(R.string.wadb_lede1)
                 pairOnly -> stringResource(R.string.hyperos_pair_lede)
                 compactSplit && step == 0 -> stringResource(R.string.wadb_lede_compact0)
