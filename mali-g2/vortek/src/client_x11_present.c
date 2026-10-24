@@ -722,6 +722,13 @@ static uint32_t rootOrderOf(const xcb_query_tree_reply_t* tree) {
     return hash ? hash : 1;
 }
 
+/* A parent smaller than the window clips it. Wine puts a game's Vulkan window in a 1x1 parent
+ * when it shows the frames elsewhere (A.V.A.: a 1024x768 client window at 0,0, its frames scaled
+ * into the game window in the middle of the screen). */
+static bool clippedByParent(const X11Swapchain* sc, int x, int y, int w, int h) {
+    return x < sc->clipX0 || y < sc->clipY0 || x + w > sc->clipX1 || y + h > sc->clipY1;
+}
+
 static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool* stale, bool* covered) {
     xcb_connection_t* conn = sc->surface->conn;
     int levels = sc->chainLength;
@@ -800,7 +807,9 @@ static bool checkOccludedOnce(X11Swapchain* sc, int x, int y, int w, int h, bool
                     }
                     occluded = true;
                 }
-                if (rectContains(ox, oy, ow, oh, x, y, w, h)) *covered = true;
+                /* What lies over a clipped window's place says nothing: its frames are shown elsewhere
+                 * (Steam raised over Wine's 1x1 parent froze A.V.A.'s picture after a menu). */
+                if (rectContains(ox, oy, ow, oh, x, y, w, h) && !clippedByParent(sc, x, y, w, h)) *covered = true;
             }
             free(a);
             free(g);
@@ -944,16 +953,16 @@ static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain
     }
 
     /* Fully covered (also by a window of ours on a layer above): paced on the covered path. */
-    sc->occluded = checkOccluded(sc, x, y, w, h) || sc->covered;
-    if (sc->occluded) return VK_NOT_READY;
-    /* A parent smaller than the window clips it. Wine puts a game's Vulkan window in a 1x1 parent
-     * when it shows the frames elsewhere (A.V.A.: a 1024x768 client window at 0,0, its frames scaled
-     * into the 846x536 game window in the middle): a layer at 0,0 showed them in the wrong place,
-     * over a black game window that took the clicks. The X11 path lets Wine copy them. */
-    if (x < sc->clipX0 || y < sc->clipY0 || x + w > sc->clipX1 || y + h > sc->clipY1) {
+    bool occluded = checkOccluded(sc, x, y, w, h) || sc->covered;
+    /* A layer of a clipped window at its own place showed Wine's frames in the wrong place, over a
+     * black game window that took the clicks. The X11 path lets Wine copy them. */
+    if (!sc->covered && clippedByParent(sc, x, y, w, h)) {
+        sc->occluded = false;
         sc->x11Why = "a smaller parent window clips it (Wine shows its frames in another window)";
         return VK_NOT_READY;
     }
+    sc->occluded = occluded;
+    if (sc->occluded) return VK_NOT_READY;
 
     char payload[sizeof(DDPresentZeroCopy) + 18 * sizeof(uint64_t)];
     DDPresentZeroCopy request = {0};
