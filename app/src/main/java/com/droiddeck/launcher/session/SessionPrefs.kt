@@ -901,10 +901,21 @@ object SessionPrefs {
 
     fun sessionPrefs(context: Context): android.content.SharedPreferences = prefs(context)
 
-    val textureAnisotropyChoices = TextureFiltering.ANISOTROPY.map { it to if (it == 0) "Off" else "${it}x" }
+    val textureAnisotropyChoices = TextureFiltering.ANISOTROPY.map {
+        it to when (it) {
+            TextureFiltering.ANISOTROPY_GAME -> "Game default"
+            TextureFiltering.ANISOTROPY_OFF -> "Off"
+            else -> "${it}x"
+        }
+    }
 
-    fun textureAnisotropyChoices(context: Context): List<Pair<Int, String>> =
-        textureAnisotropyChoices.map { (value, label) -> value to if (value == 0) context.getString(R.string.frame_gen_off) else label }
+    fun textureAnisotropyChoices(context: Context): List<Pair<Int, String>> = textureAnisotropyChoices.map { (value, label) ->
+        value to when (value) {
+            TextureFiltering.ANISOTROPY_GAME -> context.getString(R.string.sprefs_anisotropy_game)
+            TextureFiltering.ANISOTROPY_OFF -> context.getString(R.string.frame_gen_off)
+            else -> label
+        }
+    }
 
     val textureLodBiasChoices = TextureFiltering.LOD_BIAS.map {
         it to when (it) {
@@ -923,7 +934,7 @@ object SessionPrefs {
     }
 
     fun textureAnisotropy(context: Context): Int =
-        prefs(context).getInt("textureAnisotropy", 0).takeIf { it in TextureFiltering.ANISOTROPY } ?: 0
+        prefs(context).getInt("textureAnisotropy", TextureFiltering.ANISOTROPY_GAME).takeIf { it in TextureFiltering.ANISOTROPY } ?: TextureFiltering.ANISOTROPY_GAME
 
     fun setTextureAnisotropy(context: Context, value: Int) {
         prefs(context).edit().putInt("textureAnisotropy", value).apply()

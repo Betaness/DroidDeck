@@ -1865,6 +1865,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (quality)</string>
     <string name="sprefs_upscaler_sharpen">Sharpen only</string>
     <string name="sprefs_lod_bias_auto">Auto (match scaling)</string>
+    <string name="sprefs_anisotropy_game">Game default</string>
 
     <string name="look_off_desc">Nothing applied.</string>
     <string name="look_game_clarity">Game Clarity</string>

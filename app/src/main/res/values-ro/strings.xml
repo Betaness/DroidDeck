@@ -1818,6 +1818,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (calitate)</string>
     <string name="sprefs_upscaler_sharpen">Doar claritate</string>
     <string name="sprefs_lod_bias_auto">Automat (se potrivește cu scalarea)</string>
+    <string name="sprefs_anisotropy_game">După joc</string>
 
     <string name="look_off_desc">Nimic aplicat.</string>
     <string name="look_game_clarity">Claritate de joc</string>

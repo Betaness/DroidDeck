@@ -1797,6 +1797,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (kvalitet)</string>
     <string name="sprefs_upscaler_sharpen">Endast skärpa</string>
     <string name="sprefs_lod_bias_auto">Auto (matcha skalning)</string>
+    <string name="sprefs_anisotropy_game">Spelets egen</string>
 
     <string name="look_off_desc">Inget tillämpat.</string>
     <string name="look_game_clarity">Spelklarhet</string>

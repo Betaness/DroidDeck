@@ -1776,6 +1776,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (chất lượng)</string>
     <string name="sprefs_upscaler_sharpen">Chỉ làm nét</string>
     <string name="sprefs_lod_bias_auto">Tự động (khớp tỷ lệ)</string>
+    <string name="sprefs_anisotropy_game">Theo trò chơi</string>
 
     <string name="look_off_desc">Không áp dụng gì.</string>
     <string name="look_game_clarity">Rõ nét trò chơi</string>

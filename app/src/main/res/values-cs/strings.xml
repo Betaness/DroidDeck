@@ -1839,6 +1839,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (kvalita)</string>
     <string name="sprefs_upscaler_sharpen">Jen zaostření</string>
     <string name="sprefs_lod_bias_auto">Automaticky (podle škálování)</string>
+    <string name="sprefs_anisotropy_game">Podle hry</string>
 
     <string name="look_off_desc">Nic není použito.</string>
     <string name="look_game_clarity">Herní jasnost</string>

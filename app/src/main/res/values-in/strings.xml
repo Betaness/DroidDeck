@@ -1776,6 +1776,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (kualitas)</string>
     <string name="sprefs_upscaler_sharpen">Hanya penajaman</string>
     <string name="sprefs_lod_bias_auto">Otomatis (sesuaikan skala)</string>
+    <string name="sprefs_anisotropy_game">Sesuai game</string>
 
     <string name="look_off_desc">Tidak ada yang diterapkan.</string>
     <string name="look_game_clarity">Kejernihan Gim</string>

@@ -1797,6 +1797,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (laatu)</string>
     <string name="sprefs_upscaler_sharpen">Vain terävöinti</string>
     <string name="sprefs_lod_bias_auto">Automaattinen (sovita skaalaukseen)</string>
+    <string name="sprefs_anisotropy_game">Pelin oma</string>
 
     <string name="look_off_desc">Ei mitään käytössä.</string>
     <string name="look_game_clarity">Pelin terävyys</string>

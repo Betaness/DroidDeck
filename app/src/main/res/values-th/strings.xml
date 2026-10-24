@@ -1776,6 +1776,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (คุณภาพ)</string>
     <string name="sprefs_upscaler_sharpen">เพิ่มความคมชัดเท่านั้น</string>
     <string name="sprefs_lod_bias_auto">อัตโนมัติ (ตามอัตราขยาย)</string>
+    <string name="sprefs_anisotropy_game">ตามเกม</string>
 
     <string name="look_off_desc">ไม่ใช้เอฟเฟกต์ใด ๆ</string>
     <string name="look_game_clarity">ความชัดของเกม</string>

@@ -57,6 +57,12 @@ class TextureFilteringPrefsTest {
         assertTrue(published.getString(GameEnvironmentStore.DXVK_CONFIG).contains("samplerAnisotropy = 16"))
         assertEquals("", published.getJSONObject(GameEnvironmentStore.DXVK_CONFIG_GAMES).getString("42"))
         assertNull(SessionPrefs.gameTextureFiltering(context, "43").anisotropy)
+
+        SessionPrefs.setGameTextureAnisotropy(context, "43", TextureFiltering.ANISOTROPY_OFF)
+        val forced = JSONObject(
+            File(LinuxRuntime.rootDir(context), "root/.config/droiddeck/game-environment.json").readText(),
+        ).getJSONObject(GameEnvironmentStore.DXVK_CONFIG_GAMES).getString("43")
+        assertEquals("d3d9.samplerAnisotropy = 0; d3d11.samplerAnisotropy = 0", forced)
     }
 
     @Test fun clearingGameChoicesPreservesOtherProfiles() {

@@ -1797,6 +1797,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (क्वालिटी)</string>
     <string name="sprefs_upscaler_sharpen">सिर्फ़ शार्पन</string>
     <string name="sprefs_lod_bias_auto">ऑटो (स्केलिंग से मेल)</string>
+    <string name="sprefs_anisotropy_game">गेम की सेटिंग</string>
 
     <string name="look_off_desc">कुछ लागू नहीं।</string>
     <string name="look_game_clarity">गेम क्लैरिटी</string>

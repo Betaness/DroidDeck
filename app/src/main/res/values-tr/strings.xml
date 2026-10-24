@@ -1791,6 +1791,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (kalite)</string>
     <string name="sprefs_upscaler_sharpen">Yalnızca keskinleştirme</string>
     <string name="sprefs_lod_bias_auto">Otomatik (ölçeklemeye göre)</string>
+    <string name="sprefs_anisotropy_game">Oyunun ayarı</string>
 
     <string name="look_off_desc">Hiçbir şey uygulanmadı.</string>
     <string name="look_game_clarity">Oyun Netliği</string>

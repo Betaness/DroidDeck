@@ -1820,6 +1820,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (qualité)</string>
     <string name="sprefs_upscaler_sharpen">Netteté seule</string>
     <string name="sprefs_lod_bias_auto">Auto (selon la mise à l\'échelle)</string>
+    <string name="sprefs_anisotropy_game">Selon le jeu</string>
 
     <string name="look_off_desc">Aucun effet appliqué.</string>
     <string name="look_game_clarity">Clarté de jeu</string>

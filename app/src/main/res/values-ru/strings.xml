@@ -1841,6 +1841,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (качество)</string>
     <string name="sprefs_upscaler_sharpen">Только резкость</string>
     <string name="sprefs_lod_bias_auto">Авто (по масштабированию)</string>
+    <string name="sprefs_anisotropy_game">Как в игре</string>
 
     <string name="look_off_desc">Без эффектов.</string>
     <string name="look_game_clarity">Игровая четкость</string>

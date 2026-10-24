@@ -1797,6 +1797,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (minőség)</string>
     <string name="sprefs_upscaler_sharpen">Csak élesítés</string>
     <string name="sprefs_lod_bias_auto">Automatikus (illeszkedik a méretezéshez)</string>
+    <string name="sprefs_anisotropy_game">A játék beállítása</string>
 
     <string name="look_off_desc">Semmi nincs alkalmazva.</string>
     <string name="look_game_clarity">Játéktisztaság</string>

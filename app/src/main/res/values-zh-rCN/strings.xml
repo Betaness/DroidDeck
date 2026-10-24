@@ -1854,6 +1854,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR（质量）</string>
     <string name="sprefs_upscaler_sharpen">仅锐化</string>
     <string name="sprefs_lod_bias_auto">自动（匹配缩放）</string>
+    <string name="sprefs_anisotropy_game">游戏默认</string>
 
     <string name="look_off_desc">不应用任何效果。</string>
     <string name="look_game_clarity">游戏清晰</string>

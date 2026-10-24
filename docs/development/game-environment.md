@@ -121,7 +121,9 @@ prefix IDs to unsigned IDs.
 The published file also carries generated `dxvkConfig` and `dxvkConfigGames`
 values the app's own file never has. The session menu's texture filtering
 (`core/TextureFiltering`) becomes `d3d9/d3d11.samplerAnisotropy` and
-`samplerLodBias` options. Default choices apply to games without overrides; each
+`samplerLodBias` options. "Game default" anisotropy passes nothing, so each
+sampler keeps what the game asked for; "Off" is `samplerAnisotropy = 0`, which
+DXVK applies to every linear sampler. Default choices apply to games without overrides; each
 game can save either choice independently or return it to **Use Default**. The
 launcher appends the selected options to `DXVK_CONFIG` after the environment
 profile, so a user's own `DXVK_CONFIG` entry keeps its options. "Auto" texture

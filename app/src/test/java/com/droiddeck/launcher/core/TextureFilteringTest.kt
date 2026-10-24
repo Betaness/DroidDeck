@@ -26,8 +26,18 @@ class TextureFilteringTest {
         )
     }
 
+    @Test fun offIsForcedWhileGameDefaultPassesNothing() {
+        assertEquals("", TextureFiltering.dxvkOptions(TextureFiltering.ANISOTROPY_GAME, "0", 0f))
+        // DXVK: -1 (unset) keeps the game's samplers, 0 forces anisotropy off.
+        assertEquals(
+            "d3d9.samplerAnisotropy = 0; d3d11.samplerAnisotropy = 0",
+            TextureFiltering.dxvkOptions(TextureFiltering.ANISOTROPY_OFF, "0", 0f),
+        )
+    }
+
     @Test fun unknownValuesLeaveTheGameAlone() {
         assertEquals("", TextureFiltering.dxvkOptions(3, "junk", 0f))
+        assertEquals("", TextureFiltering.dxvkOptions(-1, "0", 0f))
         assertEquals("", TextureFiltering.dxvkOptions(0, TextureFiltering.LOD_BIAS_AUTO, 0f))
         assertEquals("", TextureFiltering.dxvkOptions(0, "0.5", 0f))
         assertEquals(-2f, TextureFiltering.lodBias("-9", 0f), 0f)

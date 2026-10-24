@@ -1778,6 +1778,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR(품질)</string>
     <string name="sprefs_upscaler_sharpen">샤프닝 전용</string>
     <string name="sprefs_lod_bias_auto">자동(스케일링에 맞춤)</string>
+    <string name="sprefs_anisotropy_game">게임 설정</string>
 
     <string name="look_off_desc">적용된 효과 없음.</string>
     <string name="look_game_clarity">게임 선명도</string>

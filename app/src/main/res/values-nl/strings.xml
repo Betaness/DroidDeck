@@ -1797,6 +1797,7 @@
     <string name="sprefs_upscaler_gsr_quality">Snapdragon GSR (kwaliteit)</string>
     <string name="sprefs_upscaler_sharpen">Alleen verscherpen</string>
     <string name="sprefs_lod_bias_auto">Automatisch (volgt de schaling)</string>
+    <string name="sprefs_anisotropy_game">Zoals in het spel</string>
 
     <string name="look_off_desc">Niets toegepast.</string>
     <string name="look_game_clarity">Game-helderheid</string>
