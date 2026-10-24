@@ -18,6 +18,8 @@ app/src/main/jniLibs/arm64-v8a/libvortekserver.so
 app/src/main/jniLibs/arm64-v8a/libvkbridge_server.so
 /mali-g2/vortek/work/
 /mali-g2/vortek/out/
+/mali-g2/hybris/work/
+/mali-g2/hybris/out/
 app/src/main/rust/stores/target/
 app/src/main/assets/droiddeck-esync/
 app/src/main/assets/droiddeck-esync-extra/
