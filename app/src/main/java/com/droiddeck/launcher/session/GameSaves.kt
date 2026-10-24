@@ -116,13 +116,32 @@ object GameSaves {
         return out to count
     }
 
+    /**
+     * Profile directories that hold no saves, only scratch and caches that grow every zip (and every backup an
+     * import makes) by tens of megabytes: FEX's code cache alone is about 80 MB a game.
+     */
+    private val NOT_SAVES = listOf(
+        "AppData/Local/Temp", "AppData/Local/CrashDumps",
+        "AppData/Local/D3DSCache", "AppData/Local/NVIDIA", "AppData/Local/AMD",
+        "AppData/Local/Microsoft/Windows/INetCache", "AppData/Local/Microsoft/Windows/WebCache",
+    )
+
+    /** Caches known by name wherever they are: FEX's ([parent]/fex-emu/DiskCache) and Unreal's DerivedDataCache. */
+    internal fun notSaves(rel: String): Boolean {
+        if (NOT_SAVES.any { rel.equals(it, true) }) return true
+        val segs = rel.split('/')
+        val name = segs.last()
+        return (name.equals("DiskCache", true) && segs.getOrNull(segs.size - 2).equals("fex-emu", true)) ||
+            name.equals("DerivedDataCache", true)
+    }
+
     private fun zipProfile(profile: File, roots: List<String>?, layout: Layout, out: File): Int {
         if (!profile.isDirectory) return 0
         val scope = roots?.map { File(profile, it) }?.filter { it.exists() } ?: listOf(profile)
         var count = 0
         ZipOutputStream(BufferedOutputStream(FileOutputStream(out))).use { zos ->
             for (top in scope) top.walkTopDown()
-                .onEnter { d -> d.relativeTo(profile).path.replace(File.separatorChar, '/').let { !it.equals("AppData/Local/Temp", true) && !it.equals("AppData/Local/CrashDumps", true) } }
+                .onEnter { d -> !notSaves(d.relativeTo(profile).path.replace(File.separatorChar, '/')) }
                 .filter { it.isFile }
                 .forEach { f ->
                     val rel = f.relativeTo(profile).path.replace(File.separatorChar, '/')
