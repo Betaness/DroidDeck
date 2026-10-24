@@ -40,7 +40,7 @@ object HyperOsGameMode {
     @Synchronized
     fun start(context: Context): String {
         if (!SessionPrefs.stopJoyose(context)) return "joyose: left running (setting off)"
-        if (Build.SOC_MODEL != "O3") return "joyose: not on this SoC"
+        if (!onO3()) return "joyose: not on this SoC"
         val app = context.applicationContext
         worker?.interrupt()
         worker = Thread({ run(app) }, "hyperos-game-mode").apply { isDaemon = true; start() }
@@ -59,11 +59,13 @@ object HyperOsGameMode {
     fun checkAtLaunch(context: Context) {
         if (launchChecked) return
         launchChecked = true
-        if (!SessionPrefs.stopJoyose(context) || Build.SOC_MODEL != "O3") return
+        if (!onO3() || !SessionPrefs.stopJoyose(context)) return
         val app = context.applicationContext
         val shownAt = SystemClock.elapsedRealtime()
         Thread({ checkRegulator(app, shownAt) }, "hyperos-game-regulator").apply { isDaemon = true; start() }
     }
+
+    private fun onO3() = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3"
 
     private fun checkRegulator(context: Context, shownAt: Long) {
         try {
