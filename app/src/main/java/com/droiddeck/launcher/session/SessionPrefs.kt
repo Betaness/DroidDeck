@@ -438,6 +438,9 @@ object SessionPrefs {
     /** [mali-g2] Whether HyperOS's game regulator is kept off the app: Joyose stopped at launch and during a session (HyperOsGameMode). */
     fun stopJoyose(context: Context): Boolean = prefs(context).getBoolean("stopJoyose", true)
 
+    /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
+    fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
+
     /** Whether a Windows game's busiest thread may share a core with its wineserver (WineServerColocation). */
     fun wineColocate(context: Context): Boolean = prefs(context).getBoolean("wineColocate", false)
 

@@ -926,6 +926,11 @@ class SessionService : Service() {
             binds.addAll(gpuStats.binds())
         }
         if (controllersOn) components.add(RumbleComponent().also { it.attach(this) })
+        // [mali-g2] The Android system tree, for loading the vendor Vulkan driver in a guest process (libhybris).
+        if (SessionPrefs.androidSystemBinds(this)) {
+            ANDROID_SYSTEM_DIRS.filter { File(it).exists() }.forEach { binds.add("$it:$it") }
+            Log.i(TAG, "android system binds: on")
+        }
         val home = File(LinuxRuntime.rootDir(this), "root")
         File(home, "Storage").mkdirs()
         binds.add(Environment.getExternalStorageDirectory().path + ":/root/Storage")
@@ -1993,6 +1998,10 @@ class SessionService : Service() {
         private const val GAME_LAUNCH_RETRY_MS = 250L
         private const val DOWNLOAD_POLL_MS = 2_000L
         private const val STEAM_GAME_REQUEST = "steam-game"
+        private val ANDROID_SYSTEM_DIRS = listOf(
+            "/system", "/vendor", "/apex", "/linkerconfig", "/system_ext", "/product", "/odm",
+            "/dev/__properties__", "/property_contexts", "/plat_property_contexts",
+        )
         private const val GAME_URL_PREFIX = "steam://rungameid/"
         /** How long a front-end launch may take to start (downloads, first-run installs) before the exit watch gives up. */
         private const val GAME_START_TIMEOUT_MS = 20 * 60_000L
