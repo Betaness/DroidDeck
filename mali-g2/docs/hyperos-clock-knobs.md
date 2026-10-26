@@ -354,13 +354,13 @@ adb logcat -d -s MirimThirdPartyFreq MirimThirdPartyAuthRegistry MiBridge | tail
 
 ```
 export DROIDDECK_PACKAGE=com.droiddeck.launcher.g2
-tools/droiddeckctl prefs set session miBridgeBoost gpu=1      # then gpu=3, cpu=1, "gpu=1,ddr=1"; "off" for none
+tools/droiddeckctl prefs set --type string session miBridgeBoost gpu=1   # then gpu=3, cpu=1, "gpu=1,ddr=1"; "off" for none
 # session log / logcat -s MiBridgeBoost: "added to mibridge_authorized_pkg_list", "gpu level 1: granted"
 # The session's start line only says what is asked for; granted or refused is in the MiBridgeBoost lines.
 ```
 
 - **Run:** A/B against `off`, as in E2.
-- **Restore:** `tools/droiddeckctl prefs set session miBridgeBoost --type remove` goes back to the default
+- **Restore:** `tools/droiddeckctl prefs set --type remove session miBridgeBoost` goes back to the default
   (on, on the O3). With `off`, the app takes its package out of `mibridge_authorized_pkg_list` again at the next
   session start (log `taken out of mibridge_authorized_pkg_list again`).
 - **Check afterwards (with `off`):** `adb shell settings get system mibridge_authorized_pkg_list` should no
@@ -369,6 +369,11 @@ tools/droiddeckctl prefs set session miBridgeBoost gpu=1      # then gpu=3, cpu=
   pairing's port (seen on this build: logcat `MiBridgeBoost: no wireless debugging pairing, or wireless
   debugging is off`), the app finds it by trying loopback ports in the kernel's ephemeral range (logcat
   `WirelessAdbFix: loopback ports ... answering as wireless debugging`).
+- **Measured** (fullscreen, half-resolution Duckov title, on battery): two 20-minute runs, the default
+  `cpu=1,gpu=1,ddr=1` against `off`, gave 82.3±0.8 against 61.4±0.3 fps (per-minute mean ± SE), main thread
+  10.64 against 13.85 ms a frame, the same energy per frame (0.141 against 0.139 J), board 42.6 against 37.5 °C.
+  GPU and DDR were granted at every renewal (GPU floor and top 979 MHz, DDR 9600 MHz); CPU was refused
+  (`thermal break ... deny CPU`) whenever `board_sensor_temp` was 40 °C or more, which is most of a session.
 
 ### E4: G2 out of Game Turbo (owner's UI action)
 
