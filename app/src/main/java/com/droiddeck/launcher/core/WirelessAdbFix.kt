@@ -3,6 +3,7 @@ package com.droiddeck.launcher.core
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.util.Log
 import com.droiddeck.launcher.R
 import com.flyfishxu.kadb.Kadb
 import com.flyfishxu.kadb.cert.KadbCert
@@ -17,11 +18,16 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.ArrayDeque
 
 object WirelessAdbFix {
+    private const val TAG = "WirelessAdbFix"
     private const val CERT_FILE = "wireless-adb-cert.pem"
     private const val KEY_FILE = "wireless-adb-key.pem"
     private const val HOST_FILE = "wireless-adb-host.txt"
     private const val CONNECTION_FILE = "wireless-adb-connection.txt"
     const val LOOPBACK = "127.0.0.1"
+    /** Ports from a loopback scan given a connection, at most; adbd has one. */
+    private const val SCANNED_ATTEMPTS = 3
+    /** Callers that come together at a session's start look for a new port one at a time. */
+    private val discovery = Any()
 
     private data class SavedConnection(val host: String, val port: Int?)
 
@@ -191,20 +197,68 @@ object WirelessAdbFix {
         saveConnection(context, host, port)
     }
 
+    /** A shell-user connection that answers, or null. */
+    private fun attempt(host: String, port: Int): Kadb? {
+        val adb = runCatching { Kadb.create(host, port, connectTimeout = 3000) }.getOrNull() ?: return null
+        if (runCatching { adb.shell("echo ok").output.trim() == "ok" }.getOrDefault(false)) return adb
+        runCatching { adb.close() }
+        return null
+    }
+
+    /**
+     * [mali-g2] The wireless debugging port of this device by a loopback scan ([AdbPortScan]) and a connection to it,
+     * skipping the ports [tried] already. Saved as a loopback connection: the pairing holds for this device's adbd
+     * whatever address it was made on, and that address may have changed since.
+     */
+    private fun scanLoopback(appContext: Context, tried: Set<Int>): Pair<Int, Kadb>? {
+        val range = AdbPortScan.range()
+        val startedAt = System.nanoTime()
+        val ports = try {
+            AdbPortScan.scan(LOOPBACK, AdbPortScan.order(range, tried))
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return null
+        }
+        Log.i(TAG, "loopback ports ${range.first}-${range.last} answering as wireless debugging: " +
+            "${ports.ifEmpty { "none" }} (${TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)} ms)")
+        for (port in ports.take(SCANNED_ATTEMPTS)) {
+            if (Thread.currentThread().isInterrupted) return null
+            val adb = attempt(LOOPBACK, port) ?: continue
+            writeAtomically(appContext, File(appContext.noBackupFilesDir, HOST_FILE), LOOPBACK.toByteArray())
+            saveConnection(appContext, LOOPBACK, port)
+            return port to adb
+        }
+        if (ports.isNotEmpty()) Log.i(TAG, "no answer through the saved pairing on $ports: paired again since, or the key revoked?")
+        return null
+    }
+
     /**
      * A shell-user connection to this device through the saved pairing (the cached port, else the one
-     * discovered now), or null without a pairing or when wireless debugging is off. The caller closes it.
+     * announced over mDNS, else one found by a loopback scan), or null without a pairing or when wireless
+     * debugging is off. The caller closes it. Blocks for up to about 20 s when the cached port is stale.
      */
     fun connectUsingSavedPairing(context: Context): Kadb? {
         val appContext = context.applicationContext
-        val saved = savedConnection(appContext) ?: return null
+        val first = savedConnection(appContext) ?: return null
         loadOrCreateIdentity(appContext)
-        fun attempt(port: Int): Kadb? = runCatching {
-            Kadb.create(saved.host, port, connectTimeout = 3000).takeIf { it.shell("echo ok").output.trim() == "ok" }
-        }.getOrNull()
-        saved.port?.let { port -> attempt(port)?.let { return it } }
-        val port = findConnectPort(appContext, saved.host) ?: return null
-        return attempt(port)?.also { saveConnection(appContext, saved.host, port) }
+        first.port?.let { port -> attempt(first.host, port)?.let { return it } }
+        synchronized(discovery) {
+            val tried = mutableSetOf<Int>()
+            first.port?.let { tried += it }
+            // Another caller may have found the new port meanwhile.
+            val saved = savedConnection(appContext) ?: return null
+            saved.port?.takeIf { saved != first }?.let { port ->
+                tried += port
+                attempt(saved.host, port)?.let { return it }
+            }
+            findConnectPort(appContext, saved.host)?.takeIf { tried.add(it) }?.let { port ->
+                attempt(saved.host, port)?.let { adb ->
+                    saveConnection(appContext, saved.host, port)
+                    return adb
+                }
+            }
+            return scanLoopback(appContext, tried)?.second
+        }
     }
 
     fun setUsingSavedPairing(context: Context, enabled: Boolean) {
@@ -212,21 +266,24 @@ object WirelessAdbFix {
         val saved = savedConnection(appContext)
             ?: error(appContext.getString(R.string.adbfix_no_pairing))
         val cachedPort = saved.port
-        if (cachedPort != null) {
-            val cachedResult = runCatching {
-                setChildProcessLimit(appContext, saved.host, cachedPort, enabled)
-            }
-            if (cachedResult.isSuccess) return
+        val cachedResult = cachedPort?.let { port ->
+            runCatching { setChildProcessLimit(appContext, saved.host, port, enabled) }.also { if (it.isSuccess) return }
+        }
+        synchronized(discovery) {
             val discoveredPort = findConnectPort(appContext, saved.host)
             if (discoveredPort != null && discoveredPort != cachedPort) {
                 setChildProcessLimit(appContext, saved.host, discoveredPort, enabled)
-            } else {
-                cachedResult.getOrThrow()
+                return
             }
-        } else {
-            val discoveredPort = findConnectPort(appContext, saved.host)
-                ?: error(appContext.getString(R.string.adbfix_enter_address))
-            setChildProcessLimit(appContext, saved.host, discoveredPort, enabled)
+            loadOrCreateIdentity(appContext)
+            val scanned = scanLoopback(appContext, setOfNotNull(cachedPort))
+            if (scanned != null) {
+                scanned.second.close()
+                setChildProcessLimit(appContext, LOOPBACK, scanned.first, enabled)
+                return
+            }
         }
+        cachedResult?.getOrThrow()
+        error(appContext.getString(R.string.adbfix_enter_address))
     }
 }
