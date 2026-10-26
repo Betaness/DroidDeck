@@ -6,7 +6,8 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 `/vendor/lib64/hw/vulkan.mali.so`，没有转发和服务端。原型在设备上测得每 4 万条命令（录制 + 提交等待）省约 1.8 ms，
 另外省下 Vortek 服务端约 16% 个核。
 
-默认关闭。会话设置 `gpuPath` 设为 `hybris` 时只有**游戏**走这条路，Steam 客户端（网页界面）仍走 Vortek。
+会话设置 `gpuPath` 为 `hybris` 时只有**游戏**走这条路，Steam 客户端（网页界面）仍走 Vortek。没设时玄戒 O3 默认开、其他 SoC 默认关
+（O3 上半屏鸭科夫标题 88.2±0.8 对 Vortek 78.5±1.0 fps，主线程 10.32 对 10.99 ms/帧，13 个会话没有崩溃；`vortek` 关掉）。
 
 ## 组成
 
@@ -40,15 +41,16 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 都是按 soname 命名的实文件（APK 的 assets 存不了符号链接）。`GUEST_DIR` 编进了 libhybris（链接器目录、RUNPATH），
 别处测试用 `tests/run.sh`（设 `HYBRIS_LINKER_DIR`、`LD_LIBRARY_PATH`、`LD_PRELOAD`、`VK_ICD_FILENAMES`）。
 
-## App 里怎么接（默认关）
+## App 里怎么接（O3 默认开）
 
-- `session/HybrisGpu.kt`、`SessionPrefs.gpuPath`（`droiddeckctl prefs set session gpuPath hybris`，`vortek` 或删掉即关）。
+- `session/HybrisGpu.kt`、`SessionPrefs.gpuPath`（`droiddeckctl prefs set --type string session gpuPath hybris` 开，`vortek` 关；删掉回到默认：O3 开，其他关）。
 - 打开时 `SessionService` 挂入安卓系统目录（和 `androidSystemBinds` 相同），guest 环境加 `DROIDDECK_GPU_PATH=hybris`（rootfs 里有 ICD 清单时）。
   droiddeck-env 里写 `DROIDDECK_GPU_PATH=vortek` 可整体关掉，game-environment.json 里给单个游戏写也行。
 - `droiddeck-game-env` 的 `hybris_gpu`：只对 ARM64 Proton（有 `files/lib/wine/aarch64-unix`）的游戏启动（`waitforexitandrun`）、
   `BL_GPU_MODE=vortek` 时生效（x86_64 Proton 的 Wine 跑在 FEX 里，留在 Vortek），设
   `VK_ICD_FILENAMES`/`VK_DRIVER_FILES` 为本 ICD，把 `libhybris-common.so.1` 放到 `LD_PRELOAD` 最前，
-  `VORTEK_PRESENT_SOCKET=$XDG_RUNTIME_DIR/vortek-present`。缺文件或 `/system/lib64/libvulkan.so` 时退回 Vortek。
+  `VORTEK_PRESENT_SOCKET=$XDG_RUNTIME_DIR/vortek-present`，`GLIBC_TUNABLES` 加 `glibc.rtld.optional_static_tls=16384`
+  （启动脚本的 `LD_AUDIT` 让 rtld 在预加载之前就排好静态 TLS，libhybris-common 约 4 KB 的 TLS 段只能从可选余量里分）。缺文件或 `/system/lib64/libvulkan.so` 时退回 Vortek。
 - `SessionFiles` 每次会话从 APK 放进 rootfs（有才放）；CI 的 `hybris` 任务（`continue-on-error`）编出后放进 APK。
 - 合成器（`waylandcomp/src/vortek_present.c`）现在同时接受最多 7 个零拷贝连接（Vortek 服务端 + 各游戏进程），
   链 id 按连接区分，释放消息发回所属连接。只有 Vortek 服务端一个连接时行为和以前一样：同一进程重连会替换旧连接，

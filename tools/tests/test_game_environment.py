@@ -1281,13 +1281,17 @@ class ForceSsbsTest(unittest.TestCase):
             try:
                 game = [str(arm / "proton"), "waitforexitandrun", "Game.exe"]
                 env = {"DROIDDECK_GPU_PATH": "hybris", "BL_GPU_MODE": "vortek", "VK_ICD_FILENAMES": "/vortek.json",
-                       "LD_PRELOAD": "/usr/local/lib/libssbs.so", "XDG_RUNTIME_DIR": "/run/droiddeck"}
+                       "LD_PRELOAD": "/usr/local/lib/libssbs.so", "XDG_RUNTIME_DIR": "/run/droiddeck",
+                       "GLIBC_TUNABLES": "glibc.pthread.rseq=0:glibc.rtld.optional_static_tls=512"}
                 got = hybris(game, env)
+                self.assertEqual(got["GLIBC_TUNABLES"], "glibc.pthread.rseq=0:glibc.rtld.optional_static_tls=16384")
+                self.assertEqual(hybris(game, dict(env, GLIBC_TUNABLES=""))["GLIBC_TUNABLES"], "glibc.rtld.optional_static_tls=16384")
                 self.assertEqual(got["VK_ICD_FILENAMES"], str(files["icd.json"]))
                 self.assertEqual(got["VK_DRIVER_FILES"], str(files["icd.json"]))
                 self.assertEqual(got["LD_PRELOAD"], str(files["libhybris-common.so.1"]) + ":/usr/local/lib/libssbs.so")
                 self.assertEqual(got["VORTEK_PRESENT_SOCKET"], "/run/droiddeck/vortek-present")
                 self.assertEqual(hybris(game, got)["LD_PRELOAD"], got["LD_PRELOAD"])
+                self.assertEqual(hybris(game, got)["GLIBC_TUNABLES"], got["GLIBC_TUNABLES"])
                 self.assertEqual(hybris([str(arm / "proton"), "run", "iscriptevaluator.exe"], env), env)
                 self.assertEqual(hybris([str(x86 / "proton"), "waitforexitandrun", "Game.exe"], env), env)
                 for off in ({"DROIDDECK_GPU_PATH": "vortek"}, {"BL_GPU_MODE": "adreno"}):

@@ -384,6 +384,9 @@ HYBRIS_DIR = "/usr/local/lib/droiddeck-hybris"
 HYBRIS_ICD = HYBRIS_DIR + "/droiddeck_hybris_icd.aarch64.json"
 HYBRIS_PRELOAD = HYBRIS_DIR + "/lib/libhybris-common.so.1"
 ANDROID_VULKAN = "/system/lib64/libvulkan.so"
+# The launcher's LD_AUDIT (libblaudit.so) makes rtld lay out static TLS before the preloads, so libhybris-common's
+# 4 KB TLS segment has to come out of the optional surplus (512 bytes by default).
+HYBRIS_STATIC_TLS = "glibc.rtld.optional_static_tls=16384"
 
 
 def hybris_gpu(command, env):
@@ -391,7 +394,8 @@ def hybris_gpu(command, env):
     processes run the Mali driver themselves through libhybris (mali-g2/hybris) instead of forwarding every
     Vulkan call to the Vortek server, and hand their frames to the compositor directly. Games only: Steam's
     web views stay on Vortek. libhybris-common takes static TLS, so it is preloaded rather than dlopened;
-    the driver and Android's libraries come from the Android system tree the app binds in for it."""
+    the driver and Android's libraries come from the Android system tree the app binds in for it. Unset, the app
+    asks for it on the Xring O3."""
     if env.get("DROIDDECK_GPU_PATH") != "hybris" or env.get("BL_GPU_MODE") != "vortek":
         return env
     if len(command) < 2 or command[1] != "waitforexitandrun":
@@ -406,7 +410,9 @@ def hybris_gpu(command, env):
         print("droiddeck-game-env: in-process GPU asked for, but %s is missing; Vortek" % missing[0], file=sys.stderr)
         return env
     parts = [p for p in re.split(r"[:\s]+", env.get("LD_PRELOAD", "")) if p and p != HYBRIS_PRELOAD]
-    result = dict(env, VK_ICD_FILENAMES=HYBRIS_ICD, VK_DRIVER_FILES=HYBRIS_ICD, LD_PRELOAD=":".join([HYBRIS_PRELOAD] + parts))
+    tunables = [t for t in env.get("GLIBC_TUNABLES", "").split(":") if t and not t.startswith("glibc.rtld.optional_static_tls=")]
+    result = dict(env, VK_ICD_FILENAMES=HYBRIS_ICD, VK_DRIVER_FILES=HYBRIS_ICD, LD_PRELOAD=":".join([HYBRIS_PRELOAD] + parts),
+                  GLIBC_TUNABLES=":".join(tunables + [HYBRIS_STATIC_TLS]))
     result.setdefault("VORTEK_PRESENT_SOCKET", os.path.join(env.get("XDG_RUNTIME_DIR") or "/run/droiddeck", "vortek-present"))
     print("droiddeck-game-env: Vulkan in-process (libhybris), Steam stays on Vortek", file=sys.stderr)
     return result
