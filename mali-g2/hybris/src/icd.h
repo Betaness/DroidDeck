@@ -4,7 +4,8 @@
  * and adds what DroidDeck needs on top of the bare driver:
  *   - X11 WSI (wsi.c): VK_KHR_surface, VK_KHR_xcb_surface, VK_KHR_xlib_surface, VK_KHR_swapchain,
  *     with AHardwareBuffer images shown zero-copy by DroidDeck's compositor, or copied into the window;
- *   - the Mali workarounds the Vortek client carries (mali_fixes.c).
+ *   - the Mali workarounds the Vortek client carries, and the command memory release the Vortek
+ *     server does (mali_fixes.c).
  * Dispatchable handles are libhybris's (the HAL's) own: nothing is wrapped, calls this library does
  * not intercept go straight to libhybris.
  *
@@ -86,7 +87,7 @@ typedef struct Device {
     X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) \
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) \
     X(ImportSemaphoreFdKHR) X(ImportFenceFdKHR) X(GetFenceFdKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
-    X(CreateShaderModule) X(CreateGraphicsPipelines)
+    X(CreateShaderModule) X(CreateGraphicsPipelines) X(ResetCommandPool) X(ResetCommandBuffer)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
 #undef X
@@ -116,5 +117,6 @@ PFN_vkVoidFunction mali_device_proc(const char* name);
 /* The device's core features as the application may enable them: the ones reported as emulated
  * but missing in the driver are turned off in `enabled`. */
 void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled);
+void mali_device_created(Device* device);
 
 #endif

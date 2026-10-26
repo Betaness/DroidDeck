@@ -14,6 +14,13 @@
  *     and shaderClipDistance / shaderCullDistance while their writes are removed from shaders.
  *     Without them DXVK finds no adapter ("Device does not support required feature
  *     'fillModeNonSolid'").
+ *   - Every Nth vkResetCommandPool / vkResetCommandBuffer of the same pool or command buffer adds
+ *     RELEASE_RESOURCES, as the Vortek server does (winlator-0018): the Mali keeps ~420 bytes of
+ *     host heap per vkCmdBeginRendering in a command buffer that also records a query until it is
+ *     reset with RELEASE_RESOURCES, and DXVK resets its pools with flags 0, so the game process
+ *     grows by tens of MB a minute (vortek/tests/frame_leak_test.c). N is
+ *     DROIDDECK_HYBRIS_CMD_RELEASE_EVERY, else VORTEK_CMD_RELEASE_EVERY, default 32; 1 = every
+ *     reset, 0 = never. Implicit resets by vkBeginCommandBuffer are not covered.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -181,6 +188,66 @@ out:;
     return result;
 }
 
+static int releaseEvery(void) {
+    static int every = -1;
+    int value = __atomic_load_n(&every, __ATOMIC_RELAXED);
+    if (value >= 0) return value;
+    const char* name = "DROIDDECK_HYBRIS_CMD_RELEASE_EVERY";
+    const char* text = getenv(name);
+    if (!text || !*text) text = getenv(name = "VORTEK_CMD_RELEASE_EVERY");
+    value = text && *text ? atoi(text) : 32;
+    if (value < 0) value = 0;
+    if (text && *text) fprintf(stderr, "hybris-icd: %s=%d\n", name, value);
+    __atomic_store_n(&every, value, __ATOMIC_RELAXED);
+    return value;
+}
+
+#define RESET_SLOT_BITS 8
+static pthread_mutex_t resetLock = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint64_t handle; uint32_t resets; } resetCounts[1u << RESET_SLOT_BITS];
+
+/* A handle new to its slot (first reset, or a collision) releases. */
+static bool releaseOnReset(uint64_t handle) {
+    int every = releaseEvery();
+    if (every <= 1) return every == 1;
+    uint32_t slot = (uint32_t)((handle * 0x9E3779B97F4A7C15ull) >> (64 - RESET_SLOT_BITS));
+    bool release = true;
+    pthread_mutex_lock(&resetLock);
+    if (resetCounts[slot].handle != handle) {
+        resetCounts[slot].handle = handle;
+        resetCounts[slot].resets = 0;
+    }
+    else if (++resetCounts[slot].resets < (uint32_t)every) release = false;
+    else resetCounts[slot].resets = 0;
+    pthread_mutex_unlock(&resetLock);
+    return release;
+}
+
+static VkResult VKAPI_CALL ResetCommandPool(VkDevice handle, VkCommandPool pool, VkCommandPoolResetFlags flags) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    if (releaseOnReset((uint64_t)pool)) flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+    return device->ResetCommandPool(handle, pool, flags);
+}
+
+/* A command buffer does not name its device. Its vkResetCommandBuffer from libhybris is the Mali
+ * driver's own function (in libGLES_mali.so), the same for every device. */
+static PFN_vkResetCommandBuffer nextResetCommandBuffer;
+
+void mali_device_created(Device* device) {
+    PFN_vkResetCommandBuffer expected = NULL;
+    if (device->ResetCommandBuffer)
+        __atomic_compare_exchange_n(&nextResetCommandBuffer, &expected, device->ResetCommandBuffer, false, __ATOMIC_RELEASE,
+                                    __ATOMIC_RELAXED);
+}
+
+static VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags) {
+    PFN_vkResetCommandBuffer next = __atomic_load_n(&nextResetCommandBuffer, __ATOMIC_ACQUIRE);
+    if (!next) return VK_ERROR_DEVICE_LOST;
+    if (releaseOnReset((uint64_t)(uintptr_t)commandBuffer)) flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
+    return next(commandBuffer, flags);
+}
+
 PFN_vkVoidFunction mali_instance_proc(const char* name) {
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures")) return (PFN_vkVoidFunction)GetPhysicalDeviceFeatures;
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") || !strcmp(name, "vkGetPhysicalDeviceFeatures2KHR"))
@@ -193,5 +260,7 @@ PFN_vkVoidFunction mali_instance_proc(const char* name) {
 PFN_vkVoidFunction mali_device_proc(const char* name) {
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)CreateShaderModule;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
+    if (!strcmp(name, "vkResetCommandPool")) return (PFN_vkVoidFunction)ResetCommandPool;
+    if (!strcmp(name, "vkResetCommandBuffer")) return (PFN_vkVoidFunction)ResetCommandBuffer;
     return NULL;
 }

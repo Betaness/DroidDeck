@@ -34,7 +34,9 @@
  * vkDeviceWaitIdle, destroys and recreates FL_RECREATE_WHAT (cmdpool, querypool or both).
  * FL_CB_RESET=1/2: vkResetCommandBuffer before each begin, with flags 0 / RELEASE_RESOURCES.
  * FL_SERVER_PID: the Vortek server's pid; every FL frame line then also carries the server's malloc
- * heap ("srvheap", kB of resident Scudo/malloc mappings from /proc/<pid>/smaps).
+ * heap ("srvheap", kB of resident Scudo/malloc mappings from /proc/<pid>/smaps). FL_SERVER_PID=self
+ * measures this process (the in-process Mali path, ../../hybris/tests/frame_leak_test.sh), counting
+ * unnamed anonymous mappings and [heap] as heap, with its whole resident size ("rss", kB) too.
  * Also builds as a bionic program against the device's own loader and driver (no Vortek, no X11,
  * offscreen only); it then prints the process's malloc heap with every FL frame line:
  *   clang --target=aarch64-linux-android30 -O2 -o frame_leak_test frame_leak_test.c -lvulkan
@@ -50,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <vulkan/vulkan.h>
 #include "cmd_stream_spv.h"
 
@@ -81,7 +84,9 @@ static bool step(const char* name) {
     return false;
 }
 
-static long serverHeapKb(int pid) {
+/* Unnamed anonymous mappings count too with `anonymous`: bionic's allocator inside libhybris (the
+ * in-process path) cannot name its mappings in a glibc process. */
+static long serverHeapKb(int pid, bool anonymous) {
     char path[64], line[512];
     snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
     FILE* f = fopen(path, "r");
@@ -90,11 +95,25 @@ static long serverHeapKb(int pid) {
     bool heap = false;
     while (fgets(line, sizeof(line), f)) {
         unsigned long start, end;
-        if (sscanf(line, "%lx-%lx ", &start, &end) == 2) heap = strstr(line, "scudo") || strstr(line, "malloc");
+        int nameAt = 0;
+        if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %n", &start, &end, &nameAt) == 2)
+            heap = strstr(line, "scudo") || strstr(line, "malloc") ||
+                   (anonymous && (nameAt == 0 || line[nameAt] == 0 || line[nameAt] == '\n' || !strncmp(line + nameAt, "[heap]", 6)));
         else if (heap && sscanf(line, "Rss: %ld kB", &kb) == 1) total += kb;
     }
     fclose(f);
     return total;
+}
+
+static long selfRssKb(void) {
+    char line[256];
+    long kb = -1;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "VmRSS: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb;
 }
 
 static VkPhysicalDeviceMemoryProperties mp;
@@ -108,6 +127,10 @@ int main(void) {
     int frames = envInt("FL_FRAMES", 20000), inflight = envInt("FL_INFLIGHT", 2), draws = envInt("FL_DRAWS", 64);
     int ncb = envInt("FL_CMDBUFS", 2), report = envInt("FL_REPORT", 2000);
     int cbReset = envInt("FL_CB_RESET", 0), serverPid = envInt("FL_SERVER_PID", 0);
+#ifndef __ANDROID__
+    bool selfHeap = getenv("FL_SERVER_PID") && strcmp(getenv("FL_SERVER_PID"), "self") == 0;
+    if (selfHeap) serverPid = getpid();
+#endif
     int passes = envInt("FL_PASSES", 1), poolRelease = envInt("FL_POOL_RELEASE", 0), recreate = envInt("FL_RECREATE", 0);
     const char* recreateWhat = getenv("FL_RECREATE_WHAT") && *getenv("FL_RECREATE_WHAT") ? getenv("FL_RECREATE_WHAT") : "both";
     if (passes < 1) passes = 1;
@@ -504,7 +527,10 @@ int main(void) {
             struct mallinfo mi = mallinfo();
             printf("FL frame %d t %.2f fps %.1f heap %zu\n", f + 1, t - t0, report / (t - tReport), (size_t)mi.uordblks);
 #else
-            if (serverPid > 0) printf("FL frame %d t %.2f fps %.1f srvheap %ld\n", f + 1, t - t0, report / (t - tReport), serverHeapKb(serverPid));
+            if (selfHeap)
+                printf("FL frame %d t %.2f fps %.1f rss %ld srvheap %ld\n", f + 1, t - t0, report / (t - tReport), selfRssKb(),
+                       serverHeapKb(serverPid, true));
+            else if (serverPid > 0) printf("FL frame %d t %.2f fps %.1f srvheap %ld\n", f + 1, t - t0, report / (t - tReport), serverHeapKb(serverPid, false));
             else printf("FL frame %d t %.2f fps %.1f\n", f + 1, t - t0, report / (t - tReport));
 #endif
             fflush(stdout);

@@ -17,11 +17,11 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 | `patches/libhybris-0002-common-exports.patch` | libhybris-common 用版本脚本只导出 `hybris_*`、`android_*` 等自己的入口（和 `my_property_*`）：它被预加载进游戏的每个进程，自带的 `strlcpy`/`strlcat`、`native_handle_*` 等通用符号不能顶替 glibc 的（`nm -D` 可查） |
 | `src/icd.c`, `src/icd.h` | guest 加载器看到的 ICD。dlopen 同目录 `lib/libhybris-vulkan-icd.so.0`（libhybris 的 glibc ICD：实例由安卓的 libvulkan 创建，设备和命令直接进 HAL），只拦截需要的入口，其余原样交给它；不包装句柄。有交换链的设备在图形队列族里多要一个队列给 acquire 用，没有空余时用应用的队列并加锁 |
 | `src/wsi.c` | X11 WSI：`VK_KHR_surface`、`VK_KHR_xcb_surface`、`VK_KHR_xlib_surface`、`VK_KHR_get_surface_capabilities2`、`VK_KHR_swapchain`。交换链图像是 AHardwareBuffer（`VK_ANDROID_external_memory_android_hardware_buffer` 导入），经 `$VORTEK_PRESENT_SOCKET` 用 Vortek 的零拷贝协议（`../vortek/src/zero_copy.c`，原样编译）交给合成器显示；acquire 把合成器的释放栅栏导入应用的信号量/栅栏（`headless_swapchain.c` 的做法）。是否能走合成器图层由 X 窗口树决定（`client_x11_present.c` 的逻辑：被别的窗口挡住、被父窗口裁剪、带 alpha 时拷贝进窗口，完全被挡时按 10 fps 节流），两份代码合在一个进程里 |
-| `src/mali_fixes.c` | Vortek 客户端里属于驱动问题的补丁：去掉 ClipDistance/CullDistance 写入（`../vortek/src/spirv_clip_cull.h`，和 Vortek 共用；不去掉 Mali 编译器在本进程里段错误，见测试）、vkd3d-proton 的 storage texel buffer 对齐、`VK_EXT_vertex_attribute_divisor` 别名；驱动没有、DXVK 又要求的核心特性 fillModeNonSolid、shaderClipDistance、shaderCullDistance 照 Vortek 服务端的做法报成支持，建设备时再关掉（没有它们 DXVK 找不到设备：`Skipping: Device does not support required feature 'fillModeNonSolid'`）。maintenance5/6、GPL、扩展过滤表（`ext_commands.h`）都是 Vortek 协议的需要，原生驱动不用 |
+| `src/mali_fixes.c` | Vortek 客户端里属于驱动问题的补丁：去掉 ClipDistance/CullDistance 写入（`../vortek/src/spirv_clip_cull.h`，和 Vortek 共用；不去掉 Mali 编译器在本进程里段错误，见测试）、vkd3d-proton 的 storage texel buffer 对齐、`VK_EXT_vertex_attribute_divisor` 别名；驱动没有、DXVK 又要求的核心特性 fillModeNonSolid、shaderClipDistance、shaderCullDistance 照 Vortek 服务端的做法报成支持，建设备时再关掉（没有它们 DXVK 找不到设备：`Skipping: Device does not support required feature 'fillModeNonSolid'`）。maintenance5/6、GPL、扩展过滤表（`ext_commands.h`）都是 Vortek 协议的需要，原生驱动不用。另外照 Vortek 服务端（`winlator-0018`）拦截 `vkResetCommandPool`/`vkResetCommandBuffer`：同一个池或命令缓冲每第 N 次重置加上 `RELEASE_RESOURCES`（N 取 `DROIDDECK_HYBRIS_CMD_RELEASE_EVERY`，没有时取 `VORTEK_CMD_RELEASE_EVERY`，默认 32；1 每次都释放，0 不释放；256 格的表加锁，多线程重置安全）。Mali 在同时录了查询的命令缓冲里每次 `vkCmdBeginRendering` 留约 420 字节主机堆，不带这个标志的重置不还，DXVK 用 0 重置池，不这样做游戏进程每分钟涨几十 MB 直到崩溃 |
 | `src/ahb.c`, `src/compat/android/hardware_buffer.h` | AHardwareBuffer 调用经 libhybris 转到设备的 `libnativewindow.so`（分配走 gralloc 的 binder 服务，和普通 App 一样） |
 | `tests/` | 见下 |
 
-环境变量沿用 Vortek 的同名开关：`VORTEK_PRESENT_SOCKET`、`VORTEK_ZERO_COPY=0`、`VORTEK_AHB_SWAPCHAIN=0`、`VORTEK_MIN_IMAGES`、
+环境变量沿用 Vortek 的同名开关：`VORTEK_CMD_RELEASE_EVERY`（`DROIDDECK_HYBRIS_CMD_RELEASE_EVERY` 优先）、`VORTEK_PRESENT_SOCKET`、`VORTEK_ZERO_COPY=0`、`VORTEK_AHB_SWAPCHAIN=0`、`VORTEK_MIN_IMAGES`、
 `VORTEK_RELEASE_WAIT`、`VORTEK_X11_SHM=0`、`VORTEK_X11_STATS=N`、`VORTEK_KEEP_CLIP_DISTANCE=1`、`VORTEK_STRICT_TEXEL_ALIGNMENT=1`。
 日志前缀 `hybris-icd:`、`hybris-wsi:`、`hybris-x11:`（和 `vortek-x11:` 的格式相同）；连接合成器那行沿用 `vortek-server:`。
 
@@ -66,6 +66,8 @@ sh tests/compositor_test.sh        # 合成器自己的 vortek_present.c（Surfa
                                    # 再用 presenter_probe 测同进程重连和放不进链 key 的 id
 glslangValidator -V --vn clip_vert -o out/tests/clip_vert.h tests/clip.vert && cc -Iout/tests -o out/tests/clip_test tests/clip_test.c -lvulkan
 sh tests/run.sh out/tests/clip_test           # 写 ClipDistance 的管线；VORTEK_KEEP_CLIP_DISTANCE=1 时驱动段错误
+sh tests/frame_leak_test.sh        # ../vortek/tests/frame_leak_test.c 在本进程里（离屏，每帧 16 个渲染过程 + 时间戳查询），
+                                   # 量进程自己的堆：分别用 vkResetCommandPool 和 vkResetCommandBuffer，释放关掉时每帧约涨 6.7 KB，默认 0
 ```
 
 ## 只能在设备上测的

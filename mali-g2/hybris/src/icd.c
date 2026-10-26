@@ -438,6 +438,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
                      device->GetFenceFdKHR && device->ImportFenceFdKHR && device->ImportSemaphoreFdKHR;
     instance->GetPhysicalDeviceMemoryProperties(physical, &device->memory);
     pthread_mutex_init(&device->queueLock, NULL);
+    mali_device_created(device);
 
     for (uint32_t i = 0; i < info->queueCreateInfoCount; i++) {
         const VkDeviceQueueCreateInfo* q = &info->pQueueCreateInfos[i];
