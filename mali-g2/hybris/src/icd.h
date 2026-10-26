@@ -50,7 +50,8 @@ typedef struct Instance {
 #define INSTANCE_FUNCS(X) \
     X(DestroyInstance) X(EnumeratePhysicalDevices) X(EnumeratePhysicalDeviceGroups) X(GetPhysicalDeviceProperties) \
     X(GetPhysicalDeviceProperties2) X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
-    X(GetPhysicalDeviceFormatProperties) X(EnumerateDeviceExtensionProperties) X(CreateDevice) X(GetDeviceProcAddr)
+    X(GetPhysicalDeviceFormatProperties) X(GetPhysicalDeviceFeatures) X(GetPhysicalDeviceFeatures2) \
+    X(EnumerateDeviceExtensionProperties) X(CreateDevice) X(GetDeviceProcAddr)
 #define X(name) PFN_vk##name name;
     INSTANCE_FUNCS(X)
 #undef X
@@ -112,5 +113,8 @@ void wsi_device_destroyed(Device* device);
 /* mali_fixes.c */
 PFN_vkVoidFunction mali_instance_proc(const char* name);
 PFN_vkVoidFunction mali_device_proc(const char* name);
+/* The device's core features as the application may enable them: the ones reported as emulated
+ * but missing in the driver are turned off in `enabled`. */
+void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled);
 
 #endif

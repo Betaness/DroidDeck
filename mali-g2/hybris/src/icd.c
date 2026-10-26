@@ -253,6 +253,8 @@ static VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo* info, cons
 #undef X
     if (!instance->EnumeratePhysicalDeviceGroups)
         instance->EnumeratePhysicalDeviceGroups = (PFN_vkEnumeratePhysicalDeviceGroups)next.gipa(*out, "vkEnumeratePhysicalDeviceGroupsKHR");
+    if (!instance->GetPhysicalDeviceFeatures2)
+        instance->GetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)next.gipa(*out, "vkGetPhysicalDeviceFeatures2KHR");
     const char* engine = info->pApplicationInfo ? info->pApplicationInfo->pEngineName : NULL;
     instance->vkd3d = engine && !strcmp(engine, "vkd3d");
     pthread_mutex_lock(&registryLock);
@@ -386,7 +388,23 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
         }
     }
 
+    /* Features reported only as emulated (mali_fixes.c) are not asked of the driver. The chained
+     * VkPhysicalDeviceFeatures2 is the application's: changed for the call and put back after it. */
+    VkPhysicalDeviceFeatures enabled = {0}, chainedSaved = {0};
+    VkPhysicalDeviceFeatures2* chained = NULL;
+    for (const VkBaseInStructure* s = info->pNext; s && !chained; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) chained = (VkPhysicalDeviceFeatures2*)s;
+    if (info->pEnabledFeatures) {
+        enabled = *info->pEnabledFeatures;
+        mali_drop_emulated_features(instance, physical, &enabled);
+    }
+    else if (chained) {
+        chainedSaved = chained->features;
+        mali_drop_emulated_features(instance, physical, &chained->features);
+    }
+
     VkDeviceCreateInfo copy = *info;
+    if (info->pEnabledFeatures) copy.pEnabledFeatures = &enabled;
     copy.enabledExtensionCount = count;
     copy.ppEnabledExtensionNames = count ? names : NULL;
     copy.queueCreateInfoCount = queueInfoCount;
@@ -402,6 +420,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
         ownIndex = UINT32_MAX;
         result = instance->CreateDevice(physical, &copy, allocator, out);
     }
+    if (chained && !info->pEnabledFeatures) chained->features = chainedSaved;
     if (result != VK_SUCCESS) {
         free(driverList); free(names); free(device); free(families); free(queueInfos); free(priorities);
         return result;

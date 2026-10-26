@@ -8,6 +8,12 @@
  *     (VORTEK_STRICT_TEXEL_ALIGNMENT=1 reports the driver's value).
  *   - VK_EXT_vertex_attribute_divisor stands in for the driver's KHR extension (icd.c); its
  *     properties structure is filled from the KHR one here.
+ *   - Core features DXVK requires that the Mali lacks are reported, as the Vortek server reports
+ *     them (vortekrenderer's checkDeviceFeatures), and turned off again at vkCreateDevice (icd.c):
+ *     fillModeNonSolid (what line or point fill then draws is up to the driver, as through Vortek),
+ *     and shaderClipDistance / shaderCullDistance while their writes are removed from shaders.
+ *     Without them DXVK finds no adapter ("Device does not support required feature
+ *     'fillModeNonSolid'").
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -60,6 +66,40 @@ static bool clipStripOn(void) {
     static int on = -1;
     if (on < 0) on = !icd_env_int("VORTEK_KEEP_CLIP_DISTANCE", 0);
     return on;
+}
+
+static void emulateFeatures(VkPhysicalDeviceFeatures* features) {
+    features->fillModeNonSolid = VK_TRUE;
+    if (clipStripOn()) {
+        features->shaderClipDistance = VK_TRUE;
+        features->shaderCullDistance = VK_TRUE;
+    }
+}
+
+static void VKAPI_CALL GetPhysicalDeviceFeatures(VkPhysicalDevice physical, VkPhysicalDeviceFeatures* features) {
+    Instance* instance = icd_instance_of(physical);
+    if (!instance) return;
+    instance->GetPhysicalDeviceFeatures(physical, features);
+    emulateFeatures(features);
+}
+
+static void VKAPI_CALL GetPhysicalDeviceFeatures2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2* features) {
+    Instance* instance = icd_instance_of(physical);
+    if (!instance) return;
+    instance->GetPhysicalDeviceFeatures2(physical, features);
+    emulateFeatures(&features->features);
+}
+
+void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled) {
+    VkPhysicalDeviceFeatures driver = {0};
+    instance->GetPhysicalDeviceFeatures(physical, &driver);
+    VkPhysicalDeviceFeatures emulated = driver;
+    emulateFeatures(&emulated);
+    VkBool32* want = (VkBool32*)enabled;
+    const VkBool32* has = (const VkBool32*)&driver;
+    const VkBool32* fake = (const VkBool32*)&emulated;
+    for (size_t i = 0; i < sizeof(*enabled) / sizeof(VkBool32); i++)
+        if (want[i] && !has[i] && fake[i]) want[i] = VK_FALSE;
 }
 
 /* A rewritten copy of `info` in *out (code to free in *freeCode), or false to use `info`. */
@@ -142,6 +182,9 @@ out:;
 }
 
 PFN_vkVoidFunction mali_instance_proc(const char* name) {
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures")) return (PFN_vkVoidFunction)GetPhysicalDeviceFeatures;
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") || !strcmp(name, "vkGetPhysicalDeviceFeatures2KHR"))
+        return (PFN_vkVoidFunction)GetPhysicalDeviceFeatures2;
     if (!strcmp(name, "vkGetPhysicalDeviceProperties2") || !strcmp(name, "vkGetPhysicalDeviceProperties2KHR"))
         return (PFN_vkVoidFunction)GetPhysicalDeviceProperties2;
     return NULL;
