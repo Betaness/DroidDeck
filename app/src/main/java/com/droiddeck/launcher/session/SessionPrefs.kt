@@ -2,6 +2,7 @@ package com.droiddeck.launcher.session
 
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.os.Build
 import androidx.annotation.StringRes
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.core.CpuAllocationDefaults
@@ -460,8 +461,12 @@ object SessionPrefs {
     /** [mali-g2] The thread FrameSchedFeed names for the game layer: "compositor" (the one presenting it) or "game" (its busiest thread). */
     fun feedFrameSchedThread(context: Context): String = prefs(context).getString("feedFrameSchedThread", "compositor") ?: "compositor"
 
-    /** [mali-g2] Clock floors asked of HyperOS's MiBridge during a session, e.g. "gpu=1"; empty is off (MiBridgeBoost). */
-    fun miBridgeBoost(context: Context): String = prefs(context).getString("miBridgeBoost", "") ?: ""
+    /**
+     * [mali-g2] Clock floors asked of HyperOS's MiBridge during a session, e.g. "gpu=1"; "off" or empty is off (MiBridgeBoost).
+     * Unset, the Xring O3 asks for [MiBridgeBoost.DEFAULT_SPEC] and other SoCs for nothing.
+     */
+    fun miBridgeBoost(context: Context): String =
+        MiBridgeBoost.spec(prefs(context).getString("miBridgeBoost", null), Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3")
 
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)

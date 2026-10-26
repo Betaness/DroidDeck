@@ -10,7 +10,7 @@ import dalvik.system.PathClassLoader
 import java.lang.reflect.Method
 
 /**
- * [mali-g2] Clock floors from Xiaomi's MiBridge during a session on the Xring O3 (experimental, off by default).
+ * [mali-g2] Clock floors from Xiaomi's MiBridge during a session on the Xring O3 (on by default there).
  *
  * HyperOS serves third-party apps a performance SDK, com.miui.performance.MiuiBooster in
  * /system_ext/framework/MiuiBooster.jar. Its requests reach system_server's MirimThirdPartyPolicy, which
@@ -18,7 +18,7 @@ import java.lang.reflect.Method
  * request (level 1, 2, 3); a CPU request is refused while the board sensor reads 40 C or more. Only packages
  * in the system setting mibridge_authorized_pkg_list (a cloud-fed list) are served. The app may not edit
  * that setting, the shell user may: so the package is added through the wireless debugging pairing at a
- * session's start, and taken out again at the first session after the setting here is cleared (and the
+ * session's start, and taken out again at the first session after the setting here is turned off (and the
  * pairing works; clearing the app's data or uninstalling it leaves the package listed). Being listed lets the
  * app ask MirimThirdPartyPolicy; PowerKeeper (MiSpeedUtils) also hands the listed uids to the native
  * miuiboosterservice, and skips that while the list is empty or unset, so when this package was the only
@@ -27,8 +27,13 @@ import java.lang.reflect.Method
  * renewing them. A cloud update rewriting the list takes the grant away mid-session: a request refused for
  * want of it has the package listed and the permission checked again, at most once a minute.
  *
- * The setting [SessionPrefs.miBridgeBoost] names what to hold, e.g. "gpu=1" or "gpu=1,ddr=1,cpu=1";
- * empty is off. Which clocks the levels map to is not known yet: uniperf's tables are not readable.
+ * Level 1 is the strongest, as measured on the O3 (OS4.0.16): GPU 1/2/3 put the GPU's floor at 979/749/576 MHz;
+ * CPU 1 puts the three clusters' floors at 2.25/3.43/2.71 GHz, 2 at 2.25/2.67/2.71 and 3 at 1.64/1.97/2.71;
+ * DDR 1 holds the DDR at 9600 MHz. A sustained game keeps the board at 40-42 C, so the CPU floor is mostly refused
+ * then; DDR 1 took cycles off each half-resolution frame (main thread 34 -> 28, GPU 19 -> 15 Mcycles).
+ *
+ * The setting [SessionPrefs.miBridgeBoost] names what to hold, e.g. "gpu=1" or "gpu=1,ddr=1,cpu=1"; "off" or
+ * empty is off, unset is [DEFAULT_SPEC] on the O3.
  */
 object MiBridgeBoost {
     private const val TAG = "MiBridgeBoost"
@@ -42,6 +47,8 @@ object MiBridgeBoost {
     private const val NOT_PERMITTED = -2
     private val MAX_TIMEOUT_MS = intArrayOf(0, 10_000, 5_000, 1_500)
     private val PACKAGE_LIST = Regex("[A-Za-z0-9._,]*")
+    /** On the O3 unless turned off: the strongest level of each. */
+    const val DEFAULT_SPEC = "cpu=1,gpu=1,ddr=1"
 
     internal data class Hold(val kind: String, val level: Int) {
         val method get() = kind.replaceFirstChar { it.uppercaseChar() }
@@ -52,6 +59,12 @@ object MiBridgeBoost {
 
     @Volatile
     private var worker: Thread? = null
+
+    /** The setting as stored ([stored] null when unset) to what to hold; "" is off. */
+    internal fun spec(stored: String?, onO3: Boolean): String {
+        val value = stored?.trim() ?: return if (onO3) DEFAULT_SPEC else ""
+        return if (value.equals("off", ignoreCase = true)) "" else value
+    }
 
     /** "gpu=1,cpu=2" as holds; null when malformed. Each kind once, levels 1-3. */
     internal fun parse(spec: String): List<Hold>? {

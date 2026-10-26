@@ -14,6 +14,17 @@ class MiBridgeBoostTest {
         assertEquals("Ddr", Hold("ddr", 2).method)
     }
 
+    @Test fun `unset is the strongest levels on the O3 only, and off is off`() {
+        assertEquals("cpu=1,gpu=1,ddr=1", MiBridgeBoost.spec(null, onO3 = true))
+        assertEquals(listOf(Hold("cpu", 1), Hold("gpu", 1), Hold("ddr", 1)), MiBridgeBoost.parse(MiBridgeBoost.DEFAULT_SPEC))
+        assertEquals("", MiBridgeBoost.spec(null, onO3 = false))
+        assertEquals("", MiBridgeBoost.spec("off", onO3 = true))
+        assertEquals("", MiBridgeBoost.spec(" OFF ", onO3 = true))
+        assertEquals("", MiBridgeBoost.spec("", onO3 = true))
+        assertEquals("gpu=2", MiBridgeBoost.spec("gpu=2", onO3 = true))
+        assertEquals("gpu=2", MiBridgeBoost.spec("gpu=2", onO3 = false))
+    }
+
     @Test fun `a malformed setting holds nothing`() {
         assertNull(MiBridgeBoost.parse(""))
         assertNull(MiBridgeBoost.parse("gpu"))

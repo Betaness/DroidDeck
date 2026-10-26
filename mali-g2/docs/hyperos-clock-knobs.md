@@ -234,7 +234,21 @@ This is the only system path found through which an untrusted app can raise floo
 
 - `dumpsys scenariorecognition` (MirimThirdPartyPolicy) shows `uniperfEnable=true`, the eligible uids, and
   `cpuHandles={} gpuHandles={} ddrHandles={}`.
-- What frequency each level means is in uniperf's tables, which cannot be read. Experiment E1 measures it.
+- **Level 1 is the strongest** (measured with the probe from the shell, 2026-10-26). uniperf's tables cannot be read, but the
+  floors can (`/sys/class/devfreq/gpufreq_core/min_freq`, each policy's `scaling_min_freq`, `ddr_devfreq`):
+
+  | Level | GPU floor | CPU floors (cpu0-3 / 4-7 / 8-9) | DDR |
+  |---|---|---|---|
+  | 1 | 979 MHz | 2.25 / 3.43 / 2.71 GHz | `cur_freq` held at 9600 MHz (`min_freq` unchanged) |
+  | 2 | 749 MHz | 2.25 / 2.67 / 2.71 GHz | |
+  | 3 | 576 MHz | 1.64 / 1.97 / 2.71 GHz | |
+
+  Without any request the system already held the GPU at 979 MHz and the CPU at 1.07/1.14 GHz during a session,
+  so `gpu=1` adds little. A sustained half-resolution session keeps `board_sensor_temp` at 40-42 °C, even with a
+  cooler, so CPU requests are mostly refused then. `ddr=1` cut the Duckov title's cycles per frame (main thread
+  33.7 → 28.4 M, GPU 19.1 → 14.6 M), while the system then ran the small and middle clusters lower (about 2.1 →
+  1.75 GHz). Half-resolution fps: none 56.5 ± 4.5, gpu=1 57.7 ± 4.4, gpu=1,ddr=1 60.2 ± 2.3, cpu=1,gpu=1,ddr=1
+  61.1 ± 2.6 (within the spread between sessions); the SoC ran about 5 °C warmer.
 - **Child processes:** yes for the frequency floors, which are system-wide. For priority, only for the tids
   passed.
 - **Risk.** The list is cloud-managed, so a cloud update can drop the entry; add it again per session (and
@@ -244,8 +258,8 @@ This is the only system path found through which an untrusted app can raise floo
   (`settings get`/`put system mibridge_authorized_pkg_list`). SCHED_FIFO on a busy Wine thread can starve other
   threads on that core, so it is not used here.
 
-**Implemented here:** default-off `MiBridgeBoost` (pref `session/miBridgeBoost`, e.g. `gpu=1`), and the
-shell probe `mali-g2/tools/mibridge-probe`.
+**Implemented here:** `MiBridgeBoost` (pref `session/miBridgeBoost`, e.g. `gpu=1`; unset is
+`cpu=1,gpu=1,ddr=1` on the O3, `off` turns it off), and the shell probe `mali-g2/tools/mibridge-probe`.
 
 ### 12. TurboSched (`system turbo_sched_core_app_list`)
 
@@ -264,10 +278,9 @@ the wrong layers. The struct layouts are not decoded.
 ## Ranking (expected gain, then simplicity)
 
 1. **MiBridge GPU/CPU/DDR floors (11).**
-   - **Gain:** the only floor an app can get. The GPU idles at about 950-1110 MHz at about 90% busy at half
-     resolution, so a GPU floor above that is the likeliest gain. Whether any uniperf level goes above
-     1.1 GHz is unknown; PerfFlinger's highest named GPU hint is 979 MHz.
-   - **Cost:** one setting plus app code, which now exists and is off by default.
+   - **Gain:** the only floor an app can get. Level 1 is the strongest, and its GPU floor is 979 MHz, no higher
+     than the clock the GPU idles at; the DDR floor is what lowers the cycles per frame (see 11).
+   - **Cost:** one setting plus app code, which now exists and is on by default on the O3.
    - **Test:** E1, then E3.
 2. **Performance mode (1).**
    - **Gain:** may relax the thermal and IPA ceilings that show up as `scaling_max_freq` drops during a
@@ -341,18 +354,21 @@ adb logcat -d -s MirimThirdPartyFreq MirimThirdPartyAuthRegistry MiBridge | tail
 
 ```
 export DROIDDECK_PACKAGE=com.droiddeck.launcher.g2
-tools/droiddeckctl prefs set session miBridgeBoost gpu=1      # then gpu=3, cpu=1, "gpu=1,ddr=1"
+tools/droiddeckctl prefs set session miBridgeBoost gpu=1      # then gpu=3, cpu=1, "gpu=1,ddr=1"; "off" for none
 # session log / logcat -s MiBridgeBoost: "added to mibridge_authorized_pkg_list", "gpu level 1: granted"
 # The session's start line only says what is asked for; granted or refused is in the MiBridgeBoost lines.
 ```
 
-- **Run:** A/B against an empty setting, as in E2.
-- **Restore:** `tools/droiddeckctl prefs set session miBridgeBoost --type remove`. At the next session
-  start the app takes its package out of `mibridge_authorized_pkg_list` again (log
-  `taken out of mibridge_authorized_pkg_list again`).
-- **Check afterwards:** `adb shell settings get system mibridge_authorized_pkg_list` should no longer
-  contain `com.droiddeck.launcher.g2`.
-- The setting needs the wireless debugging pairing, like HyperOsGameMode.
+- **Run:** A/B against `off`, as in E2.
+- **Restore:** `tools/droiddeckctl prefs set session miBridgeBoost --type remove` goes back to the default
+  (on, on the O3). With `off`, the app takes its package out of `mibridge_authorized_pkg_list` again at the next
+  session start (log `taken out of mibridge_authorized_pkg_list again`).
+- **Check afterwards (with `off`):** `adb shell settings get system mibridge_authorized_pkg_list` should no
+  longer contain `com.droiddeck.launcher.g2`.
+- The setting needs the wireless debugging pairing, like HyperOsGameMode. When mDNS does not announce the
+  pairing's port (seen on this build: logcat `MiBridgeBoost: no wireless debugging pairing, or wireless
+  debugging is off`), the app finds it by trying loopback ports in the kernel's ephemeral range (logcat
+  `WirelessAdbFix: loopback ports ... answering as wireless debugging`).
 
 ### E4: G2 out of Game Turbo (owner's UI action)
 
