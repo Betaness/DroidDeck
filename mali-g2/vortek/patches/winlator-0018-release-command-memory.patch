@@ -1,0 +1,108 @@
+[mali-g2] Release command buffer memory now and then, and two small per-call leaks.
+
+The Mali driver keeps host memory for every render pass instance (about 420 bytes per
+vkCmdBeginRendering) recorded into a command buffer that also records a query (timestamp or
+occlusion), until that command buffer is reset with RELEASE_RESOURCES or its pool is destroyed;
+resets with flags 0 never give it back. DXVK resets its command pools with flags 0 and records the
+game's D3D11 queries into the same command buffer as its rendering, so a Unity game's server grew by
+~85 MB a minute until Scudo could no longer map memory (abort in malloc under vkBeginCommandBuffer).
+The server now adds RELEASE_RESOURCES to every VORTEK_CMD_RELEASE_EVERY-th (default 32, 1 = always,
+0 = never) vkResetCommandPool / vkResetCommandBuffer of the same pool or command buffer (a 64-entry
+table per connection; a new or colliding handle releases). Implicit resets by vkBeginCommandBuffer
+are not covered. Test: tests/frame_leak_test.c, tests/frame_leak_test.sh.
+
+vkWaitSemaphores (timeline_semaphore.c) and the async pipeline creation unserialize into a
+MemoryPool without a backing buffer, and vt_free() frees the chunks but not the allocation list's
+array: 32 bytes leaked per call.
+
+diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+index 50cf1c2..ecec294 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
++++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+@@ -53,6 +53,9 @@ typedef struct VkContext {
+     pthread_mutex_t ownedLock;
+     ArrayList ownedDevices;
+     ArrayList ownedInstances;
++
++    /* [mali-g2] resets per command pool / command buffer since the last one that released its memory */
++    struct { uint64_t handle; uint32_t resets; } commandResets[64];
+     int untrackedLogged;
+ } VkContext;
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
+index 5364368..a63c582 100644
+--- a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
++++ b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
+@@ -172,6 +172,7 @@ static void pipelineCreateThread(void* param) {
+     }
+ 
+     vt_free(&pipelineCreateRequest->memoryPool);
++    ArrayList_free(&pipelineCreateRequest->memoryPool.allocationList, false);
+ 
+     /* [mali-g2] owned by the connection before the client can see (and destroy) them (winlator-0015) */
+     for (int i = 0; i < pipelineCreateRequest->pipelineCount; i++) {
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 9b27820..201da4b 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -1367,6 +1367,32 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
+     if (VkContext_untrack(context, device, OWNED_COMMAND_POOL, commandPool)) vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
+ }
+ 
++/* [mali-g2] The Mali driver keeps host memory for every render pass instance recorded into a command
++ * buffer that also records a query until the command buffer is reset with RELEASE_RESOURCES or its pool
++ * is destroyed (about 420 bytes per vkCmdBeginRendering, tests/frame_leak_test.c). DXVK resets its pools
++ * with flags 0, so a game issuing D3D11 queries grew the server by tens of MB a minute until malloc
++ * failed. Every VORTEK_CMD_RELEASE_EVERY-th reset of a pool or command buffer (default 32, 1 = every
++ * reset, 0 = never) releases. Implicit resets by vkBeginCommandBuffer are not covered. */
++static bool releaseCommandMemory(VkContext* context, uint64_t handle) {
++    static int every = -1;
++    if (every < 0) {
++        const char* value = getenv("VORTEK_CMD_RELEASE_EVERY");
++        int parsed = value && *value ? atoi(value) : 32;
++        if (value && *value) println("vortek: VORTEK_CMD_RELEASE_EVERY=%d", parsed);
++        every = parsed < 0 ? 0 : parsed;
++    }
++    if (every <= 1) return every == 1;
++    uint32_t slot = (uint32_t)((handle * 0x9E3779B97F4A7C15ull) >> 58);
++    if (context->commandResets[slot].handle != handle) {
++        context->commandResets[slot].handle = handle;
++        context->commandResets[slot].resets = 0;
++        return true;
++    }
++    if (++context->commandResets[slot].resets < (uint32_t)every) return false;
++    context->commandResets[slot].resets = 0;
++    return true;
++}
++
+ void vt_handle_vkResetCommandPool(VkContext* context) {
+     uint64_t deviceId;
+     uint64_t commandPoolId;
+@@ -1376,6 +1402,7 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+     VkDevice device = VkObject_fromId(deviceId);
+     VkCommandPool commandPool = VkObject_fromId(commandPoolId);
+ 
++    if (releaseCommandMemory(context, commandPoolId)) flags |= VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT;
+     vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
+ }
+ 
+@@ -1487,6 +1514,7 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+     vt_unserialize_vkResetCommandBuffer((VkCommandBuffer)&commandBufferId, &flags, context->inputBuffer, &context->memoryPool);
+     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
+ 
++    if (releaseCommandMemory(context, commandBufferId)) flags |= VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
+     vulkanWrapper.vkResetCommandBuffer(commandBuffer, flags);
+ }
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c b/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c
+index d20430b..0d2547c 100644
+--- a/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c
++++ b/app/src/main/cpp/vortekrenderer/src/timeline_semaphore.c
+@@ -50,6 +50,7 @@ static void waitSemaphoresThread(void* param) {
+     CLOSEFD(waitSemaphoresRequest->notifyFd);
+ 
+     vt_free(&memoryPool);
++    ArrayList_free(&memoryPool.allocationList, false);
+     MEMFREE(waitSemaphoresRequest->inputBuffer);
+     MEMFREE(waitSemaphoresRequest);
+ }
