@@ -10,17 +10,17 @@
 # the last). Prints FRAMELEAK-PASS or FRAMELEAK-FAIL.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=$HERE/../out/tests
-mkdir -p "$OUT"
-cc -O2 -o "$OUT/frame_leak_test" "$HERE/../../vortek/tests/frame_leak_test.c" -lvulkan -lX11 || exit 1
+TESTS=$HERE/../out/tests
+mkdir -p "$TESTS"
+cc -O2 -o "$TESTS/frame_leak_test" "$HERE/../../vortek/tests/frame_leak_test.c" -lvulkan -lX11 || exit 1
 : "${FL_FRAMES:=8000}"
 export FL_FRAMES FL_PASSES=16 FL_REPORT=1000 FL_SERVER_PID=self
 max=${FL_MAX_GROWTH:-64}
 fail=0
 
 run() { # name expect(grow|flat) release-every steps cb-reset
-    log=$OUT/frame_leak_$1.log
-    DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=$3 FL_STEPS=$4 FL_CB_RESET=$5 timeout 600 sh "$HERE/run.sh" "$OUT/frame_leak_test" >"$log" 2>&1
+    log=$TESTS/frame_leak_$1.log
+    DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=$3 FL_STEPS=$4 FL_CB_RESET=$5 timeout 600 sh "$HERE/run.sh" "$TESTS/frame_leak_test" >"$log" 2>&1
     rc=$?
     verdict=$(awk -v max="$max" -v expect="$2" '/^FL frame .* srvheap /{ f[n] = $3; r[n] = $(NF-2); h[n] = $NF; n++ }
       END {
