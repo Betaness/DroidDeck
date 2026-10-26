@@ -63,7 +63,8 @@ fun WirelessAdbFixPage(
 ) {
     val context = LocalContext.current
     val savedAddress = remember { WirelessAdbFix.savedConnectionAddress(context) }
-    var step by rememberSaveable { mutableStateOf(if (savedAddress == null) 0 else 1) }
+    // Pair-only is opened to pair (again): straight to the pairing code.
+    var step by rememberSaveable { mutableStateOf(if (savedAddress == null || pairOnly) 0 else 1) }
     var pairingAddress by rememberSaveable { mutableStateOf("") }
     var connectionAddress by rememberSaveable { mutableStateOf(savedAddress.orEmpty()) }
     var pairingCode by rememberSaveable { mutableStateOf("") }

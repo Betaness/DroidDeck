@@ -495,7 +495,11 @@ private fun RegulatorCheck(onRequestPairing: () -> Unit, onOpenDeveloperOptions:
     ) {
         when {
             !paired -> PrimaryButton(stringResource(R.string.hyperos_pair), compact = true, onClick = onRequestPairing)
-            noConnection -> SecondaryButton(stringResource(R.string.setup_dev_options), compact = true, onClick = onOpenDeveloperOptions)
+            // The pairing may be gone (Android forgets it), not only wireless debugging off: both ways out.
+            noConnection -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SecondaryButton(stringResource(R.string.setup_dev_options), compact = true, onClick = onOpenDeveloperOptions)
+                PrimaryButton(stringResource(R.string.wadb_pair_again), compact = true, onClick = onRequestPairing)
+            }
             else -> SecondaryButton(stringResource(R.string.wadb_pair_again), compact = true, onClick = onRequestPairing)
         }
     }

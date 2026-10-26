@@ -2962,7 +2962,7 @@
     <string name="hyperos_regulator">HyperOS 遊戲調頻</string>
     <string name="hyperos_regulator_avoided">已配對。如果啟動時 HyperOS 把 DroidDeck 交給遊戲調頻，DroidDeck 會自動重新啟動一次避開它。</string>
     <string name="hyperos_regulator_unpaired">未配對。遊戲時 HyperOS 可能把 CPU 或 GPU 壓在最低頻率（影格率減半甚至更低）。配對無線偵錯後 DroidDeck 可以避開它。</string>
-    <string name="hyperos_regulator_off">這次啟動時無線偵錯沒開或連不上，沒能檢查遊戲調頻。請開啟無線偵錯，再重新開啟 DroidDeck。</string>
+    <string name="hyperos_regulator_off">這次啟動時無線偵錯沒開，或者不再認可 DroidDeck，沒能檢查遊戲調頻。請開啟無線偵錯；已經開著的話請點「重新配對」（Android 可能清掉了配對），然後重新開啟 DroidDeck。</string>
     <string name="hyperos_pair">配對</string>
     <string name="hyperos_pair_title">配對無線偵錯</string>
     <string name="hyperos_pair_lede">把設定和 DroidDeck 並排顯示（分割畫面或小視窗），在設定裡開啟 開發人員選項 → 無線偵錯 → 使用配對碼配對裝置，把顯示的位址和配對碼填到這裡。不會改動子程序限制。</string>
