@@ -1,0 +1,27 @@
+[mali-g2] removeImageBoundCheck off by default.
+
+Winlator's workaround for Mali's folded bound checks takes the first OpSelect after an
+OpSampledImage/OpImageFetch whose second operand is a zero constant and makes it pick the first
+operand, whatever the condition: an ordinary D3D movc after a sample (cond ? texel : 0) then always
+gives the texel. The cause, OpConstantComposite of spec constants folded at their defaults, is fixed
+exactly in the client (src/spirv_spec_composite.h), for every stage and for inline stages, which
+this rewrite never saw. VORTEK_IMAGE_BOUND_CHECK_HACK=1 restores it. Test: tests/mali_quirks_test.c
+("bound": the runtime-condition location must stay zero).
+
+diff --git a/app/src/main/cpp/vortekrenderer/src/shader_inspector.c b/app/src/main/cpp/vortekrenderer/src/shader_inspector.c
+--- a/app/src/main/cpp/vortekrenderer/src/shader_inspector.c
++++ b/app/src/main/cpp/vortekrenderer/src/shader_inspector.c
+@@ -593,7 +593,12 @@
+     bool isMaliDevice = context->driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
+     bool isDXVKEngine = context->engineName ? strcmp(context->engineName, "DXVK") == 0 : false;
+ 
+-    shaderInspector->removeImageBoundCheck = isMaliDevice && isDXVKEngine;
++    /* [mali-g2] The client makes the bound checks' spec-constant composites specializable
++     * (spirv_spec_composite.h), which is what Mali got wrong; this rewrite also forces the texel in
++     * any other select after a sample (a movc with a zero operand). VORTEK_IMAGE_BOUND_CHECK_HACK=1
++     * turns it back on. */
++    const char* boundCheckHack = getenv("VORTEK_IMAGE_BOUND_CHECK_HACK");
++    shaderInspector->removeImageBoundCheck = isMaliDevice && isDXVKEngine && boundCheckHack && *boundCheckHack == '1';
+     if (isDXVKEngine && context->engineVersion > MAKE_ENGINE_VERSION(2, 3, 1)) {
+         shaderInspector->removePointSizeExport = true;
+         shaderInspector->checkInOutVariablesSize = true;
