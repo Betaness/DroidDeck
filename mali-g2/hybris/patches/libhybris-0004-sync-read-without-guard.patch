@@ -4,9 +4,11 @@ static_sync_guard: two extra lock/unlock pairs per hooked call (about 18 mutex p
 vkQueueSubmit, 55 per command buffer cycle on the Mali-G2), and every driver and game thread
 contending for the same lock. The storage is only four-byte aligned, so a pointer-width atomic is not
 allowed; publish the value as two four-byte atomics instead (low, then high with release) and read
-the high half first with acquire: a non-zero high half is a published pointer (static initializers
-and process-shared values have a zero one), and the low half read after it belongs to it. Everything
-else takes the guard as before.
+the high half first with acquire: a non-zero high half is a value that init or publication stored
+(a host pointer, or a process-shared handle, whose high half is all ones with HYBRIS_SHM_MASK), the
+low half read after it belongs to it, and the whole value is returned as the guarded read would
+return it; the callers still tell handles from pointers. Static initializers have a zero high half
+and, like everything else, take the guard as before.
 
 --- a/hybris/common/bionic_sync.c
 +++ b/hybris/common/bionic_sync.c
@@ -23,12 +25,12 @@ else takes the guard as before.
 +    __atomic_store_n(&half[1], (uint32_t)((uint64_t)value >> 32), __ATOMIC_RELEASE);
 +}
 +
-+/* Every lock, unlock and wait reads the storage. Static initializers and
-+ * process-shared values have a zero high half (bionic's 64-bit objects keep
-+ * a zero owner/sequence word there), host pointers practically never do:
-+ * a non-zero high half read with acquire is a published value, and the low
-+ * half read after it belongs to it, without the guard. Anything else takes
-+ * the guard as before. Little-endian AArch64. */
++/* Every lock, unlock and wait reads the storage. Static initializers have a
++ * zero high half (bionic keeps a zero owner/sequence word there); host
++ * pointers practically never do, process-shared handles never (HYBRIS_SHM_MASK
++ * sets it to all ones). A non-zero high half read with acquire is a stored
++ * value and the low half read after it belongs to it: returned whole, as under
++ * the guard. Anything else takes the guard as before. Little-endian AArch64. */
  uintptr_t hybris_read_sync_value(const void *storage)
  {
      uintptr_t value;
