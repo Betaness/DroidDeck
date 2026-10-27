@@ -16,6 +16,8 @@ from pathlib import Path
 NTDLL = "files/lib/wine/aarch64-unix/ntdll.so"
 WINESERVER = "files/bin-arm64/wineserver"
 PACK_FILES = (NTDLL, WINESERVER)
+# Other files of the same wine build a pack may replace (pack.json "extras", path -> sha256).
+EXTRA_FILES = ("files/lib/wine/aarch64-unix/winex11.so",)
 DEFAULT_COPY = ("files/bin-arm64/wine", "files/lib/wine/aarch64-unix/wine", "files/lib/wine/aarch64-unix/wine-preloader")
 REAL_DIRS = (".", "files", "files/bin-arm64", "files/lib", "files/lib/wine", "files/lib/wine/aarch64-unix")
 STOCK_LINKS = ("dist.lock", "files/steampipe_fixups_mtime")
@@ -314,6 +316,15 @@ def valid_hashes(value):
     return isinstance(value, dict) and all(isinstance(value.get(rel), str) and SHA256.fullmatch(value[rel]) for rel in PACK_FILES)
 
 
+def valid_extras(value):
+    return isinstance(value, dict) and all(rel in EXTRA_FILES and isinstance(sha, str) and SHA256.fullmatch(sha)
+                                           for rel, sha in value.items())
+
+
+def pack_extras(pack):
+    return pack.get("extras") or {}
+
+
 def is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -323,6 +334,7 @@ def valid_pack(data, name=None):
         return False
     ident = data.get("id")
     copy = data.get("copy", list(DEFAULT_COPY))
+    extras = data.get("extras", {})
     return bool(isinstance(ident, str) and PACK_ID.fullmatch(ident) and (name is None or ident == name)
                 and isinstance(data.get("flavor"), str) and data["flavor"]
                 and is_int(data.get("rev"))
@@ -330,13 +342,15 @@ def valid_pack(data, name=None):
                 and valid_hashes(data.get("stock")) and valid_hashes(data.get("files"))
                 and isinstance(data.get("exports"), str) and isinstance(data.get("source_match"), bool)
                 and isinstance(copy, list) and all(valid_copy(rel) for rel in copy)
+                and valid_extras(extras) and not set(copy).intersection(extras)
                 and not data.get("revoked") and not data.get("ignored"))
 
 
 def read_pack(pack_dir, name=None):
     with open(os.path.join(pack_dir, "pack.json"), encoding="utf-8") as source:
         data = json.load(source)
-    if not valid_pack(data, name) or not all(os.path.isfile(os.path.join(pack_dir, rel)) for rel in PACK_FILES):
+    if not valid_pack(data, name) or not all(os.path.isfile(os.path.join(pack_dir, rel))
+                                             for rel in PACK_FILES + tuple(pack_extras(data))):
         raise ValueError("%s is not a usable droiddeck-esync pack" % pack_dir)
     return data
 
@@ -482,7 +496,7 @@ def intact(path, expected, cache):
 
 
 def plan(tool, base, pack):
-    real = set(PACK_FILES).union(pack.get("copy", DEFAULT_COPY))
+    real = set(PACK_FILES).union(pack.get("copy", DEFAULT_COPY), pack_extras(pack))
     links = {}
     for folder in REAL_DIRS:
         try:
@@ -507,7 +521,8 @@ def plan(tool, base, pack):
 def sync(dist, tool, base, pack, pack_dir, record, cache):
     links = plan(tool, base, pack)
     copy = list(pack.get("copy", DEFAULT_COPY))
-    real = set(PACK_FILES).union(copy)
+    extras = pack_extras(pack)
+    real = set(PACK_FILES).union(copy, extras)
     for folder in REAL_DIRS:
         path = os.path.join(dist, folder)
         if os.path.islink(path) or (os.path.lexists(path) and not os.path.isdir(path)):
@@ -529,10 +544,10 @@ def sync(dist, tool, base, pack, pack_dir, record, cache):
             current = None
         if current != target and not (current is None and os.path.isdir(path)):
             put_link(target, path)
-    for rel in PACK_FILES:
+    for rel, expected in [(rel, pack["files"][rel]) for rel in PACK_FILES] + sorted(extras.items()):
         path = os.path.join(dist, rel)
-        if not intact(path, pack["files"][rel], cache):
-            install(os.path.join(pack_dir, rel), path, pack["files"][rel])
+        if not intact(path, expected, cache):
+            install(os.path.join(pack_dir, rel), path, expected)
     previous = record.get("copies") if isinstance(record.get("copies"), dict) else {}
     copies = {}
     for rel in copy:
