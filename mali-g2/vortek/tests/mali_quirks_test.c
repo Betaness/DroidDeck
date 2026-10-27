@@ -9,11 +9,16 @@
  *           ordinary runtime condition that is false (mq_bound.spvasm); with MQ_ENGINE=DXVK
  *           (default) Winlator's removeImageBoundCheck sees it too
  *   linear  vkGetImageSubresourceLayout of LINEAR images of one row (Mali reports rowPitch 0)
- *   dmabuf  a LINEAR image created with VkExternalMemoryImageCreateInfo(DMA_BUF), which Mali refuses
+ *   dmabuf  images created with VkExternalMemoryImageCreateInfo(DMA_BUF), which Mali refuses (-1000158000):
+ *           passes when the format query refuses them too
+ *   wire    a triangle covering a 16x16 target drawn with VK_POLYGON_MODE_LINE (fillModeNonSolid,
+ *           which Mali lacks and Vortek reports): counts the lit pixels, an INFO line (r56p0 fills it
+ *           solid, as with VK_POLYGON_MODE_POINT; MQ_WIRE_MODE=1 point, 2 fill, which must pass)
  * MQ_PARTS (default all) picks parts, comma-separated; MQ_INLINE=1 hands the shaders to the pipelines
  * as VkShaderModuleCreateInfo in the stage's pNext (maintenance5) instead of modules; MQ_ENGINE sets
  * the engine name; MQ_FIX=1 applies ../src/spirv_spec_composite.h and ../src/linear_row_pitch.h
- * itself (to check them on the bare driver, as the in-process path uses them). Prints "MQ <part> PASS|FAIL ..." per part and exits 1 when one failed.
+ * itself (to check them on the bare driver, as the in-process path uses them).
+ * Prints "MQ <part> PASS|FAIL ..." per part and exits 1 when one failed.
  * Build: cc -O2 -o mali_quirks_test mali_quirks_test.c -lvulkan
  *        clang --target=aarch64-linux-android30 -O2 -o mali_quirks_test mali_quirks_test.c -lvulkan */
 #include <stdbool.h>
@@ -353,6 +358,82 @@ static void testBound(void) {
     freeImage(&rt[1]);
 }
 
+static void testWire(void) {
+    const uint32_t W = 16;
+    const char* m = getenv("MQ_WIRE_MODE");
+    VkPolygonMode mode = m && *m == '1' ? VK_POLYGON_MODE_POINT : m && *m == '2' ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE;
+    Img rt = image2d(W, W, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    HostBuf down = hostBuffer(W * W * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout layout;
+    CK(vkCreatePipelineLayout(dev, &lci, NULL, &layout));
+    VkAttachmentDescription att = {0, VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE,
+                                   VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL};
+    VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ref};
+    VkSubpassDependency dep = {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &att, 1, &sub, 1, &dep};
+    VkRenderPass rp;
+    CK(vkCreateRenderPass(dev, &rpci, NULL, &rp));
+    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &rt.view, W, W, 1};
+    VkFramebuffer fb;
+    CK(vkCreateFramebuffer(dev, &fci, NULL, &fb));
+    VkPipelineShaderStageCreateInfo st[2] = {stage(VK_SHADER_STAGE_VERTEX_BIT, mq_quad_spv, sizeof(mq_quad_spv), NULL),
+                                             stage(VK_SHADER_STAGE_FRAGMENT_BIT, mq_white_spv, sizeof(mq_white_spv), NULL)};
+    VkPipelineVertexInputStateCreateInfo vin = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkViewport vp = {0, 0, W, W, 0, 1};
+    VkRect2D sc = {{0, 0}, {W, W}};
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, &vp, 1, &sc};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = mode;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba = {0};
+    cba.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY, 1, &cba};
+    VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vin, &ia, NULL, &vps, &rs, &ms, NULL, &cb, NULL,
+                                        layout, rp, 0};
+    VkPipeline pipe;
+    VkResult r = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe);
+    dropStages(st, 2);
+    char d[160];
+    if (r == VK_SUCCESS) {
+        VkCommandBuffer cmd = beginCmd();
+        VkClearValue clear = {.color = {.float32 = {0, 0, 0, 0}}};
+        VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, {{0, 0}, {W, W}}, 1, &clear};
+        vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, W, 1}};
+        vkCmdCopyImageToBuffer(cmd, rt.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, down.buf, 1, &c);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        submitWait(cmd);
+        const uint8_t* px = down.map;
+        unsigned lit = 0;
+        for (uint32_t i = 0; i < W * W; i++) lit += px[i * 4] != 0;
+        /* fill lights all 256; the triangle's two edges inside the target, a row and a column, 31 */
+        unsigned want = mode == VK_POLYGON_MODE_FILL ? W * W : mode == VK_POLYGON_MODE_LINE ? 2 * W - 1 : 0;
+        snprintf(d, sizeof(d), "polygon mode %d: %u of %u pixels lit (lines: %u, fill: %u)", mode, lit, W * W, 2 * W - 1, W * W);
+        if (mode == VK_POLYGON_MODE_FILL) result("wire", lit == want, d);
+        else printf("MQ wire INFO %s: %s\n", d, lit == W * W ? "drawn solid" : lit == want ? "drawn as lines" : "other");
+        vkDestroyPipeline(dev, pipe, NULL);
+    } else {
+        snprintf(d, sizeof(d), "polygon mode %d: vkCreateGraphicsPipelines %d", mode, r);
+        result("wire", false, d);
+    }
+    vkDestroyFramebuffer(dev, fb, NULL);
+    vkDestroyRenderPass(dev, rp, NULL);
+    vkDestroyPipelineLayout(dev, layout, NULL);
+    freeHostBuffer(&down);
+    freeImage(&rt);
+}
+
 typedef struct { const char* name; VkImageType type; VkFormat format; uint32_t bpp, w, h, d, mips, layers, mip; } LinearCase;
 
 static void testLinear(void) {
@@ -410,21 +491,27 @@ static void testLinear(void) {
 }
 
 static void testDmabuf(void) {
-    VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {8, 8, 1}, 1, 1,
-                            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            VK_SHARING_MODE_EXCLUSIVE};
-    VkImage img;
-    VkResult r = vkCreateImage(dev, &ci, NULL, &img);
-    char d[160];
-    snprintf(d, sizeof(d), "LINEAR 8x8 RGBA8 with DMA_BUF handle type: vkCreateImage %d", r);
-    result("dmabuf", r == VK_SUCCESS, d);
-    if (r == VK_SUCCESS) {
-        VkSubresourceLayout l;
-        VkImageSubresource sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
-        vkGetImageSubresourceLayout(dev, img, &sub, &l);
-        printf("MQ dmabuf layout rowPitch %llu size %llu\n", (unsigned long long)l.rowPitch, (unsigned long long)l.size);
-        vkDestroyImage(dev, img, NULL);
+    static const VkImageTiling tilings[2] = {VK_IMAGE_TILING_LINEAR, VK_IMAGE_TILING_OPTIMAL};
+    for (int t = 0; t < 2; t++) {
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        VkPhysicalDeviceExternalImageFormatInfo extInfo = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, NULL,
+                                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        VkPhysicalDeviceImageFormatInfo2 fi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &extInfo, VK_FORMAT_R8G8B8A8_UNORM,
+                                               VK_IMAGE_TYPE_2D, tilings[t], usage};
+        VkExternalImageFormatProperties extProps = {VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+        VkImageFormatProperties2 fp = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &extProps};
+        VkResult q = vkGetPhysicalDeviceImageFormatProperties2(pd, &fi, &fp);
+        VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {8, 8, 1}, 1, 1,
+                                VK_SAMPLE_COUNT_1_BIT, tilings[t], usage, VK_SHARING_MODE_EXCLUSIVE};
+        VkImage img;
+        VkResult r = vkCreateImage(dev, &ci, NULL, &img);
+        if (r == VK_SUCCESS) vkDestroyImage(dev, img, NULL);
+        /* refusing a combination the format query also refuses is allowed; apps ask first */
+        char d[200];
+        snprintf(d, sizeof(d), "%s 8x8 RGBA8 with the DMA_BUF handle type: format query %d (features 0x%x), vkCreateImage %d",
+                 t ? "OPTIMAL" : "LINEAR", q, extProps.externalMemoryProperties.externalMemoryFeatures, r);
+        result("dmabuf", q != VK_SUCCESS || r == VK_SUCCESS, d);
     }
 }
 
@@ -469,6 +556,7 @@ int main(void) {
     if (part("bound")) testBound();
     if (part("linear")) testLinear();
     if (part("dmabuf")) testDmabuf();
+    if (part("wire")) testWire();
 
     vkDestroyCommandPool(dev, pool, NULL);
     vkDestroyDevice(dev, NULL);
