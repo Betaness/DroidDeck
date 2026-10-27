@@ -96,4 +96,18 @@ class LaunchCmdlineTest {
         File(root, "24022").deleteRecursively()
         assertTrue(ProcScanner.launches(scanner.scan()).isEmpty())
     }
+
+    @Test fun aYoungProcessIsReadAgainUntilWineHasRenamedIt() {
+        val root = tmp.newFolder("proc2")
+        proc(root, 300, listOf("/usr/bin/wine64-preloader", "wine64"), 600)
+        val scanner = ProcScanner(root, rereadScans = 3)
+        assertEquals("/usr/bin/wine64-preloader", scanner.scan().getValue(300).argv0)
+        proc(root, 300, listOf("C:\\AVA\\Binaries\\AVA.exe"), 600)
+        assertEquals(300, ProcScanner.gameProcess(scanner.scan(), "AVA.exe")?.pid)
+        // Settled processes and old ones are not read again.
+        proc(root, 301, listOf("/bin/bash"), 601)
+        repeat(5) { scanner.scan() }
+        proc(root, 301, listOf("C:\\late.exe"), 601)
+        assertEquals("/bin/bash", scanner.scan().getValue(301).argv0)
+    }
 }

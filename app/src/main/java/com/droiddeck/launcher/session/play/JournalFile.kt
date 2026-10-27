@@ -39,9 +39,30 @@ class JournalFile(
     @Synchronized
     fun append(record: Map<String, Any?>) {
         dir.mkdirs()
-        val text = line(record) + "\n"
+        // A line cut short (power lost mid-write) must not swallow the next record.
+        val text = (if (endsMidLine()) "\n" else "") + line(record) + "\n"
         plays.appendText(text, Charsets.UTF_8)
         if (plays.length() > capBytes) trim()
+    }
+
+    private fun endsMidLine(): Boolean = try {
+        java.io.RandomAccessFile(plays, "r").use { raf -> raf.length() > 0 && raf.let { it.seek(it.length() - 1); it.read() } != '\n'.code }
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Whether a play with this id is among the last records (a recovered play written twice otherwise). */
+    @Synchronized
+    fun hasPlay(id: String, tailBytes: Long = 256L * 1024): Boolean = try {
+        java.io.RandomAccessFile(plays, "r").use { raf ->
+            val from = maxOf(0L, raf.length() - tailBytes)
+            val buf = ByteArray((raf.length() - from).toInt())
+            raf.seek(from)
+            raf.readFully(buf)
+            String(buf, Charsets.UTF_8).contains(Json.write(mapOf("id" to id)).removePrefix("{").removeSuffix("}"))
+        }
+    } catch (_: Exception) {
+        false
     }
 
     @Synchronized

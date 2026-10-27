@@ -1204,6 +1204,8 @@ class FrontEndActivity : ComponentActivity() {
             com.droiddeck.launcher.session.LogMigration.run(this)
             com.droiddeck.launcher.frontend.GamesFolderMigration.run(this)
             SessionLogShare.clear(this)
+            // [mali-g2] Before finishAbandoned scrubs the logs open.json's offsets point into.
+            runCatching { com.droiddeck.launcher.session.play.PlayJournal.recover(this) }
             SessionArtifacts.finishAbandoned(this)
             SessionArtifacts.scrubOlder(this)
             SessionArtifacts.prune(this)

@@ -414,8 +414,15 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val output = glassesScreen?.display
             ?: (if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay) ?: return
         if (output.displayId != displayId) return
+        // [mali-g2] Each change of the panel's rate goes on the play journal's timeline.
+        val hz = kotlin.math.round(output.mode.refreshRate).toInt()
+        if (hz != journalHz) {
+            journalHz = hz
+            com.droiddeck.launcher.session.play.PlayJournal.displayHz(hz)
+        }
         applyOutputPacing()
     }
+    private var journalHz = 0
     private var isHomeApp by mutableStateOf(false)
     private var androidApps by mutableStateOf<List<HomeApp.LaunchableApp>>(emptyList())
 

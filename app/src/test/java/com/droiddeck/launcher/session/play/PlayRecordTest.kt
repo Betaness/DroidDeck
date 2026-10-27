@@ -63,7 +63,8 @@ class PlayRecordTest {
     @Test fun aFullRecordHasEveryField() {
         val r = finished()
         assertEquals(listOf("v", "type", "id", "logs", "app", "appid", "game", "exe", "launch", "relaunchOf", "start", "end", "durS",
-            "focusedS", "exit", "flags", "gpu", "env", "settings", "display", "fps", "hz", "thermal", "cpu", "mibridge", "mem", "errors", "marks"),
+            "focusedS", "exit", "flags", "gpu", "env", "settings", "display", "fps", "hz", "thermal", "cpu", "mibridge", "mem", "errors", "marks",
+            "timeline", "scanned"),
             r.keys.toList())
         assertEquals("2026-10-28T01:17:32+11:00", r["start"])
         assertEquals(1830L, r["durS"])
@@ -86,6 +87,48 @@ class PlayRecordTest {
         assertEquals(2210L, mem["gameHwmMB"])
         assertEquals(120L, mem["appNativeMaxMB"])
         assertEquals(listOf(mapOf("atS" to 1210L, "t" to "2026-10-28T01:37:42+11:00")), r["marks"])
+    }
+
+    @Test fun theTimelineFoldsRefreshRateFlipsAndTakesTheLogsFirstTimes() {
+        val s = play()
+        s.event(t0 + 30_000, "focus away (769)")
+        s.event(t0 + 45_000, "focus back")
+        for (i in 0 until 12) s.event(t0 + 100_000 + i * 4_000L, if (i % 2 == 0) "hz 60" else "hz 120")
+        s.event(t0 + 400_000, "hz 60")
+        val end = t0 + 1_830_000
+        val r = PlayRecord.base(s, end, zone)
+        val log = tmp.newFile("steam-1.log").apply {
+            writeText("hybris-x11: window 0x4c00058 1024x768 now hidden, frames paced (t=1000.000)\n")
+        }
+        val uptimeToWall = t0 + 600_000 - 1_000_000
+        val f = LogSliceScanner(uptimeToWallMs = uptimeToWall).scan(listOf(LogSliceScanner.Source("steam-1.log", log)))
+        val exit = ExitClassifier.classify(PlayRecord.evidenceFrom(PlayRecord.evidence(s, end), f, usedVortek = false))
+        PlayRecord.finish(r, f, exit, zone, startMs = t0)
+        assertEquals(listOf(
+            listOf(30L, "focus away (769)"), listOf(45L, "focus back"), listOf(100L, "hz 120", 12),
+            listOf(400L, "hz 60"), listOf(600L, "hidden"),
+        ), r["timeline"])
+        assertTrue("hidden_paced" in exit.flags)
+        val errors = r["errors"] as List<*>
+        assertEquals(600L, (errors[0] as Map<*, *>)["atS"])
+        assertEquals("hidden-paced", ((r["display"] as Map<*, *>)["present"] as String).substringAfter("+"))
+    }
+
+    @Test fun aCopyPathPlayHasNoFrameTimes() {
+        val s = PlayState("x#1", "x", 1473480, "A.V.A.", "AVA/ava.exe", "steam", t0)
+        var screen = 0L
+        for (i in 0..120) {
+            s.acc.add(Sample(t0 + i * 5000L, true, true, false, 0L, 120f, 120f, screenFrames = screen))
+            screen += 600
+        }
+        FrameTimes.addInto(s.hist, IntArray(FrameTimes.BINS).also { it[FrameTimes.bin(3_400_000)] = 3 })
+        val r = PlayRecord.base(s, t0 + 600_000, zone)
+        val fps = r["fps"] as Map<*, *>
+        assertEquals("screen", fps["source"])
+        assertEquals(120.0, fps["mean"] as Double, 0.5)
+        assertNull(fps["low1"])
+        assertNull(fps["longestStallS"])
+        assertEquals(0L, fps["freezeS"])
     }
 
     @Test fun theRecordSurvivesRedactionUnchangedAndItsErrorLinesAreScrubbed() {

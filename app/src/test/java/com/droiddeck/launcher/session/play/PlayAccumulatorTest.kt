@@ -11,14 +11,18 @@ class PlayAccumulatorTest {
     private fun run(
         acc: PlayAccumulator, fromS: Int, toS: Int, fps: Int, frames0: Long, focused: Boolean = true,
         visible: Boolean = true, suspended: Boolean = false, modeHz: Float = 120f, wantedHz: Float = 120f,
-        status: Int = 0, skin: Float? = null, cpuRefused: Boolean = false,
+        status: Int = 0, skin: Float? = null, cpuRefused: Boolean = false, limitHz: Int? = null,
+        screenFps: Int? = null, screen0: Long = 0,
     ): Long {
         var frames = frames0
+        var screen = screen0
         var s = fromS
         while (s <= toS) {
-            acc.add(Sample(t0 + s * 1000L, focused, visible, suspended, frames, modeHz, wantedHz, null, status, null, skin, null, 30f,
-                intArrayOf(2000, 2800, 3100), intArrayOf(3600, 2400, 4200), mapOf("cpu" to if (cpuRefused) -1 else 0, "gpu" to 0)))
+            acc.add(Sample(t0 + s * 1000L, focused, visible, suspended, frames, modeHz, wantedHz, limitHz, status, null, skin, null, 30f,
+                intArrayOf(2000, 2800, 3100), intArrayOf(3600, 2400, 4200), mapOf("cpu" to if (cpuRefused) -1 else 0, "gpu" to 0),
+                screenFps?.let { screen }))
             frames += fps * 5L
+            screen += (screenFps ?: 0) * 5L
             s += 5
         }
         return frames - fps * 5L
@@ -55,6 +59,14 @@ class PlayAccumulatorTest {
         f = run(acc, 125, 165, 0, f + 300)
         run(acc, 170, 200, 60, f + 300)
         assertEquals(40L, acc.longestZeroRunMs / 1000)
+        assertEquals(40L, acc.longestZeroRunAfterLoadMs / 1000)
+        // The same 40 s inside the first two minutes is loading.
+        val early = PlayAccumulator(t0)
+        f = run(early, 0, 20, 60, 0)
+        f = run(early, 25, 65, 0, f + 300)
+        run(early, 70, 100, 60, f + 300)
+        assertEquals(40L, early.longestZeroRunMs / 1000)
+        assertEquals(0L, early.longestZeroRunAfterLoadMs)
     }
 
     @Test fun sixtyHertzIsAttributedToTheAppTheHeatOrTheSystem() {
@@ -63,18 +75,100 @@ class PlayAccumulatorTest {
         f = run(acc, 65, 120, 60, f + 300, modeHz = 60f, wantedHz = 60f) // asked for 60 (fps cap)
         f = run(acc, 125, 180, 60, f + 300, modeHz = 60f, skin = 42f)    // hot
         f = run(acc, 185, 240, 60, f + 300, modeHz = 60f, cpuRefused = true) // MiBridge refusing the CPU: hot board
-        run(acc, 245, 300, 60, f + 300, modeHz = 60f)                     // no reason seen
+        run(acc, 245, 300, 60, f + 300, modeHz = 60f)                     // no reason seen, nothing to tell
         val share = acc.at60Share()!!
         assertEquals(0.8, share, 0.03)
         val why = acc.at60Why()
         assertEquals(0.2, why.getValue("app"), 0.03)
         assertEquals(0.4, why.getValue("thermal"), 0.03)
-        assertEquals(0.2, why.getValue("system"), 0.03)
-        assertEquals(listOf(120, 60, 60, 60, 60, 60), acc.perMinuteHz())
+        assertEquals(0.0, why.getValue("system"), 0.03)
+        assertEquals(0.2, why.getValue("unknown"), 0.03)
+        assertEquals(listOf(120, 60, 60, 60, 60, null), acc.perMinuteHz())
         assertEquals(0.8, acc.mibridgeShares().getValue("cpu"), 0.02)
         assertEquals(1.0, acc.mibridgeShares().getValue("gpu"), 0.0)
         assertEquals(listOf(2000, 2800, 3100), acc.cpuMeanMHz())
         assertEquals(listOf(3600, 2400, 4200), acc.cpuCapMinMHz())
+    }
+
+    @Test fun powerKeepersCapComesBeforeTheSessionsWishAndACoolProbeSaysSystem() {
+        val acc = PlayAccumulator(t0)
+        // peak_refresh_rate lowered by the heat makes the wanted rate 60 too: the cap says why.
+        var f = run(acc, 0, 60, 60, 0, modeHz = 60f, wantedHz = 60f, limitHz = 60)
+        run(acc, 65, 120, 60, f + 300, modeHz = 60f, limitHz = 0, skin = 36f)
+        val why = acc.at60Why()
+        assertEquals(0.5, why.getValue("thermal"), 0.05)
+        assertEquals(0.5, why.getValue("system"), 0.05)
+        assertEquals(0.0, why.getValue("app"), 0.0)
+    }
+
+    @Test fun refreshRateFlippingWithinAMinuteReadsAsItsMean() {
+        val acc = PlayAccumulator(t0)
+        var frames = 0L
+        for (i in 0..24) {
+            acc.add(Sample(t0 + i * 5000L, true, true, false, frames, if (i % 2 == 0) 60f else 120f, 120f))
+            frames += 300
+        }
+        assertEquals(90.0, acc.perMinuteHz()[0]!!.toDouble(), 5.0)
+        assertEquals(0.5, acc.at60Share()!!, 0.05)
+    }
+
+    @Test fun aGameDrawnThroughX11IsCountedFromTheCompositor() {
+        // A.V.A. (1473480): no game-layer frames, the compositor shows ~120 fps of it.
+        val acc = PlayAccumulator(t0)
+        run(acc, 0, 600, 0, 0, screenFps = 120)
+        assertEquals("screen", acc.source())
+        assertEquals(120.0, acc.meanFps()!!, 0.5)
+        assertEquals(120.0, acc.composedFps()!!, 0.5)
+        assertEquals(0L, acc.longestZeroRunMs)
+        assertEquals(120.0, acc.perMinuteFps()[3]!!, 0.5)
+    }
+
+    @Test fun aZeroCopyGameIsCountedFromItsLayer() {
+        val acc = PlayAccumulator(t0)
+        run(acc, 0, 300, 76, 0, screenFps = 0)
+        assertEquals("game-layer", acc.source())
+        assertEquals(76.0, acc.meanFps()!!, 0.5)
+        assertEquals(0.0, acc.composedFps()!!, 0.01)
+    }
+
+    @Test fun aFreezeNeedsBothTheLayerAndTheCompositorStill() {
+        val acc = PlayAccumulator(t0)
+        var f = run(acc, 0, 60, 60, 0, screenFps = 0)
+        // The game's layer gone for a minute while the compositor draws it: not frozen.
+        run(acc, 65, 125, 0, f, screenFps = 60, screen0 = 300)
+        assertEquals(0L, acc.longestZeroRunMs)
+        val frozen = PlayAccumulator(t0)
+        f = run(frozen, 0, 60, 60, 0, screenFps = 0)
+        run(frozen, 65, 125, 0, f, screenFps = 0)
+        assertEquals(65L, frozen.longestZeroRunMs / 1000)
+        assertEquals(60_000L, frozen.longestZeroRunAtMs)
+    }
+
+    @Test fun framesWhileTheGameWasNotFocusedDoNotStartTheClock() {
+        // Steam's UI drawing before the game shows: the game's own loading time is not a freeze.
+        val acc = PlayAccumulator(t0)
+        var f = run(acc, 0, 30, 60, 0, focused = false)
+        f = run(acc, 35, 90, 0, f, focused = true)
+        run(acc, 95, 150, 60, f)
+        assertEquals(0L, acc.longestZeroRunMs)
+        assertEquals(t0 + 95_000, acc.firstFrameAt)
+    }
+
+    @Test fun cpufreqReadsThatFailedAreLeftOut() {
+        val acc = PlayAccumulator(t0)
+        acc.add(Sample(t0, true, true, false, 0, cpuMHz = intArrayOf(0, 2000), capMHz = intArrayOf(0, 3000)))
+        acc.add(Sample(t0 + 5000, true, true, false, 0, cpuMHz = intArrayOf(0, 1000), capMHz = intArrayOf(0, 2000)))
+        assertEquals(listOf(null, 1500), acc.cpuMeanMHz())
+        assertEquals(listOf(null, 2000), acc.cpuCapMinMHz())
+    }
+
+    @Test fun memoryPerMinute() {
+        val acc = PlayAccumulator(t0)
+        acc.memory(gameAnonKb = 1_183_000, atMs = t0 + 10_000)
+        acc.memory(gameAnonKb = 1_190_000, vortekAnonKb = 300_000, atMs = t0 + 70_000)
+        acc.memory(gameAnonKb = 1_224_000, atMs = t0 + 130_000)
+        assertEquals(listOf(1155L, 1162L, 1195L), acc.perMinuteGameAnonMB())
+        assertEquals(listOf(null, 293L, null), acc.perMinuteVortekAnonMB())
     }
 
     @Test fun lowFpsAfterTheFirstMinute() {

@@ -34,6 +34,33 @@ class PlayState(
     var shellSeen = false
     var endMs: Long? = null
     var sources: List<LogSliceScanner.Source> = emptyList()
+    /** What happened when, in seconds into the play: focus, refresh rate, heat, marks, the server's death. */
+    val timeline = ArrayList<MutableList<Any?>>()
+    var timelineDropped = 0
+    /** The game's own logs found so far (label, file). */
+    @Volatile var gameLogs: List<Pair<String, java.io.File>> = emptyList()
+    var wasFocused = true
+    var wasShown = true
+    /** Wall time minus CLOCK_MONOTONIC when the play started, for the X11 layers' "(t=...)" stamps. */
+    var uptimeToWallMs: Long? = null
+
+    fun event(atMs: Long, what: String) {
+        val atS = ((atMs - startMs) / 1000).coerceAtLeast(0)
+        // Refresh-rate switches every few seconds (PowerKeeper hovering at its limit) fold into one entry a minute.
+        val last = timeline.lastOrNull()
+        if (what.startsWith("hz ") && last != null && (last[1] as String).startsWith("hz ") && atS - (last[0] as Long) < 60) {
+            val n = (last.getOrNull(2) as? Int ?: 1) + 1
+            last[1] = what
+            if (last.size > 2) last[2] = n else last.add(n)
+            return
+        }
+        if (timeline.size >= MAX_TIMELINE) { timelineDropped++; return }
+        timeline.add(mutableListOf(atS, what))
+    }
+
+    companion object {
+        const val MAX_TIMELINE = 48
+    }
 }
 
 /**
@@ -73,24 +100,29 @@ object PlayRecord {
         r["env"] = s.env
         r["settings"] = s.settings
         r["display"] = LinkedHashMap(s.display)
-        val gameLayer = a.countedFrames > 0 || stats.frames > 0
+        val source = a.source()
+        // Frame times are the game layer's: they say nothing about a game drawn through X11.
+        val layer = source == "game-layer"
         r["fps"] = linkedMapOf(
-            "source" to if (gameLayer) "game-layer" else null,
+            "source" to source,
             "mean" to a.meanFps(),
             "meanAfter1m" to a.meanFpsAfterWarmup(),
-            "low1" to stats.low1,
-            "low5" to stats.low5,
-            "ftP50" to stats.ftP50,
-            "ftP90" to stats.ftP90,
-            "ftP99" to stats.ftP99,
+            "low1" to stats.low1.takeIf { layer },
+            "low5" to stats.low5.takeIf { layer },
+            "ftP50" to stats.ftP50.takeIf { layer },
+            "ftP90" to stats.ftP90.takeIf { layer },
+            "ftP99" to stats.ftP99.takeIf { layer },
             "frames" to a.countedFrames,
+            "layerFrames" to a.countedLayerFrames,
+            "composedFps" to a.composedFps(),
             "countedS" to a.countingMs / 1000,
-            "stalls" to stats.stalls,
-            "longestStallS" to stats.longestStallS,
+            "stalls" to stats.stalls.takeIf { layer },
+            "longestStallS" to stats.longestStallS.takeIf { layer },
             "freezeS" to a.longestZeroRunMs / 1000,
+            "freezeAtS" to a.longestZeroRunAtMs?.takeIf { a.longestZeroRunMs >= 30_000 }?.let { it / 1000 },
             "perMin" to a.perMinuteFps(),
         )
-        r["hz"] = linkedMapOf("at60" to a.at60Share(), "why" to a.at60Why(), "perMin" to a.perMinuteHz())
+        r["hz"] = linkedMapOf("at60" to a.at60Share(), "why" to a.at60Why(), "switches" to a.hzSwitches, "perMin" to a.perMinuteHz())
         r["thermal"] = linkedMapOf(
             "statusMax" to a.statusMax?.let(::thermalName),
             "headroomMax" to a.headroomMax?.let { PlayAccumulator.r2(it.toDouble()) },
@@ -114,9 +146,13 @@ object PlayRecord {
             "appNativeMaxMB" to a.appNativeMaxBytes.takeIf { it > 0 }?.let { it shr 20 },
             "availMinMB" to a.availMinBytes?.let { it shr 20 },
             "lowMemory" to a.lowMemory,
+            "anonPerMin" to a.perMinuteGameAnonMB().takeIf { l -> l.any { it != null } },
+            "vortekAnonPerMin" to a.perMinuteVortekAnonMB().takeIf { l -> l.any { it != null } },
         )
         r["errors"] = emptyList<Any>()
         r["marks"] = s.marks.map { (atS, t) -> linkedMapOf("atS" to atS, "t" to iso(t, zone)) }
+        r["timeline"] = s.timeline.map { ArrayList(it) }
+        if (s.timelineDropped > 0) r["timelineDropped"] = s.timelineDropped
         return r
     }
 
@@ -141,18 +177,24 @@ object PlayRecord {
     fun evidence(s: PlayState, endMs: Long): LinkedHashMap<String, Any?> {
         val stats = FrameStats.of(s.hist)
         val a = s.acc
+        val layer = a.source() == "game-layer"
         return linkedMapOf(
+            "startMs" to s.startMs,
             "durS" to (endMs - s.startMs) / 1000,
             "gameFrames" to a.countedFrames,
             "zeroRunS" to a.longestZeroRunMs / 1000,
-            "longestStallS" to stats.longestStallS,
+            "zeroRunAfterLoadS" to a.longestZeroRunAfterLoadMs / 1000,
+            "screenCounted" to a.screenCounterSeen,
+            "longestStallS" to stats.longestStallS.takeIf { layer },
             "meanAfter1m" to a.meanFpsAfterWarmup(),
-            "low1" to stats.low1,
+            "low1" to stats.low1.takeIf { layer },
+            "fpsLimit" to (s.display["fpsLimit"] as? Number)?.toInt(),
             "at60" to a.at60Share(),
             "at60Thermal" to a.at60Why()["thermal"],
             "marked" to s.marks.isNotEmpty(),
             "vortekExit" to s.vortekExit,
             "vortekToEndS" to s.vortekExitAtMs?.let { (endMs - it) / 1000 },
+            "uptimeToWallMs" to s.uptimeToWallMs,
             "runMode" to (s.launch != "steam"),
         )
     }
@@ -174,8 +216,10 @@ object PlayRecord {
         findings = findings,
         steamExitCode = findings?.steamExitCode,
         gameFrames = m.long("gameFrames"),
-        screenFramesSeen = findings?.screenFrames?.any { it > 0 } ?: false,
+        // With the compositor's live count, gameFrames holds composited frames already; the [stats] lines are the whole session's.
+        screenFramesSeen = m["screenCounted"] != true && (findings?.screenFrames?.any { it > 0 } ?: false),
         longestZeroRunS = m.long("zeroRunS") ?: 0L,
+        zeroRunAfterLoadS = m.long("zeroRunAfterLoadS") ?: m.long("zeroRunS") ?: 0L,
         longestStallS = m.dbl("longestStallS"),
         meanFpsAfterWarmup = m.dbl("meanAfter1m"),
         low1 = m.dbl("low1"),
@@ -183,10 +227,17 @@ object PlayRecord {
         at60Thermal = m.dbl("at60Thermal"),
         marked = m["marked"] == true,
         runMode = m["runMode"] == true,
+        fpsLimit = m.long("fpsLimit")?.toInt(),
     )
 
+    /** Kinds whose first time in the game's logs goes on the timeline. */
+    private val TIMELINE_KINDS = listOf("hidden", "x11_copy", "unsupported", "device_lost", "oom", "crash", "vortek")
+
     @Suppress("UNCHECKED_CAST")
-    fun finish(r: MutableMap<String, Any?>, f: LogSliceScanner.Findings?, exit: ExitClassifier.Exit, zone: TimeZone = TimeZone.getDefault()) {
+    fun finish(
+        r: MutableMap<String, Any?>, f: LogSliceScanner.Findings?, exit: ExitClassifier.Exit,
+        zone: TimeZone = TimeZone.getDefault(), startMs: Long? = null,
+    ) {
         r["exit"] = linkedMapOf(
             "reason" to exit.reason,
             "steamCode" to exit.steamCode,
@@ -199,10 +250,12 @@ object PlayRecord {
         )
         r["flags"] = exit.flags
         if (f == null) return
+        val fpsSource = (r["fps"] as? Map<String, Any?>)?.get("source")
         (r["gpu"] as? Map<String, Any?>)?.let { g ->
             r["gpu"] = LinkedHashMap(g).apply {
                 if (f.gpuUsed != null) put("used", f.gpuUsed)
-                put("renderer", f.renderer)
+                if (f.software) put("used", "cpu")
+                put("renderer", f.renderer ?: f.device)
                 put("dxvk", f.dxvk)
             }
         }
@@ -211,20 +264,38 @@ object PlayRecord {
                 val chains = f.swapchains()
                 put("swapchain", chains.firstOrNull())
                 if (chains.size > 1) put("swapchains", chains.take(5))
+                put("present", listOfNotNull(
+                    "zero-copy".takeIf { fpsSource == "game-layer" },
+                    "x11-copy".takeIf { fpsSource == "screen" || f.inGame("x11_copy") },
+                    "hidden-paced".takeIf { f.inGame("hidden") },
+                ).joinToString("+").ifEmpty { null })
             }
         }
         (r["fps"] as? Map<String, Any?>)?.let { fps ->
             r["fps"] = LinkedHashMap(fps).apply {
-                if (f.screenFrames.isNotEmpty()) put("screenFps", PlayAccumulator.r1(f.screenFrames.average() / 10.0))
+                // The [stats] lines' rate covers the whole slice (Steam's UI, after the game): only a stand-in.
+                if (get("composedFps") == null && f.screenFrames.isNotEmpty()) put("statsFps", PlayAccumulator.r1(f.screenFrames.average() / 10.0))
                 if (f.x11Fps.isNotEmpty()) put("x11Fps", PlayAccumulator.r1(f.x11Fps.average()))
                 if (get("source") == null) put("source", when {
                     f.x11Fps.isNotEmpty() -> "x11-stats"
-                    f.screenFrames.isNotEmpty() -> "screen"
+                    f.screenFrames.isNotEmpty() -> "stats"
                     else -> null
                 })
             }
         }
         (r["cpu"] as? Map<String, Any?>)?.let { c -> r["cpu"] = LinkedHashMap(c).apply { put("steers", f.steers) } }
-        r["errors"] = f.errors.map { (k, v) -> linkedMapOf("k" to k, "n" to v.n, "first" to v.first) }
+        fun atS(ms: Long?): Long? = if (ms == null || startMs == null) null else (ms - startMs) / 1000
+        r["errors"] = f.errors.map { (k, v) ->
+            linkedMapOf("k" to k, "n" to v.n, "atS" to atS(v.firstAtMs), "game" to f.inGame(k), "first" to v.first)
+        }
+        r["scanned"] = f.sources.distinct()
+        if (startMs != null) {
+            val events = (r["timeline"] as? List<*>)?.filterIsInstance<List<Any?>>()?.map { ArrayList(it) } ?: emptyList()
+            val more = TIMELINE_KINDS.mapNotNull { k ->
+                val at = atS(f.errors[k]?.firstAtMs)?.takeIf { it >= 0 && f.inGame(k) } ?: return@mapNotNull null
+                arrayListOf<Any?>(at, k)
+            }
+            if (more.isNotEmpty()) r["timeline"] = (events + more).sortedBy { (it[0] as Number).toLong() }
+        }
     }
 }

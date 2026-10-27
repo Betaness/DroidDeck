@@ -39,12 +39,12 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * Cost while playing: the compositor bumps a histogram per game frame ([FrameTimes]); every 5 s a background
  * thread lists this app's processes (argv read once per new pid), reads three cpufreq files and some
- * volatile fields; every 30 s it reads two /proc status files, the memory info and the thermal headroom.
- * The logs are read only after a play has ended ([LogSliceScanner]).
+ * volatile fields; every 30 s it reads two /proc status files, the memory info and the thermal headroom,
+ * and lists the game's log folders. The logs are read only after a play has ended ([LogSliceScanner]).
  *
  * A play is one Steam launch (the wrapper's argv carries `SteamLaunch AppId=`), or the whole session for a
- * game run directly (MODE_RUN). A play still open when the app dies is in open.json (rewritten every
- * minute) and is recorded at the next session start ([recover]).
+ * game run directly (MODE_RUN). A play still open when the app dies is in open.json (written when it starts
+ * and every minute) and is recorded when the app next starts ([recover]).
  */
 object PlayJournal {
     private const val TAG = "PlayJournal"
@@ -71,6 +71,7 @@ object PlayJournal {
     private val open = LinkedHashMap<Long, PlayState>()
     private val counting = HashMap<Long, Boolean>()
     private val windows = HashMap<Long, MutableSet<String>>()
+    private val prefixes = HashMap<Long, File?>()
     private var playCount = 0
     private var lastEnded: Triple<Long, String, Long>? = null // appid, id, end
     private var focusedApp: Long? = null
@@ -84,7 +85,9 @@ object PlayJournal {
     private var headroom: Float? = null
     private var running = false
     private var policies: List<File> = emptyList()
-    private var logFiles: List<Pair<String, File>> = emptyList()
+    @Volatile private var logFiles: List<Pair<String, File>> = emptyList()
+    /** The session's logs and the open plays' game logs: their lengths when the session is asked to stop end the slices. */
+    @Volatile private var watched: List<File> = emptyList()
     /** The logs' lengths at the tick before: a launch is seen up to a tick late, and its first lines matter. */
     private var lengthsBefore: Map<String, Long> = emptyMap()
     private val clkTck: Long by lazy {
@@ -125,10 +128,13 @@ object PlayJournal {
             mode = sessionMode
             program = sessionProgram
             journal = journalFor(ctx)
+            // Mid-session records go out before the session's collect, which is where the redactor learns otherwise.
+            runCatching { LogRedactor.learnFromRuntime(LinuxRuntime.rootDir(ctx)) }
             scanner = ProcScanner()
             open.clear()
             counting.clear()
             windows.clear()
+            prefixes.clear()
             playCount = 0
             focusedApp = null
             focusableSeen.clear()
@@ -149,6 +155,7 @@ object PlayJournal {
                 "gameprocess_log.txt" to File(SessionPrefs.activeSteamRoot(ctx), "logs/gameprocess_log.txt"),
             )
             lengthsBefore = logFiles.associate { (label, f) -> label to f.length() }
+            watched = logFiles.map { it.second }
             if (sessionMode == SessionService.MODE_RUN) openRun(System.currentTimeMillis())
             thread().removeCallbacks(tickRunnable)
             thread().postDelayed(tickRunnable, TICK_MS)
@@ -170,28 +177,57 @@ object PlayJournal {
         focusedApp = focused
         focusableSeen.addAll(focusable)
         focused?.let { focusableSeen.add(it) }
-        for ((k, s) in open) counting[k] = focused(s) && SessionState.visible && !SessionState.suspended
+        for ((k, s) in open) {
+            val f = focused(s)
+            if (f != s.wasFocused) { s.event(now, if (f) "focus back" else "focus away" + (focused?.let { " ($it)" } ?: "")); s.wasFocused = f }
+            counting[k] = f && SessionState.visible && !SessionState.suspended
+        }
+    }
+
+    /** The display's mode changed (SessionActivity's "perf: display N Hz"). */
+    fun displayHz(hz: Int) = post {
+        if (!running) return@post
+        val now = System.currentTimeMillis()
+        for (s in open.values) { s.acc.hzSwitched(); s.event(now, "hz $hz") }
     }
 
     fun vortekExited(status: Int) = post {
         val now = System.currentTimeMillis()
-        for (s in open.values) if (s.vortekExit == null) { s.vortekExit = status; s.vortekExitAtMs = now }
+        for (s in open.values) if (s.vortekExit == null) {
+            s.vortekExit = status
+            s.vortekExitAtMs = now
+            s.event(now, "vortek-server exited $status")
+        }
     }
 
-    /** At the start of stopSession, while the guest still runs. */
-    fun sessionStopping(status: Int, failureCode: String?) = post {
-        if (!running) return@post
-        val now = System.currentTimeMillis()
-        if (open.isNotEmpty()) sample(now, slow = false)
-        val alive = if (mode == SessionService.MODE_RUN) emptySet() else ProcScanner.launches(scanner.scan()).keys
-        for (k in open.keys.toList()) {
-            val s = open[k] ?: continue
-            when {
-                k == RUN_KEY -> finish(s, now, End(runStatus = status, failureCode = failureCode))
-                k in alive -> finish(s, now, End(stopped = true, sessionStatus = status, failureCode = failureCode))
-                else -> finish(s, now, End())
+    /**
+     * At the start of stopSession, while the guest still runs: the logs' lengths now end the plays' slices
+     * (the teardown that follows kills vortek-server and the game, whose last lines are not about the play).
+     * [ownerStopped]: the owner or the system ended the session, not the guest exiting on its own.
+     */
+    fun sessionStopping(status: Int, failureCode: String?, ownerStopped: Boolean) {
+        val cutMs = System.currentTimeMillis()
+        val cut = watched.associate { it.path to it.length() }
+        post {
+            if (!running) return@post
+            val now = System.currentTimeMillis()
+            if (open.isNotEmpty()) sample(now, slow = false)
+            val alive = if (mode == SessionService.MODE_RUN) emptySet() else ProcScanner.launches(scanner.scan()).keys
+            val stop = Cut(cut, cutMs)
+            for (k in open.keys.toList()) {
+                val s = open[k] ?: continue
+                when {
+                    k == RUN_KEY && ownerStopped -> finish(s, now, End(stopped = true, sessionStatus = status, failureCode = failureCode), stop)
+                    k == RUN_KEY -> finish(s, now, End(runStatus = status, failureCode = failureCode), stop)
+                    k in alive -> finish(s, now, End(stopped = true, sessionStatus = status, failureCode = failureCode), stop)
+                    else -> finish(s, now, End(), stop)
+                }
             }
+            stopTracking()
         }
+    }
+
+    private fun stopTracking() {
         running = false
         handler?.removeCallbacks(tickRunnable)
         unlistenThermal()
@@ -238,7 +274,7 @@ object PlayJournal {
                 "batteryC" to batteryC(),
             )
             journal?.append(m)
-            for (p in open.values) p.marks += (now - p.startMs) / 1000 to now
+            for (p in open.values) { p.marks += (now - p.startMs) / 1000 to now; p.event(now, "mark") }
             KeepMarker.extend(d, now + MARK_KEEP_MS, listOf("marked"))
             checkpoint(now)
             Log.i(TAG, "marked: something went wrong at ${PlayRecord.iso(now)}" + (s?.let { " in ${it.game}" } ?: "") +
@@ -270,7 +306,8 @@ object PlayJournal {
         }
         val entries = scanner.scan()
         val launches = ProcScanner.launches(entries)
-        val gone = open.filterKeys { it !in launches }.values.toList()
+        // Gone, or relaunched between two scans (Steam restarting the game, an update): none of the launch's processes left.
+        val gone = open.filter { (appid, s) -> launches[appid]?.let { g -> g.pids.none { it in s.pids } } ?: true }.values.toList()
         if (gone.isNotEmpty()) sample(now, slow = false)
         for (s in gone) finish(s, now, End())
         for ((appid, s) in open) {
@@ -280,6 +317,14 @@ object PlayJournal {
         }
         for ((appid, g) in launches) if (appid !in open) openSteam(g, entries, now)
         lengthsBefore = logFiles.associate { (label, f) -> label to f.length() }
+    }
+
+    /** The open plays' own logs (Player.log, steam-<appid>.log), looked for again on slow ticks. */
+    private fun findGameLogs(s: PlayState) {
+        val ctx = app ?: return
+        val appid = s.appid ?: return
+        s.gameLogs = gameLogFiles(ctx, appid, s.startMs - 5_000)
+        watched = logFiles.map { it.second } + open.values.flatMap { p -> p.gameLogs.map { it.second } }
     }
 
     private fun resolveGame(s: PlayState, entries: Map<Int, ProcScanner.Entry>, now: Long) {
@@ -317,7 +362,10 @@ object PlayJournal {
         counting[g.appid] = false
         FrameTimes.forgetGap()
         resolveGame(s, entries, now)
+        findGameLogs(s)
         Log.i(TAG, "play ${s.id}: ${g.appid} $name started")
+        // In open.json from the start: a play the app dies in within its first minute is the one most worth a record.
+        checkpoint(now)
     }
 
     private fun openRun(now: Long) {
@@ -334,9 +382,11 @@ object PlayJournal {
         counting[RUN_KEY] = true
         FrameTimes.forgetGap()
         Log.i(TAG, "play ${s.id}: $name started")
+        checkpoint(now)
     }
 
     private fun prepare(ctx: Context, s: PlayState) {
+        s.uptimeToWallMs = uptimeToWall()
         s.app = linkedMapOf(
             "version" to "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
             "commit" to BuildConfig.SOURCE_COMMIT.take(12),
@@ -348,12 +398,17 @@ object PlayJournal {
     }
 
     private fun display(ctx: Context): Map<String, Any?> {
-        val panel = displayNow(ctx)?.mode?.let { "${it.physicalWidth}x${it.physicalHeight}" }
+        val panelMode = displayNow(ctx)?.mode
+        val panel = panelMode?.let { "${it.physicalWidth}x${it.physicalHeight}" }
         val size = SessionState.outputSize
+        // The setting the session read (MODE_RUN reads Steam's or the desktop's), its default when never chosen.
+        val choice = runCatching {
+            val m = SessionPrefs.displayMode(ctx, SessionState.mode, program)
+            SessionPrefs.resolutionChoice(ctx, m, (panelMode?.physicalWidth ?: size.first) to (panelMode?.physicalHeight ?: size.second))
+        }.getOrNull()
         return linkedMapOf(
             "render" to "${size.first}x${size.second}",
-            "choice" to ctx.getSharedPreferences("session", Context.MODE_PRIVATE)
-                .getString("displayResolution.${SessionState.mode}", null),
+            "choice" to choice,
             "panel" to panel,
             "swapchain" to null,
             "window" to if (SessionState.freeform) "freeform" else "fullscreen",
@@ -383,15 +438,22 @@ object PlayJournal {
         return s.appid !in focusableSeen && f != STEAM_UI
     }
 
+    private fun screenFrames(): Long? = try {
+        WaylandCompositor.screenFrameCount().takeIf { it >= 0 }
+    } catch (_: Throwable) {
+        null
+    }
+
     private fun sample(now: Long, slow: Boolean) {
         val frames = WaylandCompositor.gameFrameCount()
+        val screen = screenFrames()
         val hist = FrameTimes.snapshot()
         val delta = FrameTimes.delta(hist, lastHist)
         lastHist = hist
         val visible = SessionState.visible
         val suspended = SessionState.suspended
         val ctx = app
-        recent.addLast(longArrayOf(now, frames))
+        recent.addLast(longArrayOf(now, frames, screen ?: -1L))
         while (recent.size > 13) recent.removeFirst()
         if (slow && ctx != null && Build.VERSION.SDK_INT >= 30) {
             headroom = runCatching { ctx.getSystemService(PowerManager::class.java)?.getThermalHeadroom(10) }.getOrNull()?.takeIf { !it.isNaN() }
@@ -413,16 +475,21 @@ object PlayJournal {
             s.acc.add(Sample(
                 now, focused, visible, suspended, frames, mode, SessionState.wantedHz.takeIf { it > 0f }, shell?.limitHz,
                 status, headroom, shell?.skinC, shell?.socC, battery,
-                cpu.takeIf { policies.isNotEmpty() }, cap.takeIf { policies.isNotEmpty() }, mi,
+                cpu.takeIf { policies.isNotEmpty() }, cap.takeIf { policies.isNotEmpty() }, mi, screen,
             ))
             counting[k] = focused && visible && !suspended
             if (shell != null) s.shellSeen = true
             windows.getOrPut(k) { HashSet() }.add(if (SessionState.freeform) "freeform" else "fullscreen")
-            if (slow) memory(s, ctx)
+            val shown = visible && !suspended
+            if (shown != s.wasShown) {
+                s.event(now, if (shown) "shown" else if (suspended) "suspended" else "hidden (app in the background)")
+                s.wasShown = shown
+            }
+            if (slow) { memory(s, ctx, now); findGameLogs(s) }
         }
     }
 
-    private fun memory(s: PlayState, ctx: Context?) {
+    private fun memory(s: PlayState, ctx: Context?, now: Long) {
         val game = s.gamePid.takeIf { it > 0 }?.let { scanner.statusKb(it, "VmHWM", "VmRSS", "RssAnon") }
         val vortek = VortekServerComponent.runningPid.takeIf { it > 1 }?.let { scanner.statusKb(it, "VmHWM", "RssAnon") }
         val mi = ctx?.let { c ->
@@ -432,6 +499,7 @@ object PlayJournal {
             gameHwmKb = game?.get("VmHWM"), gameRssKb = game?.get("VmRSS"), gameAnonKb = game?.get("RssAnon"),
             vortekAnonKb = vortek?.get("RssAnon"), vortekHwmKb = vortek?.get("VmHWM"),
             appNativeBytes = Debug.getNativeHeapAllocatedSize(), availBytes = mi?.availMem?.takeIf { it > 0 }, lowMemory = mi?.lowMemory,
+            atMs = now,
         )
     }
 
@@ -458,7 +526,14 @@ object PlayJournal {
         unlistenThermal()
         if (Build.VERSION.SDK_INT < 29) return
         val pm = ctx.getSystemService(PowerManager::class.java) ?: return
-        val l = PowerManager.OnThermalStatusChangedListener { thermalStatus = it }
+        val l = PowerManager.OnThermalStatusChangedListener { status ->
+            val before = thermalStatus
+            thermalStatus = status
+            if (before != null && before != status) post {
+                val now = System.currentTimeMillis()
+                for (p in open.values) p.event(now, "thermal ${PlayRecord.thermalName(status)}")
+            }
+        }
         runCatching { pm.addThermalStatusListener({ r -> handler?.post(r) }, l); thermalListener = l }
     }
 
@@ -476,7 +551,9 @@ object PlayJournal {
         val list = recent.toList()
         for (i in 1 until list.size) {
             val dt = list[i][0] - list[i - 1][0]
-            out.add(if (dt > 0) PlayAccumulator.r1((list[i][1] - list[i - 1][1]) * 1000.0 / dt) else null)
+            val layer = list[i][1] - list[i - 1][1]
+            val screen = if (list[i][2] >= 0 && list[i - 1][2] >= 0) list[i][2] - list[i - 1][2] else 0L
+            out.add(if (dt > 0) PlayAccumulator.r1(maxOf(layer, screen) * 1000.0 / dt) else null)
         }
         return out
     }
@@ -500,84 +577,119 @@ object PlayJournal {
         val runStatus: Int? = null,
     )
 
-    private fun gameSources(ctx: Context, s: PlayState, f: LogSliceScanner.Findings, scanner: LogSliceScanner): List<LogSliceScanner.Source> {
-        val out = ArrayList<LogSliceScanner.Source>()
-        val since = s.startMs - 5_000
-        val appid = s.appid ?: return out
-        val pfx = runCatching { com.droiddeck.launcher.frontend.Library.protonPrefix(ctx, appid) }.getOrNull()
+    /** Where the logs stood when the session was asked to stop: lengths by path, and the time. */
+    private class Cut(val lengths: Map<String, Long>, val atMs: Long)
+
+    /** A game's own logs: Unity's Player.log (Player-prev.log is the run before) and Proton's steam-<appid>.log. */
+    private fun prefix(ctx: Context, appid: Long): File? = prefixes.getOrPut(appid) {
+        runCatching { com.droiddeck.launcher.frontend.Library.protonPrefix(ctx, appid) }.getOrNull()
+    }
+
+    private fun gameLogFiles(ctx: Context, appid: Long, since: Long): List<Pair<String, File>> {
+        val out = ArrayList<Pair<String, File>>()
+        val pfx = prefix(ctx, appid)
         if (pfx != null) {
-            val user = File(pfx, "drive_c/users/steamuser")
-            File(user, "AppData/LocalLow").listFiles()?.forEach { company ->
+            File(pfx, "drive_c/users/steamuser/AppData/LocalLow").listFiles()?.forEach { company ->
                 company.listFiles()?.forEach { product ->
-                    for (n in listOf("Player.log", "Player-prev.log")) {
-                        val log = File(product, n)
-                        if (log.isFile && log.lastModified() >= since) out += LogSliceScanner.Source("${product.name}/$n", log)
-                    }
-                }
-            }
-            File(user, "AppData/Local/Temp").listFiles()?.forEach { company ->
-                company.listFiles()?.forEach { product ->
-                    File(product, "Crashes").listFiles()?.filter { it.isDirectory && it.lastModified() >= since }?.take(3)?.forEach { crash ->
-                        scanner.note(f, "crash", "Unity crash report ${crash.name}", "${product.name}/Crashes")
-                        File(crash, "error.log").takeIf { it.isFile }?.let { out += LogSliceScanner.Source("${crash.name}/error.log", it) }
-                    }
+                    val log = File(product, "Player.log")
+                    if (log.isFile && log.lastModified() >= since) out += "${product.name}/Player.log" to log
                 }
             }
         }
         File(LinuxRuntime.rootDir(ctx), "root/steam-$appid.log").takeIf { it.isFile && it.lastModified() >= since }
-            ?.let { out += LogSliceScanner.Source(it.name, it) }
+            ?.let { out += it.name to it }
         return out
     }
 
-    /** This app's crash buffer since the play started (vortek-server is this app's child, so its crashes are there). */
-    private fun crashBuffer(startMs: Long): File? = try {
+    private fun sessionSource(src: LogSliceScanner.Source, cut: Cut?) = LogSliceScanner.Source(
+        src.label, src.file, src.from, cut?.lengths?.get(src.file.path) ?: -1L,
+        // A game run directly writes to session.log; under Steam it is the client's log as much as the game's.
+        game = src.label == "session.log" && mode == SessionService.MODE_RUN,
+    )
+
+    /**
+     * The game's logs for a play's end. Logs not seen before a stop (so with no length to cut them at) are
+     * read as the session's: what they hold may be the teardown's.
+     */
+    private fun gameSources(ctx: Context, s: PlayState, f: LogSliceScanner.Findings, scanner: LogSliceScanner, cut: Cut?): List<LogSliceScanner.Source> {
+        val out = ArrayList<LogSliceScanner.Source>()
+        val since = s.startMs - 5_000
+        val appid = s.appid ?: return out
+        val logs = LinkedHashMap<String, Pair<String, File>>()
+        for (l in s.gameLogs + gameLogFiles(ctx, appid, since)) logs.putIfAbsent(l.second.path, l)
+        for ((label, file) in logs.values) {
+            val until = cut?.lengths?.get(file.path)
+            out += LogSliceScanner.Source(label, file, 0L, until ?: -1L, game = cut == null || until != null)
+        }
+        val pfx = prefix(ctx, appid) ?: return out
+        val untilMs = cut?.atMs ?: Long.MAX_VALUE
+        File(pfx, "drive_c/users/steamuser/AppData/Local/Temp").listFiles()?.forEach { company ->
+            company.listFiles()?.forEach { product ->
+                File(product, "Crashes").listFiles()?.filter { it.isDirectory && it.lastModified() in since..untilMs }?.take(3)?.forEach { crash ->
+                    scanner.note(f, "crash", "Unity crash report ${crash.name}", "${product.name}/Crashes")
+                    f.gameLabels.add("${product.name}/Crashes")
+                    File(crash, "error.log").takeIf { it.isFile }?.let { out += LogSliceScanner.Source("${crash.name}/error.log", it) }
+                }
+            }
+        }
+        return out
+    }
+
+    /** This app's crash buffer from the play's start to [untilMs] (vortek-server is this app's child, so its crashes are there). */
+    private fun crashBuffer(startMs: Long, untilMs: Long?, scanner: LogSliceScanner): File? = try {
         val since = java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date(startMs))
         val p = ProcessBuilder("logcat", "-b", "crash", "-d", "-T", since).redirectErrorStream(true).start()
         val text = p.inputStream.bufferedReader().use { r -> r.readText().take(256 * 1024) }
         p.waitFor(5, TimeUnit.SECONDS)
         val lines = text.lines().filter { it.contains("Fatal signal") || it.contains("cmpbe") || it.contains("Abort message") }
+            .filter { line -> untilMs == null || (scanner.stamp(line) ?: 0L) <= untilMs }
         if (lines.isEmpty()) null else File.createTempFile("crash", ".log", app?.cacheDir).apply { writeText(lines.joinToString("\n")) }
     } catch (_: Exception) {
         null
     }
 
-    private fun finish(s: PlayState, endMs: Long, end: End) {
+    private fun uptimeToWall(): Long = System.currentTimeMillis() - SystemClock.uptimeMillis()
+
+    private fun finish(s: PlayState, endMs: Long, end: End, cut: Cut? = null) {
         val key = s.appid ?: RUN_KEY
         open.remove(key)
         counting.remove(key)
         val ctx = app
-        val scanner = LogSliceScanner()
+        val scanner = LogSliceScanner(uptimeToWallMs = uptimeToWall())
         s.settings = settings(ctx)
         windows.remove(key)?.let { w ->
             s.display = LinkedHashMap(s.display).apply { put("window", if (w.size > 1) "mixed" else w.firstOrNull() ?: get("window")) }
         }
         val r = PlayRecord.base(s, endMs)
-        val f = scanner.scan(s.sources, s.appid)
+        val f = scanner.scan(s.sources.map { sessionSource(it, cut) }, s.appid)
         if (ctx != null) {
-            val extra = gameSources(ctx, s, f, scanner)
+            val extra = gameSources(ctx, s, f, scanner, cut)
             if (extra.isNotEmpty()) scanner.scanInto(f, extra, s.appid)
         }
+        val used = f.gpuUsed ?: PlayRecord.gpuFromEnv(s.env)
+        // vortek-server serves the game only on the Vortek path.
+        if (used == "vortek") f.gameLabels.add("vortek.log")
         if (s.vortekExit != null || f.has("crash") || f.has("device_lost")) {
-            crashBuffer(s.startMs)?.let { tmp ->
-                scanner.scanInto(f, listOf(LogSliceScanner.Source("crash buffer", tmp)), s.appid)
+            crashBuffer(s.startMs, cut?.atMs, scanner)?.let { tmp ->
+                scanner.scanInto(f, listOf(LogSliceScanner.Source("crash buffer", tmp, game = used == "vortek")), s.appid)
                 tmp.delete()
             }
         }
         // The session stopping kills the server too (exit 137); only a death the component saw on its own counts.
         if (s.vortekExit == null) f.errors.remove("vortek")
-        val used = f.gpuUsed ?: PlayRecord.gpuFromEnv(s.env)
         val evidence = PlayRecord.evidenceFrom(
             PlayRecord.evidence(s, endMs), f, usedVortek = used == "vortek",
             sessionStopped = end.stopped, sessionStatus = end.sessionStatus ?: end.runStatus, failureCode = end.failureCode,
         )
         val exit = ExitClassifier.classify(evidence)
-        PlayRecord.finish(r, f, exit)
+        PlayRecord.finish(r, f, exit, startMs = s.startMs)
+        // Out of open.json first: a death between the two loses this record rather than writing it twice.
+        checkpoint(endMs)
         journal?.append(r)
         val kept = keep(s.logs, exit.flags, endMs)
         lastEnded = Triple(s.appid ?: RUN_KEY, s.id, endMs)
         Log.i(TAG, "play ${s.id}: ${s.appid ?: ""} ${s.game} ${(endMs - s.startMs) / 60_000} min, ${exit.reason}" +
             (if (exit.flags.isNotEmpty()) " ${exit.flags}" else "") + (kept?.let { ", logs kept $it d" } ?: ""))
-        checkpoint(endMs)
     }
 
     private fun keep(logs: String, flags: List<String>, now: Long): Long? {
@@ -601,7 +713,8 @@ object PlayJournal {
                 "appid" to s.appid,
                 "record" to PlayRecord.base(s, now),
                 "evidence" to PlayRecord.evidence(s, now),
-                "sources" to s.sources.map { linkedMapOf("label" to it.label, "path" to it.file.path, "from" to it.from) },
+                "sources" to s.sources.map { linkedMapOf("label" to it.label, "path" to it.file.path, "from" to it.from, "game" to (it.label == "session.log" && s.launch == "run")) } +
+                    s.gameLogs.map { (label, f) -> linkedMapOf("label" to label, "path" to f.path, "from" to 0L, "game" to true) },
             )
         }
         runCatching {
@@ -611,7 +724,8 @@ object PlayJournal {
     }
 
     /**
-     * At a session's start, before abandoned session folders are finished: records the plays a dead app left
+     * When the app starts (FrontEndActivity) and at a session's start, before abandoned session folders are
+     * finished (scrubbing rewrites the logs the saved offsets point into): records the plays a dead app left
      * in open.json, with the reason Android gives for the death, and keeps their session folder.
      */
     fun recover(context: Context) {
@@ -640,16 +754,20 @@ object PlayJournal {
         val evidence = p.obj("evidence") ?: return
         val sources = p.list("sources").orEmpty().filterIsInstance<Map<*, *>>().mapNotNull { s ->
             val path = s.str("path") ?: return@mapNotNull null
-            LogSliceScanner.Source(s.str("label") ?: File(path).name, File(path), s.long("from") ?: 0L)
+            LogSliceScanner.Source(s.str("label") ?: File(path).name, File(path), s.long("from") ?: 0L, game = s["game"] == true)
         }
         val appid = p.long("appid")
-        val f = LogSliceScanner().scan(sources, appid)
+        val id = record.str("id")
+        if (id != null && j.hasPlay(id)) return
+        // The monotonic clock restarts with the device: the offset saved with the play, not today's.
+        val f = LogSliceScanner(uptimeToWallMs = evidence.long("uptimeToWallMs")).scan(sources, appid)
         val used = f.gpuUsed ?: (record.obj("gpu")?.str("used"))
+        if (used == "vortek") f.gameLabels.add("vortek.log")
         val ev = PlayRecord.evidenceFrom(evidence, f, usedVortek = used == "vortek",
             appKilled = exit, appGone = exit == null && !sameProcess, sessionStopped = sameProcess,
             failureCode = if (sameProcess) "not finished in time" else null)
         val e = ExitClassifier.classify(ev)
-        PlayRecord.finish(record, f, e)
+        PlayRecord.finish(record, f, e, startMs = evidence.long("startMs"))
         record["recovered"] = true
         j.append(record)
         val logs = record.str("logs") ?: return

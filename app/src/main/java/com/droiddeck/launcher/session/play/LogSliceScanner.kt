@@ -7,19 +7,34 @@ import java.io.RandomAccessFile
  * [mali-g2] Reads the part of each log a play wrote, after the play: what went wrong, and a few facts
  * (swapchain size, renderer, DXVK version, Steam's exit code). Never on the render path.
  *
- * Each [Source] is read from its offset (resynced to the next line), at most [maxBytes] of it (the last
- * [maxBytes] when there is more), line by line with plain `contains` checks before any regex. Kept: per
- * kind of problem the count and the first [perKind] lines, [total] lines in all, each cut to [lineMax].
+ * Each [Source] is read from its offset (resynced to the next line) up to its end mark, at most [maxBytes]
+ * of it: when there is more, the first [headBytes] (DXVK's version, the device, the first swapchain) and
+ * the rest from the end. Line by line with plain `contains` checks before any regex. Kept: per kind of
+ * problem the count, the labels it was seen in, the first [perKind] lines ([total] lines in all, each cut
+ * to [lineMax]) and when it was first seen, for lines that carry a time.
+ *
+ * [uptimeToWallMs] turns the X11 layers' `(t=<CLOCK_MONOTONIC s>)` stamps into wall time.
  */
 class LogSliceScanner(
     private val maxBytes: Long = 16L * 1024 * 1024,
+    private val headBytes: Long = 2L * 1024 * 1024,
     private val perKind: Int = 3,
     private val total: Int = 20,
     private val lineMax: Int = 240,
+    private val uptimeToWallMs: Long? = null,
+    private val nowMs: Long = System.currentTimeMillis(),
 ) {
-    class Source(val label: String, val file: File, val from: Long = 0L)
+    /**
+     * [until] is where the slice ends (the length when the play ended; -1: the current end). [game] marks the
+     * game's own logs, as opposed to the session's, which Steam's client and other games write to as well.
+     */
+    class Source(val label: String, val file: File, val from: Long = 0L, val until: Long = -1L, val game: Boolean = true)
 
-    class Kind(var n: Int = 0, val first: MutableList<String> = ArrayList())
+    class Kind(var n: Int = 0, val first: MutableList<String> = ArrayList()) {
+        val labels = LinkedHashMap<String, Int>()
+        /** Wall time of the first line of this kind that carried a time. */
+        var firstAtMs: Long? = null
+    }
 
     class Findings {
         val errors = LinkedHashMap<String, Kind>()
@@ -37,7 +52,13 @@ class LogSliceScanner(
         var steamEndedAt: String? = null
         var steers = 0
         var vortekExit: Int? = null
+        /** DXVK's or vkd3d's "Found device", for games that log no renderer of their own. */
+        var device: String? = null
+        /** llvmpipe / softpipe seen: drawn on the CPU. */
+        var software = false
         val sources = ArrayList<String>()
+        /** Labels of the game's own logs (see [Source.game]). */
+        val gameLabels = LinkedHashSet<String>()
 
         fun swapchain(size: String) { if (swapchainSet.size < 32) swapchainSet.add(size) }
 
@@ -45,7 +66,14 @@ class LogSliceScanner(
 
         fun has(kind: String) = (errors[kind]?.n ?: 0) > 0
 
+        /** Seen in one of the game's own logs. */
+        fun inGame(kind: String) = errors[kind]?.labels?.keys?.any { it in gameLabels } ?: false
+
         fun firstLine(kind: String): String? = errors[kind]?.first?.firstOrNull()
+
+        fun firstGameLine(kind: String): String? =
+            errors[kind]?.first?.firstOrNull { line -> gameLabels.any { line.startsWith("$it: ") } }
+                ?: errors[kind]?.takeIf { inGame(kind) }?.first?.firstOrNull()
 
         private fun area(s: String): Long = s.split('x').mapNotNull { it.toLongOrNull() }.takeIf { it.size == 2 }?.let { it[0] * it[1] } ?: 0L
     }
@@ -58,6 +86,7 @@ class LogSliceScanner(
         for (s in sources) {
             if (!s.file.isFile) continue
             f.sources.add(s.label)
+            if (s.game) f.gameLabels.add(s.label)
             try {
                 read(s) { line -> look(line, s.label, appid, f) }
             } catch (_: Exception) {
@@ -69,31 +98,45 @@ class LogSliceScanner(
 
     private fun read(s: Source, each: (String) -> Unit) {
         RandomAccessFile(s.file, "r").use { raf ->
-            val length = raf.length()
-            var from = s.from.coerceIn(0L, length)
-            if (length - from > maxBytes) from = length - maxBytes
-            raf.seek(from)
-            val input = java.io.BufferedInputStream(java.io.FileInputStream(raf.fd), 64 * 1024)
-            // Mid-line: start at the next line.
-            if (from > 0) {
-                raf.seek(from - 1)
-                if (raf.read() != '\n'.code) {
-                    while (true) { val b = input.read(); if (b < 0 || b == '\n'.code) break }
-                }
+            val length = raf.length().let { if (s.until >= 0) minOf(it, s.until) else it }
+            val from = s.from.coerceIn(0L, length)
+            if (length - from <= maxBytes) {
+                range(raf, from, length, each)
+            } else {
+                range(raf, from, from + headBytes, each)
+                range(raf, length - (maxBytes - headBytes), length, each)
             }
-            val reader = java.io.BufferedReader(java.io.InputStreamReader(input, Charsets.UTF_8))
-            var left = length - from
-            while (left > 0) {
-                val line = reader.readLine() ?: break
-                left -= line.length + 1
-                each(if (line.length > 4096) line.substring(0, 4096) else line)
+        }
+    }
+
+    /** The whole lines that start in [from, end): a line cut by [from] is skipped, one cut by [end] read to its end. */
+    private fun range(raf: RandomAccessFile, from: Long, end: Long, each: (String) -> Unit) {
+        var pos = from
+        if (pos > 0) {
+            raf.seek(pos - 1)
+            if (raf.read() != '\n'.code) {
+                val skip = java.io.BufferedInputStream(java.io.FileInputStream(raf.fd), 8 * 1024)
+                raf.seek(pos)
+                var n = 0L
+                while (true) { val b = skip.read(); if (b < 0) return; n++; if (b == '\n'.code) break }
+                pos += n
             }
+        }
+        raf.seek(pos)
+        val reader = java.io.BufferedReader(java.io.InputStreamReader(java.io.FileInputStream(raf.fd), Charsets.UTF_8), 64 * 1024)
+        var left = end - pos
+        while (left > 0) {
+            val line = reader.readLine() ?: break
+            left -= line.toByteArray(Charsets.UTF_8).size + 1
+            each(if (line.length > 4096) line.substring(0, 4096) else line)
         }
     }
 
     private fun keep(f: Findings, kind: String, line: String, label: String) {
         val k = f.errors.getOrPut(kind) { Kind() }
         k.n++
+        k.labels[label] = (k.labels[label] ?: 0) + 1
+        if (k.firstAtMs == null) k.firstAtMs = stamp(line)
         if (k.first.size < perKind && f.kept < total) {
             val text = "$label: ${line.trim()}"
             k.first.add(if (text.length > lineMax) text.substring(0, lineMax - 1) + "…" else text)
@@ -109,11 +152,35 @@ class LogSliceScanner(
                 return
             }
         }
-        if (line.contains("now hidden, frames paced")) {
+        val hidden = line.contains("now hidden, frames paced")
+        if (hidden || line.contains("now through X11")) {
             // Small helper windows are hidden all the time; a game-sized one is worth noting.
             val size = WINDOW_SIZE.find(line)?.destructured?.let { (w, h) -> w.toLong() * h.toLong() } ?: 0L
-            if (size >= 640L * 360L) keep(f, "hidden", line, label)
+            if (size >= 640L * 360L) keep(f, if (hidden) "hidden" else "x11_copy", line, label)
         }
+    }
+
+    /** Wall time of a line: logcat's "MM-DD HH:MM:SS.mmm", Steam's "[YYYY-MM-DD HH:MM:SS]", or "(t=<monotonic s>)". */
+    fun stamp(line: String): Long? {
+        try {
+            LOGCAT_STAMP.find(line)?.let { m ->
+                val cal = java.util.Calendar.getInstance()
+                cal.timeInMillis = nowMs
+                val year = cal.get(java.util.Calendar.YEAR)
+                val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+                var t = fmt.parse("$year-${m.groupValues[1]}")?.time ?: return null
+                // Read in January about December.
+                if (t > nowMs + 86_400_000L) t = fmt.parse("${year - 1}-${m.groupValues[1]}")?.time ?: return null
+                return t
+            }
+            STAMP.find(line)?.let { m ->
+                return java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).parse(m.groupValues[1])?.time
+            }
+            val offset = uptimeToWallMs ?: return null
+            MONO_STAMP.find(line)?.let { m -> return (m.groupValues[1].toDouble() * 1000).toLong() + offset }
+        } catch (_: Exception) {
+        }
+        return null
     }
 
     private fun facts(line: String, label: String, appid: Long?, f: Findings): Boolean {
@@ -135,10 +202,19 @@ class LogSliceScanner(
                 }
             }
             line.contains("info:  DXVK: v") -> { f.dxvk = line.substringAfter("DXVK: ").trim().take(60); return true }
-            line.contains("Renderer:") && f.renderer == null -> { f.renderer = line.substringAfter("Renderer:").trim().take(80); return true }
+            line.contains("Renderer:") && f.renderer == null -> {
+                f.renderer = line.substringAfter("Renderer:").trim().take(80)
+                if (SOFTWARE.any { f.renderer!!.contains(it) }) f.software = true
+                return true
+            }
             line.contains("droiddeck-game-env:") && line.contains("Vulkan in-process (libhybris)") -> { f.gpuUsed = "hybris"; return true }
             line.contains("droiddeck-game-env:") && line.contains("in-process GPU asked for, but") -> { f.gpuUsed = "vortek"; return true }
             line.contains("cluster steering: moved") -> { f.steers++; return true }
+            line.contains("Found device: ") && f.device == null && line.contains("info:") && label in f.gameLabels -> {
+                f.device = line.substringAfter("Found device: ").trim().take(80)
+                if (SOFTWARE.any { f.device!!.contains(it) }) f.software = true
+                return true
+            }
             line.contains("vortek-server exited: ") -> {
                 f.vortekExit = line.substringAfter("vortek-server exited: ").trim().substringBefore(' ').toIntOrNull()
                 keep(f, "vortek", line, label)
@@ -194,5 +270,8 @@ class LogSliceScanner(
         private val TRACKED = Regex("""adding PID (\d+) as a tracked process""")
         private val EXIT_CODE = Regex("""exit code (-?\d+)""")
         private val STAMP = Regex("""^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})]""")
+        private val LOGCAT_STAMP = Regex("""^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s""")
+        private val MONO_STAMP = Regex("""\(t=(\d+\.\d+)\)\s*$""")
+        private val SOFTWARE = listOf("llvmpipe", "softpipe", "SwiftShader")
     }
 }

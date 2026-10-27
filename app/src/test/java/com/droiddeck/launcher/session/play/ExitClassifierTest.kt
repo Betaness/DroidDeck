@@ -9,26 +9,27 @@ import org.junit.rules.TemporaryFolder
 class ExitClassifierTest {
     @get:Rule val tmp = TemporaryFolder()
 
-    private fun findings(vararg lines: String, exit: String? = null): LogSliceScanner.Findings {
+    private fun findings(vararg lines: String, exit: String? = null, session: List<String> = emptyList()): LogSliceScanner.Findings {
         val f = tmp.newFile().apply {
             writeText((lines.toList() + listOfNotNull(
                 exit?.let { "[2026-10-28 01:17:32] AppID 7 adding PID 5 as a tracked process \"x\"" },
                 exit?.let { "[2026-10-28 01:20:00] AppID 7 no longer tracking PID 5, exit code $it" },
             )).joinToString("\n", postfix = "\n"))
         }
-        return LogSliceScanner().scan(listOf(LogSliceScanner.Source("log", f)), appid = 7)
+        val s = tmp.newFile().apply { writeText(session.joinToString("\n", postfix = "\n")) }
+        return LogSliceScanner().scan(listOf(LogSliceScanner.Source("log", f), LogSliceScanner.Source("session.log", s, game = false)), appid = 7)
     }
 
     private fun ev(
         durS: Long = 600, f: LogSliceScanner.Findings? = findings(), frames: Long = 30_000,
         appKilled: ExitClassifier.AppExit? = null, stopped: Boolean = false, vortek: Int? = null, vortekToEnd: Long? = null,
         usedVortek: Boolean = false, zeroRun: Long = 0, stall: Double? = null, mean: Double? = 60.0, low1: Double? = 30.0,
-        at60Thermal: Double? = 0.0, marked: Boolean = false,
+        at60Thermal: Double? = 0.0, marked: Boolean = false, runMode: Boolean = false, status: Int? = null, fpsLimit: Int? = null,
     ) = ExitClassifier.Evidence(
-        durS = durS, appKilled = appKilled, sessionStopped = stopped, sessionStatus = if (stopped) 0 else null,
+        durS = durS, appKilled = appKilled, sessionStopped = stopped, sessionStatus = status ?: if (stopped) 0 else null,
         vortekExit = vortek, vortekToEndS = vortekToEnd, usedVortek = usedVortek, findings = f, steamExitCode = f?.steamExitCode,
         gameFrames = frames, longestZeroRunS = zeroRun, longestStallS = stall, meanFpsAfterWarmup = mean, low1 = low1,
-        at60Thermal = at60Thermal, marked = marked,
+        at60Thermal = at60Thermal, marked = marked, runMode = runMode, fpsLimit = fpsLimit,
     )
 
     @Test fun reasonsInOrder() {
@@ -61,9 +62,39 @@ class ExitClassifierTest {
     @Test fun shortPlaysWithoutAFrameOrWithMissingFeaturesFailedToLaunch() {
         assertEquals("launch_failed", ExitClassifier.classify(ev(durS = 20, frames = 0)).reason)
         assertEquals("normal", ExitClassifier.classify(ev(durS = 20, frames = 100)).reason)
-        val unsupported = ExitClassifier.classify(ev(f = findings("err:   DxvkAdapter: Skipping: Device does not support required feature 'x'")))
+        val skip = "err:   DxvkAdapter: Skipping: Device does not support required feature 'fillModeNonSolid'"
+        val unsupported = ExitClassifier.classify(ev(frames = 0, f = findings(skip)))
         assertEquals("launch_failed", unsupported.reason)
-        assertTrue(unsupported.detail!!.contains("fillMode") || unsupported.detail!!.contains("Skipping"))
+        assertTrue(unsupported.detail!!.contains("fillModeNonSolid"))
+        // DXVK skipping one adapter and drawing on another for two hours is not a failed launch.
+        assertEquals("normal", ExitClassifier.classify(ev(frames = 400_000, f = findings(skip))).reason)
+    }
+
+    @Test fun aCrashBeforeTheFirstFrameOnMissingFeaturesIsAFailedLaunchWithTheCause() {
+        // r9 2026-10-26-39: Duckov, 24 s, Player.log "Crash!!!" after DXVK found no adapter.
+        val f = findings("err:   DxvkAdapter: Skipping: Device does not support required feature 'fillModeNonSolid'",
+            "err:   DXVK: No adapters found", "Crash!!!")
+        val exit = ExitClassifier.classify(ev(durS = 24, frames = 0, f = f))
+        assertEquals("launch_failed", exit.reason)
+        assertTrue(exit.detail!!, exit.detail!!.contains("fillModeNonSolid"))
+        assertEquals(listOf("launch_failed", "crash"), exit.flags)
+        // After frames, a crash names its cause before Unity's "Crash!!!".
+        val later = ExitClassifier.classify(ev(f = findings("Scudo ERROR: out of memory", "Crash!!!")))
+        assertEquals("crash", later.reason)
+        assertEquals("log: Scudo ERROR: out of memory", later.detail)
+    }
+
+    @Test fun theSessionsLogsAloneDecideNoReason() {
+        // Steam's web helper losing its device while the game played on.
+        val exit = ExitClassifier.classify(ev(f = findings(session = listOf("VK_ERROR_DEVICE_LOST", "Crash!!!", "Out of memory"))))
+        assertEquals("normal", exit.reason)
+        assertEquals(emptyList<String>(), exit.flags)
+    }
+
+    @Test fun aGameRunDirectlyThatTheOwnerStoppedWasStopped() {
+        assertEquals("session_stopped", ExitClassifier.classify(ev(runMode = true, stopped = true, status = 0)).reason)
+        assertEquals("crash", ExitClassifier.classify(ev(runMode = true, status = 139)).reason)
+        assertEquals("normal", ExitClassifier.classify(ev(runMode = true, status = 0)).reason)
     }
 
     @Test fun flagsAreIndependent() {
@@ -71,10 +102,21 @@ class ExitClassifierTest {
             f = findings("Scudo ERROR: out of memory", "hybris-x11: window 0x1 1704x1136 now hidden, frames paced (t=1)")))
         assertEquals("session_stopped", exit.reason)
         assertEquals(listOf("freeze", "low_fps", "oom", "hidden_paced", "at60_thermal", "marked"), exit.flags)
-        assertEquals(listOf("freeze"), ExitClassifier.classify(ev(stall = 40.0)).flags)
-        // A loading screen that presents nothing for a while is not one.
-        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(stall = 12.0)).flags)
+        // A long gap in the game layer's frame times alone (the X11 path took over for a while) is not a freeze.
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(stall = 40.0)).flags)
         assertEquals(listOf("low_fps"), ExitClassifier.classify(ev(low1 = 5.0)).flags)
+        // Long frames in a game that draws on demand (a card table) are not stutter.
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(low1 = 5.0, mean = 12.0, fpsLimit = 15)).flags)
+        assertEquals(listOf("low_fps"), ExitClassifier.classify(ev(mean = 12.0)).flags)
+    }
+
+    @Test fun halfAMinuteWithoutFramesWhileLoadingIsNotAFreeze() {
+        // A.V.A.: its first frame, then 30 s of loading behind it.
+        fun freeze(all: Long, afterLoad: Long) = "freeze" in ExitClassifier.classify(ExitClassifier.Evidence(
+            durS = 600, gameFrames = 10_000, longestZeroRunS = all, zeroRunAfterLoadS = afterLoad, meanFpsAfterWarmup = 60.0)).flags
+        assertTrue(!freeze(30, 0))
+        assertTrue(freeze(95, 0))
+        assertTrue(freeze(35, 35))
     }
 
     @Test fun keepDaysFollowTheFlags() {

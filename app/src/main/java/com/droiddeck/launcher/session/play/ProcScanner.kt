@@ -6,39 +6,50 @@ import java.io.File
  * [mali-g2] This app's processes as the play journal needs them: Steam game launches and the games' own
  * processes. Android shows an app only its own uid's processes in /proc (some hundred during a session),
  * and argv is read once per pid: a scan is a directory listing plus a few small reads for new pids.
+ *
+ * A process seen between fork and exec still shows its parent's argv, and wine renames its processes to
+ * the Windows path some time after they start (seconds under FEX and proot): a young pid whose argv is
+ * neither a launch nor an .exe is read again for [rereadScans] scans.
  */
-class ProcScanner(private val proc: File = File("/proc")) {
+class ProcScanner(private val proc: File = File("/proc"), private val rereadScans: Int = 6) {
     class Entry(
         val pid: Int,
         /** Start time in clock ticks after boot (/proc/<pid>/stat field 22). */
         val startTicks: Long,
         val argv0: String,
         val launch: LaunchCmdline.Launch?,
-    )
+        internal val firstScan: Int = 0,
+    ) {
+        internal val settled: Boolean get() = launch != null || argv0.replace('\\', '/').substringAfterLast('/').lowercase().endsWith(".exe")
+    }
 
     class LaunchGroup(val appid: Long, val pids: Set<Int>, val startTicks: Long, val exe: String?)
 
     private val known = HashMap<Int, Entry>()
+    private var scans = 0
 
     fun scan(): Map<Int, Entry> {
         val names = proc.list() ?: return emptyMap()
+        scans++
         val alive = HashSet<Int>(names.size)
         for (name in names) {
             val c = name.firstOrNull() ?: continue
             if (c !in '0'..'9') continue
             val pid = name.toIntOrNull() ?: continue
             alive.add(pid)
-            if (pid !in known) read(pid)?.let { known[pid] = it }
+            val e = known[pid]
+            if (e == null) read(pid, scans)?.let { known[pid] = it }
+            else if (!e.settled && scans - e.firstScan <= rereadScans) read(pid, e.firstScan)?.let { known[pid] = it }
         }
         known.keys.retainAll(alive)
         return known
     }
 
-    private fun read(pid: Int): Entry? {
+    private fun read(pid: Int, firstScan: Int): Entry? {
         val argv = cmdline(pid) ?: return null
         // A kernel thread or a process between fork and exec: read it again next time.
         if (argv.isEmpty()) return null
-        return Entry(pid, startTicks(pid) ?: 0L, argv[0], LaunchCmdline.parse(argv))
+        return Entry(pid, startTicks(pid) ?: 0L, argv[0], LaunchCmdline.parse(argv), firstScan)
     }
 
     fun cmdline(pid: Int): List<String>? = try {

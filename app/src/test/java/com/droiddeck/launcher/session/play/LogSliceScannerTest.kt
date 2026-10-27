@@ -92,12 +92,64 @@ class LogSliceScannerTest {
         assertEquals(50, f.errors.getValue("module").n)
     }
 
-    @Test fun readsOnlyTheLastPartOfAHugeSlice() {
+    @Test fun readsTheStartAndTheEndOfAHugeSlice() {
         val log = tmp.newFile("big.log")
-        log.writeText("Crash!!! early\n" + "filler line\n".repeat(2000) + "DEVICE_LOST late\n")
-        val f = LogSliceScanner(maxBytes = 1000).scan(listOf(LogSliceScanner.Source("big", log)))
+        log.writeText("info:  DXVK: v3.1.1\n" + "filler line\n".repeat(100) + "Crash!!! in the middle\n" +
+            "filler line\n".repeat(2000) + "DEVICE_LOST late\n")
+        val f = LogSliceScanner(maxBytes = 1000, headBytes = 300).scan(listOf(LogSliceScanner.Source("big", log)))
+        assertEquals("v3.1.1", f.dxvk)
         assertFalse(f.has("crash"))
         assertTrue(f.has("device_lost"))
+    }
+
+    @Test fun stopsWhereThePlayEnded() {
+        val log = file("vortek.log", "err:vulkan:in the play", "VK_ERROR_DEVICE_LOST after the server was killed")
+        val f = LogSliceScanner().scan(listOf(LogSliceScanner.Source("vortek.log", log, 0L, until = "err:vulkan:in the play\n".length.toLong())))
+        assertTrue(f.has("vulkan"))
+        assertFalse(f.has("device_lost"))
+    }
+
+    @Test fun tellsTheGamesLogsFromTheSessions() {
+        val session = file("session.log", "steamwebhelper: VK_ERROR_DEVICE_LOST", "Crash!!! from another process")
+        val player = file("Player.log", "Crash!!!")
+        val f = LogSliceScanner().scan(listOf(
+            LogSliceScanner.Source("session.log", session, game = false), LogSliceScanner.Source("Player.log", player)))
+        assertTrue(f.has("device_lost"))
+        assertFalse(f.inGame("device_lost"))
+        assertTrue(f.inGame("crash"))
+        assertEquals("Player.log: Crash!!!", f.firstGameLine("crash"))
+        assertEquals(mapOf("session.log" to 1, "Player.log" to 1), f.errors.getValue("crash").labels)
+    }
+
+    @Test fun firstTimesFromLogcatSteamAndMonotonicStamps() {
+        val zone = java.util.TimeZone.getDefault()
+        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US).apply { timeZone = zone }
+        val now = fmt.parse("2026-10-28 02:00:00.000")!!.time
+        val log = file("x.log",
+            "10-28 01:57:44.250  1234  1250 E vulkan: VK_ERROR_DEVICE_LOST",
+            "[2026-10-28 01:58:00] Out of memory",
+            "hybris-x11: window 0x4c00058 1024x768 now through X11, the compositor's layer is not available: clipped, depth 24 (t=12951.443)",
+            "hybris-x11: window 0x4c00058 1024x768 now hidden, frames paced (t=13098.164)",
+        )
+        val offset = now - 13_200_000L
+        val f = LogSliceScanner(uptimeToWallMs = offset, nowMs = now).scan(listOf(LogSliceScanner.Source("x.log", log)))
+        assertEquals(fmt.parse("2026-10-28 01:57:44.250")!!.time, f.errors.getValue("device_lost").firstAtMs)
+        assertEquals(fmt.parse("2026-10-28 01:58:00.000")!!.time, f.errors.getValue("oom").firstAtMs)
+        assertEquals(12_951_443L + offset, f.errors.getValue("x11_copy").firstAtMs)
+        assertEquals(13_098_164L + offset, f.errors.getValue("hidden").firstAtMs)
+    }
+
+    @Test fun theDeviceDxvkFoundStandsInForARendererAndSoftwareIsSeen() {
+        val log = file("steam-1473480.log", "info:  Found device: Vortek (Mali-G2-Ultra-NX MC16) (Mali-G2-Ultra-NX MC16 56.0.0)")
+        assertEquals("Vortek (Mali-G2-Ultra-NX MC16) (Mali-G2-Ultra-NX MC16 56.0.0)",
+            LogSliceScanner().scan(listOf(LogSliceScanner.Source("steam-1473480.log", log))).device)
+        val sw = file("Player.log", "    Renderer: llvmpipe (LLVM 17.0.6, 128 bits)")
+        assertTrue(LogSliceScanner().scan(listOf(LogSliceScanner.Source("Player.log", sw))).software)
+        // Steam's own DXVK in the session's log is not the game's device.
+        val session = file("session.log", "info:  Found device: llvmpipe (LLVM 17.0.6, 128 bits)")
+        val f = LogSliceScanner().scan(listOf(LogSliceScanner.Source("session.log", session, game = false)))
+        assertNull(f.device)
+        assertFalse(f.software)
     }
 
     @Test fun nothingFoundIsEmpty() {

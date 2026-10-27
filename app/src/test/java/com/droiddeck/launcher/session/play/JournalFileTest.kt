@@ -50,4 +50,22 @@ class JournalFileTest {
         j.open.writeText("{broken")
         assertNull(j.readOpen())
     }
+
+    @Test fun aLineCutShortDoesNotSwallowTheNext() {
+        val j = JournalFile(tmp.newFolder("journal"), LogRedactor::redact)
+        j.append(linkedMapOf("type" to "play", "id" to "a#1"))
+        j.plays.appendText("{\"type\":\"play\",\"id\":\"b#")
+        j.append(linkedMapOf("type" to "play", "id" to "c#1", "recovered" to true))
+        val lines = j.plays.readLines()
+        assertEquals(3, lines.size)
+        assertEquals("c#1", (Json.parse(lines[2]) as Map<*, *>)["id"])
+    }
+
+    @Test fun knowsWhichPlaysItHas() {
+        val j = JournalFile(tmp.newFolder("journal"), LogRedactor::redact)
+        assertTrue(!j.hasPlay("2026-10-28-07-steam#1"))
+        j.append(linkedMapOf("v" to 1, "type" to "play", "id" to "2026-10-28-07-steam#1"))
+        assertTrue(j.hasPlay("2026-10-28-07-steam#1"))
+        assertTrue(!j.hasPlay("2026-10-28-07-steam#2"))
+    }
 }
