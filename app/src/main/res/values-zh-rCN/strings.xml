@@ -646,6 +646,10 @@
     <string name="drawer_logs">会话日志</string>
     <string name="drawer_logs_hint">附加到错误报告</string>
     <string name="drawer_share_logs">分享日志</string>
+    <string name="drawer_mark_problem">出问题了</string>
+    <string name="drawer_mark_problem_hint">记下时间，并把这个会话的日志保留 30 天</string>
+    <string name="drawer_mark_problem_button">标记</string>
+    <string name="drawer_mark_problem_done">已标记：%1$s</string>
     <string name="drawer_background">后台</string>
     <string name="drawer_stop">停止</string>
     <string name="drawer_stop_title">停止会话？</string>

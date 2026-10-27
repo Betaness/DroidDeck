@@ -272,6 +272,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val resumeKeysDown = mutableSetOf<Pair<Int, Int>>()
 
     private var drawerOpen by mutableStateOf(false)
+    /** [mali-g2] When the drawer was last opened: a problem the owner marks from it happened before then. */
+    private var drawerOpenedAt = 0L
     private var quitFrom by mutableStateOf<androidx.compose.ui.geometry.Rect?>(null)
     private var quitFlooded = false
     private var leaving by mutableStateOf(false)
@@ -745,6 +747,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 )
                 androidx.compose.runtime.LaunchedEffect(drawerOpen) {
                     if (drawerOpen) {
+                        drawerOpenedAt = System.currentTimeMillis()
                         syncLossless()
                         releasePads()
                         androidx.compose.runtime.withFrameNanos { }
@@ -961,6 +964,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     onUnfoldedControlsWithController = ::chooseUnfoldedControlsWithController,
                     onBackground = { drawerOpen = false; pip.background(); moveTaskToBack(true) },
                     onShareLogs = { drawerOpen = false; shareCurrentSessionLogs() },
+                    onMarkProblem = ::markProblem,
                     onStop = { drawerOpen = false; SessionService.stop(this@SessionActivity); finish() },
                     onStopFrom = { onScreen ->
                         drawerOpen = false
@@ -1419,6 +1423,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         else -> if (com.droiddeck.launcher.session.SessionPrefs.activeSteamClientArch(this) == "x86_64") getString(R.string.load_starting_steam_x64)
             else getString(R.string.load_starting_steam)
+    }
+
+    /** [mali-g2] The owner says something just went wrong: noted in the play journal, the session's logs kept 30 days. */
+    private fun markProblem() {
+        val at = com.droiddeck.launcher.session.play.PlayJournal.mark(drawerOpenedAt)
+        val time = java.text.DateFormat.getTimeInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(at))
+        Toast.makeText(this, getString(R.string.drawer_mark_problem_done, time), Toast.LENGTH_LONG).show()
     }
 
     private fun shareCurrentSessionLogs() {

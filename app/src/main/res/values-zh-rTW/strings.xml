@@ -646,6 +646,10 @@
     <string name="drawer_logs">工作階段日誌</string>
     <string name="drawer_logs_hint">附加到錯誤報告</string>
     <string name="drawer_share_logs">分享日誌</string>
+    <string name="drawer_mark_problem">出問題了</string>
+    <string name="drawer_mark_problem_hint">記下時間，並將這個工作階段的日誌保留 30 天</string>
+    <string name="drawer_mark_problem_button">標記</string>
+    <string name="drawer_mark_problem_done">已標記：%1$s</string>
     <string name="drawer_background">背景</string>
     <string name="drawer_stop">停止</string>
     <string name="drawer_stop_title">停止工作階段？</string>

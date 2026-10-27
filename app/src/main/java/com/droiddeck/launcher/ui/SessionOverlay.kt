@@ -281,6 +281,8 @@ class DrawerActions(
     val unfoldedControlsWithController: Boolean = false,
     val onUnfoldedControlsWithController: (Boolean) -> Unit = {},
     val onShareLogs: () -> Unit,
+    /** [mali-g2] Notes in the play journal that something just went wrong; null hides the row. */
+    val onMarkProblem: (() -> Unit)? = null,
     val onStop: () -> Unit,
     val onStopFrom: ((androidx.compose.ui.geometry.Rect?) -> Unit)? = null,
     val onClose: () -> Unit,
@@ -697,6 +699,14 @@ internal fun SessionDrawer(open: Boolean, requestedPage: SessionDrawerPage, cont
                                         progress = com.droiddeck.launcher.session.SessionLogShare.progress) {
                                         host.open = null
                                         a.onShareLogs()
+                                    }
+                                }
+                                a.onMarkProblem?.let { onMark ->
+                                    SettingsRow(stringResource(R.string.drawer_mark_problem), stringResource(R.string.drawer_mark_problem_hint)) {
+                                        DrawerOutlineButton(stringResource(R.string.drawer_mark_problem_button), modifier = focus.track(page, "mark-problem")) {
+                                            host.open = null
+                                            onMark()
+                                        }
                                     }
                                 }
                             }

@@ -683,6 +683,10 @@
     <string name="drawer_logs">Session logs</string>
     <string name="drawer_logs_hint">Attach to a bug report</string>
     <string name="drawer_share_logs">Share logs</string>
+    <string name="drawer_mark_problem">Something went wrong</string>
+    <string name="drawer_mark_problem_hint">Notes the time and keeps this session\'s logs for 30 days</string>
+    <string name="drawer_mark_problem_button">Mark</string>
+    <string name="drawer_mark_problem_done">Marked at %1$s</string>
     <string name="drawer_background">Background</string>
     <string name="drawer_stop">Stop</string>
     <string name="drawer_stop_title">Stop session?</string>
