@@ -563,6 +563,8 @@ object PlayJournal {
                 tmp.delete()
             }
         }
+        // The session stopping kills the server too (exit 137); only a death the component saw on its own counts.
+        if (s.vortekExit == null) f.errors.remove("vortek")
         val used = f.gpuUsed ?: PlayRecord.gpuFromEnv(s.env)
         val evidence = PlayRecord.evidenceFrom(
             PlayRecord.evidence(s, endMs), f, usedVortek = used == "vortek",
