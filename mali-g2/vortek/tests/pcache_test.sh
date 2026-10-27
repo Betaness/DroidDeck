@@ -22,6 +22,8 @@
 #              the file is deleted instead of loaded, the run is cold, the next one warm again
 # 10 no-merge  device X only takes pipelines from the file while device Y adds new ones and
 #              saves: X's save finds nothing of its own missing and writes nothing
+# 11 own       the application passes its own cache (PC_CACHE_FILE), over 1 MB, and saves it:
+#              vkGetPipelineCacheData's reply is larger than the reply ring; loaded again, warm
 # "Warm" means the median monolithic pipeline (and fragment library) took under a third of the
 # cold median. Every run also checks each pipeline's pixel (pcache_test's PC verify), so a
 # pipeline taken from the cache under a wrong key fails. Prints PCACHE-PASS or PCACHE-FAIL.
@@ -214,7 +216,21 @@ kill_server
 check_warm $tmp/nomergeY.out $tmp/nomergeY2.out
 check_warm $tmp/mergeA.out $tmp/nomergeA3.out
 
-for f in cold warm periodic-cold periodic-warm mergeA mergeA2 damaged off2; do
+# 11: the application's own cache (PC_CACHE_FILE), over 1 MB: vkGetPipelineCacheData's reply is
+# larger than the 256 KB reply ring (vortek-0013/winlator-0021); saved, loaded again, warm
+own=$tmp/own.bin
+start_server $c1
+run $tmp/own-cold.out PC_CACHE_FILE=$own
+run $tmp/own-warm.out PC_CACHE_FILE=$own
+kill_server
+saved=$(awk '/^PC app cache: [0-9]+ bytes saved/ { print $4; exit }' $tmp/own-cold.out)
+[ "${saved:-0}" -gt 262144 ] || fail "own: the application's cache was ${saved:-not} saved (want over 256 KB)"
+grep -q "^PC app cache: $saved bytes loaded" $tmp/own-warm.out || fail "own: the saved cache was not loaded back"
+c=$(median $tmp/cold.out full) w=$(median $tmp/own-warm.out full)
+awk -v c="$c" -v w="$w" 'BEGIN { exit !(c != "" && w != "" && w * 3 < c) }' || fail "own: full median $w ms with the application's cache (cold $c ms)"
+grep -q 'buffer overflow' $tmp/own-cold.out $tmp/own-warm.out && fail "own: ring overflow"
+
+for f in cold warm periodic-cold periodic-warm mergeA mergeA2 damaged off2 own-warm; do
   printf '%-14s full %6s ms  fslib %6s ms  vslib %6s ms  link %6s ms (medians)\n' $f "$(median $tmp/$f.out full)" "$(median $tmp/$f.out fslib)" \
     "$(median $tmp/$f.out vslib)" "$(median $tmp/$f.out link)"
 done

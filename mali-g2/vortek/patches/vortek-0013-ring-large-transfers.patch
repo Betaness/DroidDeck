@@ -1,0 +1,48 @@
+[mali-g2] Transfers larger than a ring go through it in pieces instead of failing. The server
+answers on the 256 KB reply ring; vkGetPipelineCacheData of an application's own cache (or any reply
+over 256 KB) made the server's write fail after the header and the client's read fail with "ring:
+buffer overflow on read (2295918/262144)": VK_ERROR_DEVICE_LOST and a connection out of step.
+Both sides now move such a transfer in pieces of at most half the ring while the other side
+moves the rest (a reader and a writer each waiting for half the ring cannot block each other).
+The client and the server come from the same APK; both need it.
+Test: tests/ring_test.c (both ring_buffer.c files, 3 MB through a 256 KB ring) and
+tests/pcache_test.sh step 11 (PC_CACHE_FILE: a 1.3 MB application cache saved and loaded).
+
+diff --git a/src/ring_buffer.c b/src/ring_buffer.c
+index a1f2940..cc17afe 100644
+--- a/src/ring_buffer.c
++++ b/src/ring_buffer.c
+@@ -141,10 +141,17 @@ uint32_t RingBuffer_freeSpace(RingBuffer* ring) {
+     return ring->bufferSize - RingBuffer_size(ring);
+ }
+ 
++/* [mali-g2] A transfer larger than the ring (vkGetPipelineCacheData of a game's own cache sends
++ * megabytes back through the 256 KB reply ring) goes in pieces of at most half the ring while the
++ * other side moves the rest: a reader waiting for its piece and a writer waiting for room for its
++ * piece would together need more than the ring holds, so they never wait on each other. */
+ bool RingBuffer_read(RingBuffer* ring, void* data, uint32_t size) {
+     if (size > ring->bufferSize) {
+-        debug_printf("ring: buffer overflow on read (%d/%d)\n", size, ring->bufferSize);
+-        return false;
++        for (uint32_t done = 0, n; done < size; done += n) {
++            n = size - done < ring->bufferSize / 2 ? size - done : ring->bufferSize / 2;
++            if (!RingBuffer_read(ring, (char*)data + done, n)) return false;
++        }
++        return true;
+     }
+ 
+     if (!RingBuffer_waitForRead(ring, size)) return false;
+@@ -166,8 +173,11 @@ bool RingBuffer_read(RingBuffer* ring, void* data, uint32_t size) {
+ 
+ bool RingBuffer_write(RingBuffer* ring, const void* data, uint32_t size) {
+     if (size > ring->bufferSize) {
+-        debug_printf("ring: buffer overflow on write (%d/%d)\n", size, ring->bufferSize);
+-        return false;
++        for (uint32_t done = 0, n; done < size; done += n) {
++            n = size - done < ring->bufferSize / 2 ? size - done : ring->bufferSize / 2;
++            if (!RingBuffer_write(ring, (const char*)data + done, n)) return false;
++        }
++        return true;
+     }
+ 
+     if (!RingBuffer_waitForWrite(ring, size)) return false;
