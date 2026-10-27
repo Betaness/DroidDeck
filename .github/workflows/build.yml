@@ -113,7 +113,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # [mali-g2] The in-process Mali path (mali-g2/hybris, off unless the session pref gpuPath is "hybris"):
+  # [mali-g2] The in-process Mali path (mali-g2/hybris; session pref gpuPath, "hybris" by default on the Xring O3):
   # libhybris and the guest's ICD, glibc aarch64 like the Vortek client. The APK builds without it.
   hybris:
     name: libhybris Vulkan (mali-g2)

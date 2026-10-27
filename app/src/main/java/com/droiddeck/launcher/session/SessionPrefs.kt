@@ -471,8 +471,12 @@ object SessionPrefs {
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 
-    /** [mali-g2] How games reach the GPU on Mali: "vortek" (forwarded, the default) or "hybris" (in-process, [HybrisGpu]). */
-    fun gpuPath(context: Context): String = HybrisGpu.path(prefs(context).getString("gpuPath", null))
+    /**
+     * [mali-g2] How games reach the GPU on Mali: "vortek" (forwarded) or "hybris" (in-process, [HybrisGpu]).
+     * Unset, the Xring O3 uses "hybris" and other SoCs "vortek".
+     */
+    fun gpuPath(context: Context): String =
+        HybrisGpu.path(prefs(context).getString("gpuPath", null), Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL == "O3")
 
     fun setGpuPath(context: Context, path: String) {
         prefs(context).edit().putString("gpuPath", path).apply()

@@ -449,7 +449,8 @@ def hybris_gpu(command, env):
     processes run the Mali driver themselves through libhybris (mali-g2/hybris) instead of forwarding every
     Vulkan call to the Vortek server, and hand their frames to the compositor directly. Games only: Steam's
     web views stay on Vortek. libhybris-common takes static TLS, so it is preloaded rather than dlopened;
-    the driver and Android's libraries come from the Android system tree the app binds in for it."""
+    the driver and Android's libraries come from the Android system tree the app binds in for it. Unset, the app
+    asks for it on the Xring O3."""
     if env.get("DROIDDECK_GPU_PATH") != "hybris" or env.get("BL_GPU_MODE") != "vortek":
         return env
     if len(command) < 2 or command[1] != "waitforexitandrun":

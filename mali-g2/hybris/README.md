@@ -6,12 +6,14 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 `/vendor/lib64/hw/vulkan.mali.so`，没有转发和服务端。原型在设备上测得每 4 万条命令（录制 + 提交等待）省约 1.8 ms，
 另外省下 Vortek 服务端约 16% 个核。
 
-默认关闭。会话设置 `gpuPath` 为 `hybris` 时只有**游戏**走这条路，Steam 客户端（网页界面）仍走 Vortek。
-玄戒 O3 上能跑的游戏更快（半屏鸭科夫标题 88.2±0.8 对 Vortek 78.5±1.0 fps，主线程 10.32 对 10.99 ms/帧，13 个会话没有崩溃），
-9451a6f3 时 32 位游戏起不来：A.V.A.（D3D9，WoW64）建交换链图像失败（`Failed to create image: -1000158000`），DXVK 映射内存报
-`VK_ERROR_OUT_OF_HOST_MEMORY`，游戏约一分钟后退出；同一会话走 Vortek 时交换链正常建好。原因是 Mali 没有
-`VK_EXT_map_memory_placed`，WoW64 的 winevulkan 退到 `VK_EXT_external_memory_host`，而这条路在 Mali 上两处都不通
-（`tests/wow64_memory_test.c`）；`src/placed.c` 补上了这个扩展，还没在设备上测，所以还不默认打开。
+会话设置 `gpuPath` 为 `hybris` 时只有**游戏**走这条路，Steam 客户端（网页界面）仍走 Vortek。没设时玄戒 O3 默认开、其他 SoC 默认关
+（`vortek` 关掉）。O3 上半屏鸭科夫标题 82.1±0.1 对 Vortek 75.8±0.2 fps（各 20、30 分钟，同样机身 41–42 °C，只算 120 Hz 窗口），
+主线程 10.9 对 11.1 ms/帧，20 分钟里游戏进程内存不涨；更早的 A/B 是 88.2±0.8 对 78.5±1.0。
+9451a6f3 曾因 32 位游戏起不来改回默认关：A.V.A.（D3D9，WoW64）建交换链图像失败（`Failed to create image: -1000158000`），
+DXVK 映射内存报 `VK_ERROR_OUT_OF_HOST_MEMORY`。原因是 Mali 没有 `VK_EXT_map_memory_placed`，WoW64 的 winevulkan 退到
+`VK_EXT_external_memory_host`，而这条路在 Mali 上两处都不通（`tests/wow64_memory_test.c`）；`src/placed.c` 补上了这个扩展，
+之后 A.V.A. 能到服务器选择画面、开关 Steam 菜单后继续出图（3 次，每次约 9 分钟），这两个错误不再出现。
+x86_64 Proton 的游戏和缺文件时仍自动走 Vortek（见下）。
 
 ## 组成
 
@@ -48,9 +50,9 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 都是按 soname 命名的实文件（APK 的 assets 存不了符号链接）。`GUEST_DIR` 编进了 libhybris（链接器目录、RUNPATH），
 别处测试用 `tests/run.sh`（设 `HYBRIS_LINKER_DIR`、`LD_LIBRARY_PATH`、`LD_PRELOAD`、`VK_ICD_FILENAMES`）。
 
-## App 里怎么接（默认关）
+## App 里怎么接（O3 默认开）
 
-- `session/HybrisGpu.kt`、`SessionPrefs.gpuPath`（`droiddeckctl prefs set --type string session gpuPath hybris` 开，`vortek` 或删掉即关）。
+- `session/HybrisGpu.kt`、`SessionPrefs.gpuPath`（`droiddeckctl prefs set --type string session gpuPath hybris` 开，`vortek` 关；删掉回到默认：O3 开，其他关）。
 - 打开时 `SessionService` 挂入安卓系统目录（和 `androidSystemBinds` 相同），guest 环境加 `DROIDDECK_GPU_PATH=hybris`（rootfs 里有 ICD 清单时）。
   droiddeck-env 里写 `DROIDDECK_GPU_PATH=vortek` 可整体关掉，game-environment.json 里给单个游戏写也行。
 - `droiddeck-game-env` 的 `hybris_gpu`：只对 ARM64 Proton（有 `files/lib/wine/aarch64-unix`）的游戏启动（`waitforexitandrun`）、
