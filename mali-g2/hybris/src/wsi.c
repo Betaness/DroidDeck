@@ -1285,6 +1285,13 @@ static uint32_t rootOrderOf(const xcb_query_tree_reply_t* tree) {
     return hash ? hash : 1;
 }
 
+/* A parent smaller than the window clips it. Wine puts a game's Vulkan window in a 1x1 parent
+ * when it shows the frames elsewhere (A.V.A.: a 1024x768 client window at 0,0, its frames copied
+ * into the game window in the middle of the screen). */
+static bool clippedByParent(const Swapchain* sc, int x, int y, int w, int h) {
+    return x < sc->clipX0 || y < sc->clipY0 || x + w > sc->clipX1 || y + h > sc->clipY1;
+}
+
 /* At every level from the window up to its top-level window, a mapped sibling stacked above it that
  * overlaps the window hides part of it, and so does a mapped child of the window. */
 /* The first requests of an occlusion check, sent ahead so that they share a round trip with the
@@ -1386,7 +1393,9 @@ static bool occlusionCollect(Swapchain* sc, const OcclusionQuery* q, int x, int 
                     }
                     occluded = true;
                 }
-                if (rectContains(ox, oy, ow, oh, x, y, w, h)) *covered = true;
+                /* What lies over a clipped window's place says nothing: its frames are shown elsewhere
+                 * (Steam raised over Wine's 1x1 parent froze A.V.A.'s picture after a menu). */
+                if (rectContains(ox, oy, ow, oh, x, y, w, h) && !clippedByParent(sc, x, y, w, h)) *covered = true;
             }
             free(a);
             free(g);
@@ -1546,14 +1555,16 @@ static VkResult presentZeroCopyLocked(Swapchain* sc, VkQueue queue, uint32_t ima
         free(rootGeo);
     }
     /* Fully covered (also by a window of ours on a layer above): paced on the covered path. */
-    sc->occluded = checkOccluded(sc, x, y, w, h, sent ? &query : NULL) || sc->covered;
-    if (sc->occluded) return VK_NOT_READY;
-    /* A parent smaller than the window clips it: Wine puts a game's Vulkan window in a 1x1 parent
-     * when it shows the frames elsewhere. The X11 path lets Wine copy them. */
-    if (x < sc->clipX0 || y < sc->clipY0 || x + w > sc->clipX1 || y + h > sc->clipY1) {
+    bool occluded = checkOccluded(sc, x, y, w, h, sent ? &query : NULL) || sc->covered;
+    /* A layer of a clipped window at its own place would show Wine's frames in the wrong place, over
+     * the game window that takes the clicks. The X11 path lets Wine copy them. */
+    if (!sc->covered && clippedByParent(sc, x, y, w, h)) {
+        sc->occluded = false;
         sc->x11Why = "a smaller parent window clips it (Wine shows its frames in another window)";
         return VK_NOT_READY;
     }
+    sc->occluded = occluded;
+    if (sc->occluded) return VK_NOT_READY;
     VkResult result = presentToCompositor(sc, queue, imageIndex, waits, waitCount, x, y, w, h, sc->rootW, sc->rootH, sc->stackKey,
                                           topLevelOf(sc->chain, sc->chainLength));
     if (result == VK_SUCCESS) publishLayer(sc, true, x, y, w, h);
