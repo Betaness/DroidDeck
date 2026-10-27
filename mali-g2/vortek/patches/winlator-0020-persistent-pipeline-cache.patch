@@ -24,7 +24,7 @@ index 0f1caaf..d4a350e 100644
  #endif
 \ No newline at end of file
 diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
-index ecec294..20e9e4b 100644
+index 5df8c41..d13ad28 100644
 --- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
 +++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
 @@ -46,6 +46,7 @@ typedef struct VkContext {
@@ -112,10 +112,10 @@ index a63c582..d7e4006 100644
      ArrayList_free(&pipelineCreateRequest->memoryPool.allocationList, false);
  
 diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-index 201da4b..aa7fd47 100644
+index 7a06bb0..3d43929 100644
 --- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
 +++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
-@@ -230,6 +230,10 @@ void vt_handle_vkCreateDevice(VkContext* context) {
+@@ -232,6 +232,10 @@ void vt_handle_vkCreateDevice(VkContext* context) {
      VkDevice device;
      VkResult result = vulkanWrapper.vkCreateDevice(physicalDevice, &createInfo, NULL, &device);
      if (result == VK_SUCCESS) initVulkanDevice(context, physicalDevice, device);
@@ -127,10 +127,10 @@ index 201da4b..aa7fd47 100644
  
      VT_SERIALIZE_CMD(VkDevice, device);
 diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
-index 9f4684d..425d390 100644
+index e759186..0f3973c 100644
 --- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
 +++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
-@@ -391,6 +391,10 @@ static void releaseDevice(VkContext* context, OwnedDevice* owned, ReleaseStats*
+@@ -393,6 +393,10 @@ static void releaseDevice(VkContext* context, OwnedDevice* owned, ReleaseStats*
      /* library pipelines whose destruction was deferred, the native image set */
      AsyncPipelineCreator_destroyDevice(device);
      ResourceMemory_untrackDevice(device);
@@ -141,7 +141,7 @@ index 9f4684d..425d390 100644
      vulkanWrapper.vkDestroyDevice(device, NULL);
  }
  
-@@ -682,6 +686,7 @@ static void freeVkContext(VkContext* context) {
+@@ -685,6 +689,7 @@ static void freeVkContext(VkContext* context) {
  
      MEMFREE(context->memoryPool.data);
      MEMFREE(context->engineName);
