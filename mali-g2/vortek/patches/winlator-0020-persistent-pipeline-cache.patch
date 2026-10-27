@@ -1,0 +1,168 @@
+[mali-g2] Hooks for the persistent implicit pipeline cache (mali-g2/vortek/src/pipeline_cache.c).
+
+DXVK passes no VkPipelineCache and the Mali driver keeps no shader cache of its own, so every game
+start compiled every pipeline again (~15 ms for a material-sized shader on the Mali-G2, ~0.2 ms
+from a cache). The connection remembers VkApplicationInfo.pApplicationName; vkCreateDevice
+registers the device, whose first pipeline loads a VkPipelineCache from
+<VORTEK_PIPELINE_CACHE_DIR>/<application>.<driver key>.vkpc; pipeline creation uses it when the
+application passes none (not for plain GPL fast links, nor for calls with a shader module
+identifier) and reports counts and times; releasing a device (vkDestroyDevice, or the cleanup after
+a client that is gone) saves what is new and destroys the cache. Test: tests/pcache_test.sh.
+
+diff --git a/app/src/main/cpp/vortekrenderer/include/async_pipeline_creator.h b/app/src/main/cpp/vortekrenderer/include/async_pipeline_creator.h
+index 0f1caaf..d4a350e 100644
+--- a/app/src/main/cpp/vortekrenderer/include/async_pipeline_creator.h
++++ b/app/src/main/cpp/vortekrenderer/include/async_pipeline_creator.h
+@@ -12,4 +12,8 @@ extern void AsyncPipelineCreator_create(VkContext* context, PipelineType type);
+ extern void AsyncPipelineCreator_destroyPipeline(VkDevice device, VkPipeline pipeline);
+ extern void AsyncPipelineCreator_destroyDevice(VkDevice device);
+ 
++#ifdef VORTEK_STANDALONE
++#include "pipeline_cache.h" /* mali-g2/vortek/src */
++#endif
++
+ #endif
+\ No newline at end of file
+diff --git a/app/src/main/cpp/vortekrenderer/include/vk_context.h b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+index ecec294..20e9e4b 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vk_context.h
++++ b/app/src/main/cpp/vortekrenderer/include/vk_context.h
+@@ -46,6 +46,7 @@ typedef struct VkContext {
+     JMethods jmethods;
+     char* engineName;
+     uint32_t engineVersion;
++    char* appName; /* [mali-g2] VkApplicationInfo.pApplicationName: names the pipeline cache file */
+     VkDriverId driverID;
+ 
+     /* [mali-g2] What this connection created and has not destroyed yet (OwnedDevice*, VkInstance),
+diff --git a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
+index a63c582..d7e4006 100644
+--- a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
++++ b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
+@@ -2,6 +2,7 @@
+ #include "vortek_serializer.h"
+ #include "vulkan_helper.h"
+ #include <pthread.h>
++#include <time.h>
+ 
+ typedef struct PipelineCreateRequest {
+     VkDevice device;
+@@ -132,10 +133,51 @@ void AsyncPipelineCreator_destroyDevice(VkDevice device) {
+     pthread_mutex_unlock(&libraryRefsMutex);
+ }
+ 
++#ifdef VORTEK_STANDALONE
++static uint64_t pipelineNowNs(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
++/* [mali-g2] The device's persistent implicit cache (src/pipeline_cache.c) when the application
++ * passes none (DXVK), except for calls that only fast-link libraries (cheap, they would only fill
++ * the cache) and calls with a shader module identifier (the identifier hashes the application's
++ * SPIR-V, not what the client rewrote it to, so a cached pipeline could be the wrong code). */
++static VkPipelineCache choosePipelineCache(PipelineCreateRequest* request) {
++    if (request->pipelineCache) return request->pipelineCache;
++    if (request->type == PIPELINE_TYPE_GRAPHICS) {
++        const VkGraphicsPipelineCreateInfo* createInfos = request->pipelineInfos;
++        bool allFastLinks = true;
++        for (uint32_t i = 0; i < request->pipelineCount && allFastLinks; i++) allFastLinks = PipelineCache_isFastLink(&createInfos[i]);
++        if (allFastLinks) return VK_NULL_HANDLE;
++        for (uint32_t i = 0; i < request->pipelineCount; i++) {
++            if (PipelineCache_usesModuleIdentifier(createInfos[i].pStages, createInfos[i].stageCount)) return VK_NULL_HANDLE;
++        }
++    }
++    else if (request->type == PIPELINE_TYPE_COMPUTE) {
++        const VkComputePipelineCreateInfo* createInfos = request->pipelineInfos;
++        for (uint32_t i = 0; i < request->pipelineCount; i++) {
++            if (PipelineCache_usesModuleIdentifier(&createInfos[i].stage, 1)) return VK_NULL_HANDLE;
++        }
++    }
++    return PipelineCache_get(request->device);
++}
++#endif
++
+ static void pipelineCreateThread(void* param) {
+     PipelineCreateRequest* pipelineCreateRequest = param;
+     VkPipeline pipelines[pipelineCreateRequest->pipelineCount];
+     VkResult result = VK_SUCCESS;
++#ifdef VORTEK_STANDALONE
++    VkPipelineCache implicitCache = VK_NULL_HANDLE;
++    uint64_t createStart = 0;
++    if (__atomic_load_n(&pipelineCreateRequest->context->status, __ATOMIC_ACQUIRE) >= 0) {
++        VkPipelineCache chosen = choosePipelineCache(pipelineCreateRequest);
++        if (chosen != pipelineCreateRequest->pipelineCache) implicitCache = pipelineCreateRequest->pipelineCache = chosen;
++        createStart = pipelineNowNs();
++    }
++#endif
+ 
+     /* [mali-g2] the client is gone: nobody would get or destroy the pipelines (winlator-0015) */
+     if (__atomic_load_n(&pipelineCreateRequest->context->status, __ATOMIC_ACQUIRE) < 0) {
+@@ -171,6 +213,11 @@ static void pipelineCreateThread(void* param) {
+         result = vulkanWrapper.vkCreateComputePipelines(pipelineCreateRequest->device, pipelineCreateRequest->pipelineCache, pipelineCreateRequest->pipelineCount, createInfos, NULL, pipelines);
+     }
+ 
++#ifdef VORTEK_STANDALONE
++    if (createStart && result == VK_SUCCESS)
++        PipelineCache_noteCreated(pipelineCreateRequest->device, pipelineCreateRequest->pipelineCount, pipelineNowNs() - createStart, implicitCache != VK_NULL_HANDLE);
++#endif
++
+     vt_free(&pipelineCreateRequest->memoryPool);
+     ArrayList_free(&pipelineCreateRequest->memoryPool.allocationList, false);
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/request_handler.c b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+index 201da4b..aa7fd47 100644
+--- a/app/src/main/cpp/vortekrenderer/src/request_handler.c
++++ b/app/src/main/cpp/vortekrenderer/src/request_handler.c
+@@ -230,6 +230,10 @@ void vt_handle_vkCreateDevice(VkContext* context) {
+     VkDevice device;
+     VkResult result = vulkanWrapper.vkCreateDevice(physicalDevice, &createInfo, NULL, &device);
+     if (result == VK_SUCCESS) initVulkanDevice(context, physicalDevice, device);
++#ifdef VORTEK_STANDALONE
++    /* [mali-g2] the device's implicit, persistent pipeline cache (src/pipeline_cache.c) */
++    if (result == VK_SUCCESS) PipelineCache_deviceCreated(physicalDevice, device, context->appName, context->engineName);
++#endif
+     if (result == VK_SUCCESS) VkContext_addDevice(context, physicalDevice, device, &createInfo);
+ 
+     VT_SERIALIZE_CMD(VkDevice, device);
+diff --git a/app/src/main/cpp/vortekrenderer/src/vk_context.c b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+index 9f4684d..425d390 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vk_context.c
++++ b/app/src/main/cpp/vortekrenderer/src/vk_context.c
+@@ -391,6 +391,10 @@ static void releaseDevice(VkContext* context, OwnedDevice* owned, ReleaseStats*
+     /* library pipelines whose destruction was deferred, the native image set */
+     AsyncPipelineCreator_destroyDevice(device);
+     ResourceMemory_untrackDevice(device);
++#ifdef VORTEK_STANDALONE
++    /* saves what the device added to the persistent pipeline cache (src/pipeline_cache.c) */
++    PipelineCache_deviceDestroyed(device);
++#endif
+     vulkanWrapper.vkDestroyDevice(device, NULL);
+ }
+ 
+@@ -682,6 +686,7 @@ static void freeVkContext(VkContext* context) {
+ 
+     MEMFREE(context->memoryPool.data);
+     MEMFREE(context->engineName);
++    MEMFREE(context->appName);
+     free(context);
+ }
+ 
+diff --git a/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c b/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
+index e743fd8..385a171 100644
+--- a/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
++++ b/app/src/main/cpp/vortekrenderer/src/vulkan_helper.c
+@@ -138,10 +138,12 @@ void initVulkanInstance(VkContext* context, VkInstance instance, const VkApplica
+     logExternalMemoryCaps(context, physicalDevices[0], &fdProperties, &dmabufProperties);
+ 
+     MEMFREE(context->engineName);
++    MEMFREE(context->appName);
+     context->engineVersion = 0;
+ 
+     if (applicationInfo) {
+         context->engineName = applicationInfo->pEngineName ? strdup(applicationInfo->pEngineName) : NULL;
++        context->appName = applicationInfo->pApplicationName ? strdup(applicationInfo->pApplicationName) : NULL;
+         context->engineVersion = applicationInfo->engineVersion;
+     }
+ 

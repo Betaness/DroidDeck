@@ -52,6 +52,12 @@ class VortekServerComponent(
         env.add("VORTEK_PRESENT_LOG=0")
         // The compositor listens there (waylandcomp/src/vortek_present.c) for zero-copy presents.
         socket.parentFile?.parentFile?.let { env.add("VORTEK_PRESENT_SOCKET=" + File(it, "vortek-present").path) }
+        // Compiled pipelines per game and driver build (mali-g2/vortek/src/pipeline_cache.c); in the
+        // cache dir, which Android may clear when storage runs low. droiddeck-env can set another
+        // directory, or VORTEK_PIPELINE_CACHE=0 to turn it off.
+        if (extraEnv.none { it.startsWith("VORTEK_PIPELINE_CACHE_DIR=") }) {
+            env.add("VORTEK_PIPELINE_CACHE_DIR=" + File(app().cacheDir, PIPELINE_CACHE_DIR).path)
+        }
         env.addAll(extraEnv)
         val log = logFile?.let {
             runCatching { PrintWriter(FileWriter(it, true)) }.onFailure { e -> Log.w(TAG, "could not open $it", e) }.getOrNull()
@@ -108,6 +114,7 @@ class VortekServerComponent(
         const val GUEST_DIR = "/usr/local/lib/droiddeck-vortek"
         const val GUEST_ICD = "$GUEST_DIR/vortek_icd.aarch64.json"
         private const val HAL_DIR = "/vendor/lib64/hw"
+        private const val PIPELINE_CACHE_DIR = "vortek-pipelines"
         private const val MAX_RESTARTS = 5
         private const val RESTART_WINDOW_MS = 60_000L
 

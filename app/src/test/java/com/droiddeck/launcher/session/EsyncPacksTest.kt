@@ -121,15 +121,23 @@ class EsyncPacksTest {
 
     private fun directory(name: String) = TarArchiveEntry(name) to null
 
-    private fun packTar(pack: JSONObject, ntdll: ByteArray = ntdllBytes, prefix: String = ""): TarArchiveInputStream = tar(
-        directory("${prefix}files/"),
-        directory("${prefix}files/bin-arm64/"),
-        regular("${prefix}files/bin-arm64/wineserver", wineserverBytes),
-        directory("${prefix}files/lib/"),
-        directory("${prefix}files/lib/wine/"),
-        directory("${prefix}files/lib/wine/aarch64-unix/"),
-        regular("${prefix}files/lib/wine/aarch64-unix/ntdll.so", ntdll),
-        regular("${prefix}pack.json", pack.toString().toByteArray()),
+    private fun packTar(
+        pack: JSONObject,
+        ntdll: ByteArray = ntdllBytes,
+        prefix: String = "",
+        winex11: ByteArray? = null,
+    ): TarArchiveInputStream = tar(
+        *listOfNotNull(
+            directory("${prefix}files/"),
+            directory("${prefix}files/bin-arm64/"),
+            regular("${prefix}files/bin-arm64/wineserver", wineserverBytes),
+            directory("${prefix}files/lib/"),
+            directory("${prefix}files/lib/wine/"),
+            directory("${prefix}files/lib/wine/aarch64-unix/"),
+            regular("${prefix}files/lib/wine/aarch64-unix/ntdll.so", ntdll),
+            winex11?.let { regular("${prefix}${EsyncPacks.WINEX11}", it) },
+            regular("${prefix}pack.json", pack.toString().toByteArray()),
+        ).toTypedArray(),
     )
 
     private fun rejects(block: () -> Unit) {
@@ -664,6 +672,40 @@ class EsyncPacksTest {
         val copy = JSONArray(listOf("files/bin-arm64/wine", "files/lib/wine/aarch64-unix/wine", "files/lib/wine/aarch64-unix/wine-preloader", "proton"))
         assertTrue(EsyncPacks.place(store, entry, packTar(packJson(id).put("copy", copy).put("revoked", false).put("ignored", JSONObject.NULL))))
         assertEquals(setOf(id), EsyncPacks.installedIds(store))
+    }
+
+    @Test fun placeInstallsTheExtraFilesPackJsonLists() {
+        val store = temp.newFolder("store")
+        val id = "ge-a-r3"
+        val entry = entries(entryJson(id)).single()
+        val winex11 = "patched winex11.so".toByteArray()
+        val extras = JSONObject().put(EsyncPacks.WINEX11, sha(winex11))
+        assertTrue(EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", extras), winex11 = winex11)))
+        val file = File(store, "packs/$id/${EsyncPacks.WINEX11}")
+        assertTrue(file.canExecute())
+        assertTrue(file.readBytes().contentEquals(winex11))
+    }
+
+    @Test fun placeRejectsExtrasThatDisagreeWithPackJson() {
+        val store = temp.newFolder("store")
+        val id = "ge-a-r3"
+        val entry = entries(entryJson(id)).single()
+        val winex11 = "patched winex11.so".toByteArray()
+        val extras = JSONObject().put(EsyncPacks.WINEX11, sha(winex11))
+        rejects { EsyncPacks.place(store, entry, packTar(packJson(id), winex11 = winex11)) }
+        rejects { EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", extras))) }
+        rejects { EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", extras), winex11 = "other".toByteArray())) }
+        rejects {
+            EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", extras).put("copy", JSONArray(listOf(EsyncPacks.WINEX11))),
+                winex11 = winex11))
+        }
+        rejects {
+            val unknown = JSONObject().put("files/lib/wine/aarch64-unix/win32u.so", sha(winex11))
+            EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", unknown)))
+        }
+        rejects { EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", JSONObject.NULL))) }
+        rejects { EsyncPacks.place(store, entry, packTar(packJson(id).put("extras", JSONObject().put(EsyncPacks.WINEX11, "x")), winex11 = winex11)) }
+        assertTrue(File(store, "packs").list()!!.isEmpty())
     }
 
     @Test fun copyPathsFollowTheGuestRules() {

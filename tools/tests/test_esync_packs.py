@@ -23,6 +23,7 @@ GLOBALS = SYNC["select"].__globals__
 NTDLL = SYNC["NTDLL"]
 WINESERVER = SYNC["WINESERVER"]
 COPY = list(SYNC["DEFAULT_COPY"])
+WINEX11 = "files/lib/wine/aarch64-unix/winex11.so"
 REAL_DIRS = SYNC["REAL_DIRS"]
 RECORD = SYNC["RECORD"]
 VALVE_LINE = "1789159687 experimental-11.0-20260910b-arm64"
@@ -302,6 +303,37 @@ class ShadowTest(SyncTestCase):
         self.assertIn("unusable", said)
         self.assertNotIn("damaged", said)
         self.assertTrue((root / "packs" / pack["id"] / ".complete").exists())
+
+    def test_extra_files_replace_their_stock_links(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        (tool / WINEX11).write_bytes(b"stock winex11")
+        pack_id = "valve-experimental-r3"
+        pack_dir = root / "packs" / pack_id
+        pack = make_pack(root, tool, pack_id, extras={WINEX11: hashlib.sha256(b"patched winex11").hexdigest()})
+        (pack_dir / WINEX11).write_bytes(b"patched winex11")
+        self.assertEqual([p["id"] for p in SYNC["load_packs"](root)], [pack_id])
+        dist = Path(SYNC["ensure_dist"](root, tool, pack))
+        info = os.lstat(dist / WINEX11)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual((dist / WINEX11).read_bytes(), b"patched winex11")
+        self.assertEqual(os.readlink(dist / "files/lib/wine/aarch64-unix/winevulkan.so"),
+                         str(tool / "files/lib/wine/aarch64-unix/winevulkan.so"))
+        (dist / WINEX11).write_bytes(b"damaged")
+        self.assertEqual(Path(SYNC["ensure_dist"](root, tool, pack)), dist)
+        self.assertEqual((dist / WINEX11).read_bytes(), b"patched winex11")
+        (pack_dir / WINEX11).write_bytes(b"tampered")
+        (dist / WINEX11).unlink()
+        with self.assertRaises(SYNC["PackDamaged"]):
+            SYNC["ensure_dist"](root, tool, pack)
+
+    def test_packs_without_extras_keep_stock_winex11(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        (tool / WINEX11).write_bytes(b"stock winex11")
+        pack = make_pack(root, tool, "valve-experimental-r2")
+        dist = Path(SYNC["ensure_dist"](root, tool, pack))
+        self.assertEqual(os.readlink(dist / WINEX11), str(tool / WINEX11))
 
     def test_concurrent_ensure_dist_builds_one_dist(self):
         root = self.store()
@@ -865,6 +897,11 @@ class MatchingTest(SyncTestCase):
         make_pack(root, tool, "renamed")
         (root / "packs/renamed").rename(root / "packs/other-name")
         make_pack(root, tool, "badformat", format=True)
+        make_pack(root, tool, "badextra", extras={"files/lib/wine/aarch64-unix/win32u.so": "0" * 64})
+        make_pack(root, tool, "badextrahash", extras={WINEX11: "x"})
+        make_pack(root, tool, "copiedextra", extras={WINEX11: "0" * 64}, copy=COPY + [WINEX11])
+        (root / "packs/copiedextra" / WINEX11).write_bytes(b"x")
+        make_pack(root, tool, "missingextra", extras={WINEX11: "0" * 64})
         make_pack(root, tool, ".hidden")
         (root / "packs/broken").mkdir()
         (root / "packs/broken/.complete").write_text("")

@@ -40,6 +40,7 @@ object EsyncPacks {
     const val PUBLIC_KEY = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFyqZQAMh3g3nsEGLU+kBGVPBEkXrDv5F3kPtuQ+FV1DkTCGmYUQ1LS9wJtHGt0Ht4wToHGGEp9yzDibYZ4/zhg=="
     const val NTDLL = "files/lib/wine/aarch64-unix/ntdll.so"
     const val WINESERVER = "files/bin-arm64/wineserver"
+    const val WINEX11 = "files/lib/wine/aarch64-unix/winex11.so"
     const val GUEST_STORE = "/root/.local/share/droiddeck-esync"
     const val EXTRA_ASSETS = "droiddeck-esync-extra"
     private const val STORE = "root/.local/share/droiddeck-esync"
@@ -68,6 +69,8 @@ object EsyncPacks {
     private val RETIRED = Regex("\\..+\\.del-[0-9a-f]{16}")
     private val BINARIES = listOf(NTDLL, WINESERVER)
     private val EXPECTED = setOf(PACK_JSON, NTDLL, WINESERVER)
+    // Other files of the same wine build a pack may replace, listed in pack.json "extras" (path -> sha256).
+    private val EXTRAS = setOf(WINEX11)
     private val REAL_DIRS = setOf(".", "files", "files/bin-arm64", "files/lib", "files/lib/wine", "files/lib/wine/aarch64-unix")
     private val DIRECTORIES = REAL_DIRS - "." + ""
     private val STOCK_LINKS = setOf("dist.lock", "files/steampipe_fixups_mtime")
@@ -743,12 +746,16 @@ object EsyncPacks {
         val temp = File(packs, ".${entry.id}.tmp-${token()}")
         try {
             if (!temp.mkdir()) throw IOException("could not create $temp")
-            unpack(tar, temp)
+            val carried = unpack(tar, temp)
             val manifest = File(temp, PACK_JSON)
-            checkPack(JSONObject(manifest.readText()), entry)
-            for (rel in BINARIES) {
+            val pack = JSONObject(manifest.readText())
+            checkPack(pack, entry)
+            // The extras are covered by the archive's checksum in the index, like pack.json itself.
+            val extras = extraHashes(pack.opt("extras")).orEmpty()
+            require(carried - EXPECTED == extras.keys) { "${entry.id}: the pack's files differ from its pack.json" }
+            for ((rel, expected) in BINARIES.associateWith { entry.files.getValue(it) } + extras) {
                 val file = File(temp, rel)
-                require(Hashes.sha256(file) == entry.files[rel]) { "${entry.id}: $rel does not match the index" }
+                require(Hashes.sha256(file) == expected) { "${entry.id}: $rel does not match the index" }
                 if (!file.setReadable(true, false) || !file.setExecutable(true, false)) throw IOException("could not mark $rel executable")
             }
             manifest.setReadable(true, false)
@@ -779,12 +786,24 @@ object EsyncPacks {
         require(pack.opt("source_match") == entry.sourceMatch) { "${entry.id}: source_match differs from the index" }
         require(strictHashes(pack.opt("files")) == entry.files) { "${entry.id}: file hashes differ from the index" }
         require(!pack.has("copy") || validCopy(pack.opt("copy"))) { "${entry.id}: invalid copy list" }
+        val extras = extraHashes(pack.opt("extras"))
+        require(extras != null) { "${entry.id}: invalid extras" }
+        val copy = pack.optJSONArray("copy")?.let { list -> (0 until list.length()).mapNotNull { list.opt(it) as? String } }.orEmpty()
+        require(copy.none { it in extras.keys }) { "${entry.id}: a file is both copied and replaced" }
         require(!truthy(pack.opt("revoked")) && !truthy(pack.opt("ignored"))) { "${entry.id}: pack.json is revoked" }
     }
 
     private fun strictHashes(value: Any?): Map<String, String>? {
         if (value !is JSONObject) return null
         return BINARIES.associateWith { rel -> (value.opt(rel) as? String)?.takeIf { SHA256.matches(it) } ?: return null }
+    }
+
+    private fun extraHashes(value: Any?): Map<String, String>? {
+        if (value == null) return emptyMap()
+        if (value !is JSONObject) return null
+        return value.keys().asSequence().associateWith { rel ->
+            (value.opt(rel) as? String)?.takeIf { rel in EXTRAS && SHA256.matches(it) } ?: return null
+        }
     }
 
     private fun validCopy(value: Any?): Boolean =
@@ -807,7 +826,7 @@ object EsyncPacks {
         else -> true
     }
 
-    internal fun unpack(tar: TarArchiveInputStream, dest: File) {
+    internal fun unpack(tar: TarArchiveInputStream, dest: File): Set<String> {
         val seen = HashSet<String>()
         while (true) {
             val entry = tar.nextEntry ?: break
@@ -822,7 +841,8 @@ object EsyncPacks {
                 it.fd.sync()
             }
         }
-        require(seen == EXPECTED) { "the pack lacks ${(EXPECTED - seen).joinToString()}" }
+        require(seen.containsAll(EXPECTED)) { "the pack lacks ${(EXPECTED - seen).joinToString()}" }
+        return seen
     }
 
     internal fun entryPath(entry: TarArchiveEntry): String? {
@@ -839,7 +859,7 @@ object EsyncPacks {
         }
         require(entry.linkFlag == TarConstants.LF_NORMAL || entry.linkFlag == TarConstants.LF_OLDNORM) { "unsupported entry type for $name" }
         require(!entry.isSparse) { "sparse entry $name" }
-        require(rel in EXPECTED) { "unexpected entry $name" }
+        require(rel in EXPECTED || rel in EXTRAS) { "unexpected entry $name" }
         return rel
     }
 
