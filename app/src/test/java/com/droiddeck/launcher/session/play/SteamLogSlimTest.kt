@@ -58,4 +58,19 @@ class SteamLogSlimTest {
         SteamLogSlim.slim(dir, zone)
         assertTrue(File(steam, "console_log.txt").length() <= SteamLogSlim.TAIL_BYTES)
     }
+
+    @Test fun aHugeGameLogKeepsItsStartAndItsEnd() {
+        val f = tmp.newFile("steam-1473480.log")
+        f.writeText("info:  DXVK: v3.1.1\n" + "filler line\n".repeat(1000) + "DEVICE_LOST at the end\n")
+        val lines = ArrayList<String>()
+        SteamLogSlim.headAndTail(f, head = 100, tail = 200) { lines.add(it) }
+        assertEquals("info:  DXVK: v3.1.1", lines.first())
+        assertEquals("DEVICE_LOST at the end", lines.last())
+        assertTrue(lines.any { it.startsWith("[droiddeck: ") && it.endsWith(" bytes cut]") })
+        // Whole lines only.
+        assertTrue(lines.filter { !it.startsWith("[droiddeck") }.all { it == "filler line" || it.startsWith("info") || it.startsWith("DEVICE") })
+        val small = ArrayList<String>()
+        SteamLogSlim.headAndTail(f) { small.add(it) }
+        assertEquals(1002, small.size)
+    }
 }

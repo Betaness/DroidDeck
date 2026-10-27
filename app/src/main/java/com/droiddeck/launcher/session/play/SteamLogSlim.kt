@@ -109,4 +109,29 @@ object SteamLogSlim {
             tmp.delete()
         }
     }
+
+    /**
+     * A game log's lines; past [head] + [tail] bytes (Proton's log of a busy game runs to hundreds of MB) the
+     * start (versions, device, first swapchain) and the end, with a line saying how much was cut.
+     */
+    fun headAndTail(src: File, head: Long = 1L * 1024 * 1024, tail: Long = 3L * 1024 * 1024, each: (String) -> Unit) {
+        val length = src.length()
+        if (length <= head + tail) { src.forEachLine(Charsets.UTF_8, each); return }
+        java.io.RandomAccessFile(src, "r").use { raf ->
+            var read = 0L
+            val start = java.io.BufferedReader(java.io.InputStreamReader(java.io.FileInputStream(raf.fd), Charsets.UTF_8), 64 * 1024)
+            while (read < head) {
+                val line = start.readLine() ?: break
+                read += line.toByteArray(Charsets.UTF_8).size + 1
+                each(line)
+            }
+            val tailFrom = length - tail
+            each("[droiddeck: ${tailFrom - read} bytes cut]")
+            raf.seek(tailFrom - 1)
+            val atLineStart = raf.read() == '\n'.code
+            val end = java.io.BufferedReader(java.io.InputStreamReader(java.io.FileInputStream(raf.fd), Charsets.UTF_8), 64 * 1024)
+            if (!atLineStart) end.readLine()
+            while (true) each(end.readLine() ?: break)
+        }
+    }
 }
