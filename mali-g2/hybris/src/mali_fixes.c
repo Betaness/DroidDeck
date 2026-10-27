@@ -4,6 +4,10 @@
  * graphics pipeline libraries and the extension filter (ext_commands.h) need nothing.
  *   - ClipDistance / CullDistance stores are removed from shaders: the Mali shader compiler crashes
  *     on them (spirv_clip_cull.h). VORTEK_KEEP_CLIP_DISTANCE=1 keeps them.
+ *   - Constant composites built from specialization constants become spec-constant composites: the
+ *     Mali compiler folds them at the constituents' defaults (spirv_spec_composite.h), which breaks
+ *     DXVK's texture bound checks. Shader modules, inline stages of graphics and compute pipelines.
+ *     DROIDDECK_HYBRIS_SPEC_COMPOSITE_FIX=0 (else VORTEK_SPEC_COMPOSITE_FIX=0) leaves them.
  *   - vkd3d-proton is told storage texel buffers need single-texel alignment only
  *     (VORTEK_STRICT_TEXEL_ALIGNMENT=1 reports the driver's value).
  *   - VK_EXT_vertex_attribute_divisor stands in for the driver's KHR extension (icd.c); its
@@ -37,6 +41,7 @@
 #include <string.h>
 
 #include "spirv_clip_cull.h"
+#include "spirv_spec_composite.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
 #include "cmd_memory.h"
 
@@ -123,15 +128,41 @@ void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, 
         if (want[i] && !has[i] && fake[i]) want[i] = VK_FALSE;
 }
 
-/* A rewritten copy of `info` in *out (code to free in *freeCode), or false to use `info`. */
-static bool stripClipCull(const VkShaderModuleCreateInfo* info, VkShaderModuleCreateInfo* out, uint32_t** freeCode) {
-    if (!clipStripOn() || !info->pCode || info->codeSize < 20) return false;
-    size_t words = 0;
-    uint32_t* code = dd_strip_clip_cull(info->pCode, info->codeSize / 4, &words);
+static bool specFixOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("DROIDDECK_HYBRIS_SPEC_COMPOSITE_FIX");
+        if (!e || !*e) e = getenv("VORTEK_SPEC_COMPOSITE_FIX");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static bool rewritesOn(void) {
+    return clipStripOn() || specFixOn();
+}
+
+/* A rewritten copy of `info` in *out (code to free in *freeCode), or false to use `info`: clip/cull
+ * distance stores removed, spec-constant composites made specializable. */
+static bool rewriteShader(const VkShaderModuleCreateInfo* info, VkShaderModuleCreateInfo* out, uint32_t** freeCode) {
+    if (!info->pCode || info->codeSize < 20) return false;
+    size_t words = info->codeSize / 4;
+    uint32_t* code = clipStripOn() ? dd_strip_clip_cull(info->pCode, words, &words) : NULL;
+    if (code) {
+        static int logged;
+        if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "hybris-icd: clip/cull distance writes removed from a shader (the Mali compiler crashes on them)\n");
+    }
+    if (specFixOn() && dd_spec_composites(code ? code : info->pCode, words, NULL)) {
+        if (!code && (code = malloc(words * 4))) memcpy(code, info->pCode, words * 4);
+        if (code) {
+            size_t n = dd_spec_composites(code, words, code);
+            static int logged;
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+                fprintf(stderr, "hybris-icd: %zu spec-constant composite(s) made specializable in a shader (Mali folds them at their defaults)\n", n);
+        }
+    }
     if (!code) return false;
-    static int logged;
-    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
-        fprintf(stderr, "hybris-icd: clip/cull distance writes removed from a shader (the Mali compiler crashes on them)\n");
     *out = *info;
     out->pCode = code;
     out->codeSize = words * 4;
@@ -143,11 +174,16 @@ static VkResult VKAPI_CALL CreateShaderModule(VkDevice handle, const VkShaderMod
                                               VkShaderModule* module) {
     Device* device = icd_device(handle);
     if (!device) return VK_ERROR_DEVICE_LOST;
-    VkShaderModuleCreateInfo stripped;
+    VkShaderModuleCreateInfo rewritten;
     uint32_t* code = NULL;
-    VkResult result = device->CreateShaderModule(handle, stripClipCull(info, &stripped, &code) ? &stripped : info, allocator, module);
+    VkResult result = device->CreateShaderModule(handle, rewriteShader(info, &rewritten, &code) ? &rewritten : info, allocator, module);
     free(code);
     return result;
+}
+
+static const VkShaderModuleCreateInfo* inlineModule(const VkPipelineShaderStageCreateInfo* stage) {
+    const VkShaderModuleCreateInfo* next = stage->pNext;
+    return next && next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO ? next : NULL;
 }
 
 /* Inline stage code (DXVK 3.x, pipeline libraries): a stage whose pNext chain starts with its
@@ -157,15 +193,12 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCa
                                                    VkPipeline* pipelines) {
     Device* device = icd_device(handle);
     if (!device) return VK_ERROR_DEVICE_LOST;
-    if (!clipStripOn()) return device->CreateGraphicsPipelines(handle, cache, count, infos, allocator, pipelines);
+    if (!rewritesOn()) return device->CreateGraphicsPipelines(handle, cache, count, infos, allocator, pipelines);
     uint32_t totalStages = 0;
     bool inline_ = false;
     for (uint32_t i = 0; i < count; i++) {
         totalStages += infos[i].stageCount;
-        for (uint32_t s = 0; s < infos[i].stageCount; s++) {
-            const VkBaseInStructure* next = infos[i].pStages[s].pNext;
-            if (next && next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) inline_ = true;
-        }
+        for (uint32_t s = 0; s < infos[i].stageCount; s++) inline_ = inline_ || inlineModule(&infos[i].pStages[s]);
     }
     if (!inline_) return device->CreateGraphicsPipelines(handle, cache, count, infos, allocator, pipelines);
     VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
@@ -181,8 +214,8 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCa
         uint32_t base = used;
         for (uint32_t s = 0; s < infos[i].stageCount; s++, used++) {
             stages[used] = infos[i].pStages[s];
-            const VkShaderModuleCreateInfo* inl = infos[i].pStages[s].pNext;
-            if (inl && inl->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO && stripClipCull(inl, &modules[used], &codes[used])) {
+            const VkShaderModuleCreateInfo* inl = inlineModule(&infos[i].pStages[s]);
+            if (inl && rewriteShader(inl, &modules[used], &codes[used])) {
                 stages[used].pNext = &modules[used];
                 rewritten = true;
             }
@@ -198,6 +231,36 @@ out:;
     free(codes);
     free(modules);
     free(stages);
+    free(copy);
+    return result;
+}
+
+static VkResult VKAPI_CALL CreateComputePipelines(VkDevice handle, VkPipelineCache cache, uint32_t count,
+                                                  const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* allocator,
+                                                  VkPipeline* pipelines) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    bool inline_ = false;
+    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = inlineModule(&infos[i].stage);
+    if (!inline_) return device->CreateComputePipelines(handle, cache, count, infos, allocator, pipelines);
+    VkComputePipelineCreateInfo* copy = malloc(count * sizeof(*copy));
+    VkShaderModuleCreateInfo* modules = calloc(count, sizeof(*modules));
+    uint32_t** codes = calloc(count, sizeof(*codes));
+    bool any = false;
+    if (copy && modules && codes) {
+        memcpy(copy, infos, count * sizeof(*copy));
+        for (uint32_t i = 0; i < count; i++) {
+            const VkShaderModuleCreateInfo* inl = inlineModule(&infos[i].stage);
+            if (inl && rewriteShader(inl, &modules[i], &codes[i])) {
+                copy[i].stage.pNext = &modules[i];
+                any = true;
+            }
+        }
+    }
+    VkResult result = device->CreateComputePipelines(handle, cache, count, any ? copy : infos, allocator, pipelines);
+    for (uint32_t i = 0; codes && i < count; i++) free(codes[i]);
+    free(codes);
+    free(modules);
     free(copy);
     return result;
 }
@@ -447,6 +510,7 @@ PFN_vkVoidFunction mali_instance_proc(const char* name) {
 PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)CreateShaderModule;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
+    if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)CreateComputePipelines;
     if (!strcmp(name, "vkResetCommandPool")) return (PFN_vkVoidFunction)ResetCommandPool;
     if (!strcmp(name, "vkResetCommandBuffer")) return (PFN_vkVoidFunction)ResetCommandBuffer;
     if (releaseEvery() < 0 && (!strncmp(name, "vkCmd", 5) || strstr(name, "Command"))) return trackedProc(handle, name);

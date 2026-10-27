@@ -124,7 +124,7 @@ typedef struct Device {
     X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) \
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) \
     X(ImportSemaphoreFdKHR) X(ImportFenceFdKHR) X(GetFenceFdKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
-    X(CreateShaderModule) X(CreateGraphicsPipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
+    X(CreateShaderModule) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
     X(MapMemory2KHR) X(UnmapMemory2KHR) X(FlushMappedMemoryRanges)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
