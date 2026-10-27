@@ -1287,17 +1287,36 @@ static uint32_t rootOrderOf(const xcb_query_tree_reply_t* tree) {
 
 /* At every level from the window up to its top-level window, a mapped sibling stacked above it that
  * overlaps the window hides part of it, and so does a mapped child of the window. */
-static bool checkOccludedOnce(Swapchain* sc, int x, int y, int w, int h, bool* stale, bool* covered) {
-    xcb_connection_t* conn = sc->surface->conn;
-    int levels = sc->chainLength;
-    xcb_get_window_attributes_cookie_t selfAttrs = xcb_get_window_attributes(conn, sc->chain[0]);
+/* The first requests of an occlusion check, sent ahead so that they share a round trip with the
+ * window's geometry (presentZeroCopyLocked); then collected or discarded. */
+typedef struct OcclusionQuery {
+    int levels;
+    xcb_get_window_attributes_cookie_t selfAttrs;
     xcb_query_tree_cookie_t trees[17];
-    for (int i = 0; i < levels; i++) trees[i] = xcb_query_tree(conn, i + 1 < levels ? sc->chain[i + 1] : sc->root);
-    trees[levels] = xcb_query_tree(conn, sc->chain[0]);
+} OcclusionQuery;
+
+static void occlusionSend(Swapchain* sc, OcclusionQuery* q) {
+    xcb_connection_t* conn = sc->surface->conn;
+    q->levels = sc->chainLength;
+    q->selfAttrs = xcb_get_window_attributes(conn, sc->chain[0]);
+    for (int i = 0; i < q->levels; i++) q->trees[i] = xcb_query_tree(conn, i + 1 < q->levels ? sc->chain[i + 1] : sc->root);
+    q->trees[q->levels] = xcb_query_tree(conn, sc->chain[0]);
+}
+
+static void occlusionDiscard(Swapchain* sc, const OcclusionQuery* q) {
+    xcb_connection_t* conn = sc->surface->conn;
+    xcb_discard_reply(conn, q->selfAttrs.sequence);
+    for (int i = 0; i <= q->levels; i++) xcb_discard_reply(conn, q->trees[i].sequence);
+}
+
+static bool occlusionCollect(Swapchain* sc, const OcclusionQuery* q, int x, int y, int w, int h, bool* stale, bool* covered) {
+    xcb_connection_t* conn = sc->surface->conn;
+    int levels = q->levels;
+    xcb_get_window_attributes_cookie_t selfAttrs = q->selfAttrs;
     xcb_query_tree_reply_t* replies[17];
     bool ok = true;
     for (int i = 0; i <= levels; i++) {
-        replies[i] = xcb_query_tree_reply(conn, trees[i], NULL);
+        replies[i] = xcb_query_tree_reply(conn, q->trees[i], NULL);
         if (!replies[i]) ok = false;
     }
     sc->rootOrder = levels > 0 && replies[levels - 1] ? rootOrderOf(replies[levels - 1]) : 0;
@@ -1376,13 +1395,27 @@ static bool checkOccludedOnce(Swapchain* sc, int x, int y, int w, int h, bool* s
     return occluded;
 }
 
-static bool checkOccluded(Swapchain* sc, int x, int y, int w, int h) {
+static bool checkOccludedOnce(Swapchain* sc, int x, int y, int w, int h, bool* stale, bool* covered) {
+    OcclusionQuery q;
+    occlusionSend(sc, &q);
+    return occlusionCollect(sc, &q, x, y, w, h, stale, covered);
+}
+
+/* Whether checkOccluded will use the ancestors it has (a query sent now stays valid). */
+static bool ancestorsCurrent(Swapchain* sc) {
+    return sc->chainLength > 0 && sc->chainAge < 120;
+}
+
+/* `sent`: the first requests, already sent with sc's ancestors (ancestorsCurrent), or NULL. */
+static bool checkOccluded(Swapchain* sc, int x, int y, int w, int h, const OcclusionQuery* sent) {
     sc->covered = false;
     if (sc->chainLength == 0 || ++sc->chainAge > 120) {
+        if (sent) occlusionDiscard(sc, sent);
+        sent = NULL;
         if (!findAncestors(sc)) return true;
     }
     bool stale, covered;
-    bool occluded = checkOccludedOnce(sc, x, y, w, h, &stale, &covered);
+    bool occluded = sent ? occlusionCollect(sc, sent, x, y, w, h, &stale, &covered) : checkOccludedOnce(sc, x, y, w, h, &stale, &covered);
     if (stale) {
         if (!findAncestors(sc)) return true;
         occluded = checkOccludedOnce(sc, x, y, w, h, &stale, &covered);
@@ -1409,7 +1442,7 @@ static void updateCoverage(Swapchain* sc) {
         xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, sc->surface->window, geo->root, 0, 0), NULL);
     if (pos) {
         sc->root = geo->root;
-        checkOccluded(sc, pos->dst_x, pos->dst_y, geo->width, geo->height);
+        checkOccluded(sc, pos->dst_x, pos->dst_y, geo->width, geo->height, NULL);
     }
     else sc->covered = false;
     free(pos);
@@ -1468,28 +1501,42 @@ static VkResult presentZeroCopyLocked(Swapchain* sc, VkQueue queue, uint32_t ima
     if (sc->zeroCopy < 0) return VK_ERROR_FEATURE_NOT_PRESENT;
     sc->x11Why = "a window query failed";
     xcb_connection_t* conn = sc->surface->conn;
-    xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, sc->surface->window), NULL);
-    if (!geo) return VK_NOT_READY;
-    xcb_translate_coordinates_reply_t* pos =
-        xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, sc->surface->window, geo->root, 0, 0), NULL);
-    if (!pos) {
-        free(geo);
-        return VK_NOT_READY;
+    /* The window's geometry, its position (relative to the root it had last frame) and the first
+     * requests of the occlusion check go out together: one round trip on an unchanged window tree. */
+    xcb_get_geometry_cookie_t geoCookie = xcb_get_geometry(conn, sc->surface->window);
+    xcb_window_t lastRoot = sc->root;
+    xcb_translate_coordinates_cookie_t posCookie = {0};
+    if (lastRoot) posCookie = xcb_translate_coordinates(conn, sc->surface->window, lastRoot, 0, 0);
+    OcclusionQuery query;
+    bool sent = lastRoot && sc->rootW && ancestorsCurrent(sc);
+    if (sent) occlusionSend(sc, &query);
+    xcb_get_geometry_reply_t* geo = xcb_get_geometry_reply(conn, geoCookie, NULL);
+    xcb_translate_coordinates_reply_t* pos = NULL;
+    if (geo && lastRoot && geo->root == lastRoot) pos = xcb_translate_coordinates_reply(conn, posCookie, NULL);
+    else {
+        if (lastRoot) xcb_discard_reply(conn, posCookie.sequence);
+        if (sent) occlusionDiscard(sc, &query);
+        sent = false;
+        if (geo) pos = xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, sc->surface->window, geo->root, 0, 0), NULL);
     }
-    if (geo->depth == 32) {
-        /* A window with alpha is composited with what lies below; the compositor's layer is opaque. */
+    if (!geo || !pos || geo->depth == 32 || geo->width <= 0 || geo->height <= 0) {
+        if (sent) occlusionDiscard(sc, &query);
+        VkResult result = VK_NOT_READY;
+        if (geo && pos && geo->depth == 32) {
+            /* A window with alpha is composited with what lies below; the compositor's layer is opaque. */
+            sc->zeroCopy = -1;
+            sc->x11Why = "the window has alpha";
+            result = VK_ERROR_FEATURE_NOT_PRESENT;
+        }
         free(pos);
         free(geo);
-        sc->zeroCopy = -1;
-        sc->x11Why = "the window has alpha";
-        return VK_ERROR_FEATURE_NOT_PRESENT;
+        return result;
     }
     int x = pos->dst_x, y = pos->dst_y, w = geo->width, h = geo->height;
     *suboptimal = geo->width != sc->extent.width || geo->height != sc->extent.height;
     xcb_window_t root = geo->root;
     free(pos);
     free(geo);
-    if (w <= 0 || h <= 0) return VK_NOT_READY;
     if (!sc->rootW || root != sc->root) {
         xcb_get_geometry_reply_t* rootGeo = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, root), NULL);
         if (!rootGeo) return VK_NOT_READY;
@@ -1499,7 +1546,7 @@ static VkResult presentZeroCopyLocked(Swapchain* sc, VkQueue queue, uint32_t ima
         free(rootGeo);
     }
     /* Fully covered (also by a window of ours on a layer above): paced on the covered path. */
-    sc->occluded = checkOccluded(sc, x, y, w, h) || sc->covered;
+    sc->occluded = checkOccluded(sc, x, y, w, h, sent ? &query : NULL) || sc->covered;
     if (sc->occluded) return VK_NOT_READY;
     /* A parent smaller than the window clips it: Wine puts a game's Vulkan window in a 1x1 parent
      * when it shows the frames elsewhere. The X11 path lets Wine copy them. */
@@ -1554,7 +1601,8 @@ static void notePath(Swapchain* sc, int path, int depth) {
 static void countFrame(Swapchain* sc) {
     sc->frames++;
     sc->statFrames++;
-    int statEvery = icd_env_int("VORTEK_X11_STATS", 0);
+    static int statEvery = -1;
+    if (statEvery < 0) statEvery = icd_env_int("VORTEK_X11_STATS", 0);
     if (statEvery > 0) {
         double now = nowSeconds();
         if (sc->statStart == 0) sc->statStart = now;
