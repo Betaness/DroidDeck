@@ -87,6 +87,7 @@ typedef struct VkMemoryMapPlacedInfoEXT {
 #define MAX_QUEUES 32
 #define PLACED_TABLE_BITS 8
 struct PlacedMemory;
+struct PlacedImage;
 
 typedef struct Device {
     VkDevice handle;
@@ -111,6 +112,7 @@ typedef struct Device {
     bool placed;
     pthread_mutex_t placedLock;
     struct PlacedMemory* placedTable[1u << PLACED_TABLE_BITS];
+    struct PlacedImage* placedLinear; /* images that are not VK_IMAGE_TILING_OPTIMAL */
     PFN_vkMapMemory2KHR MapMemory2;
     PFN_vkUnmapMemory2KHR UnmapMemory2;
 #define DEVICE_FUNCS(X) \

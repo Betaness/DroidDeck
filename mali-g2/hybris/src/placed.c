@@ -5,7 +5,9 @@
  * 4 GB; tests/wow64_memory_test.c). As the Vortek client and server do it: on a device that enables
  * the extension, host-visible memory is a dma-buf imported into the requested type, and a placed map
  * is an mmap of that dma-buf at the caller's address. Other memory and other devices go to the
- * driver untouched. DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
+ * driver untouched, and so does the memory of a dedicated allocation for an optimal image, which
+ * cannot be mapped meaningfully (DXVK never does; this is what the Vortek client does too).
+ * DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
  *
  * The GPU does not snoop the CPU's caches (tests/placed_memory_test.c), so HOST_COHERENT types get
  * the system-uncached heap and nothing else. The HOST_CACHED, non-coherent types get the CPU-cached
@@ -101,6 +103,62 @@ static int dmabufAlloc(VkDeviceSize size, VkMemoryPropertyFlags flags, bool* cac
     return (int)data.fd;
 }
 
+typedef struct PlacedImage {
+    VkImage image;
+    struct PlacedImage* next;
+} PlacedImage;
+
+static VkResult VKAPI_CALL CreateImage(VkDevice handle, const VkImageCreateInfo* info, const VkAllocationCallbacks* allocator,
+                                       VkImage* image) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    VkResult result = device->CreateImage(handle, info, allocator, image);
+    if (result != VK_SUCCESS || info->tiling == VK_IMAGE_TILING_OPTIMAL) return result;
+    PlacedImage* linear = malloc(sizeof(*linear));
+    if (!linear) {
+        device->DestroyImage(handle, *image, allocator);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    linear->image = *image;
+    pthread_mutex_lock(&device->placedLock);
+    linear->next = device->placedLinear;
+    device->placedLinear = linear;
+    pthread_mutex_unlock(&device->placedLock);
+    return result;
+}
+
+static void VKAPI_CALL DestroyImage(VkDevice handle, VkImage image, const VkAllocationCallbacks* allocator) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    if (image && __atomic_load_n(&device->placedLinear, __ATOMIC_RELAXED)) {
+        PlacedImage* gone = NULL;
+        pthread_mutex_lock(&device->placedLock);
+        for (PlacedImage** link = &device->placedLinear; *link; link = &(*link)->next) {
+            if ((*link)->image == image) {
+                gone = *link;
+                *link = gone->next;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&device->placedLock);
+        free(gone);
+    }
+    device->DestroyImage(handle, image, allocator);
+}
+
+/* A dedicated allocation for an optimal image. */
+static bool optimalImageMemory(Device* device, const void* chain) {
+    VkImage image = VK_NULL_HANDLE;
+    for (const VkBaseInStructure* s = chain; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) image = ((const VkMemoryDedicatedAllocateInfo*)s)->image;
+    if (!image) return false;
+    bool linear = false;
+    pthread_mutex_lock(&device->placedLock);
+    for (PlacedImage* i = device->placedLinear; i && !linear; i = i->next) linear = i->image == image;
+    pthread_mutex_unlock(&device->placedLock);
+    return !linear;
+}
+
 static PlacedMemory** slot(Device* device, VkDeviceMemory memory) {
     uint64_t key = (uint64_t)memory;
     PlacedMemory** link = &device->placedTable[(key * 0x9E3779B97F4A7C15ull) >> (64 - PLACED_TABLE_BITS)];
@@ -140,7 +198,7 @@ static VkResult VKAPI_CALL AllocateMemory(VkDevice handle, const VkMemoryAllocat
     if (!device) return VK_ERROR_DEVICE_LOST;
     if (!device->placed || info->memoryTypeIndex >= device->memory.memoryTypeCount ||
         !(device->memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
-        importsOrExports(info->pNext))
+        importsOrExports(info->pNext) || optimalImageMemory(device, info->pNext))
         return device->AllocateMemory(handle, info, allocator, memory);
 
     static int okLogged, failLogged, importLogged;
@@ -352,6 +410,11 @@ void placed_device_destroyed(Device* device) {
             free(record);
         }
     }
+    while (device->placedLinear) {
+        PlacedImage* image = device->placedLinear;
+        device->placedLinear = image->next;
+        free(image);
+    }
     pthread_mutex_destroy(&device->placedLock);
 }
 
@@ -359,6 +422,8 @@ PFN_vkVoidFunction placed_device_proc(Device* device, const char* name) {
     if (!device || !device->placed) return NULL;
     if (!strcmp(name, "vkAllocateMemory")) return (PFN_vkVoidFunction)AllocateMemory;
     if (!strcmp(name, "vkFreeMemory")) return (PFN_vkVoidFunction)FreeMemory;
+    if (!strcmp(name, "vkCreateImage")) return (PFN_vkVoidFunction)CreateImage;
+    if (!strcmp(name, "vkDestroyImage")) return (PFN_vkVoidFunction)DestroyImage;
     if (!strcmp(name, "vkMapMemory2KHR")) return (PFN_vkVoidFunction)MapMemory2KHR;
     if (!strcmp(name, "vkMapMemory2")) return (PFN_vkVoidFunction)MapMemory2;
     if (!strcmp(name, "vkUnmapMemory2KHR")) return (PFN_vkVoidFunction)UnmapMemory2KHR;

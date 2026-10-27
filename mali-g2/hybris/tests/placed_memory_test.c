@@ -10,6 +10,9 @@
  *             range must arrive (outside it: reported, may be stale on cached memory)
  *   to CPU    the CPU reads the memory, the GPU fills it, the CPU invalidates only a range and
  *             must read the GPU's values there
+ *   images    a dedicated allocation for an optimal image is the driver's (no dma-buf): the GPU
+ *             clears the image and copies it into placed memory; one for a linear image is a
+ *             dma-buf and can be placed-mapped
  *   fds       300 rounds of allocate, place, unmap, free leave no descriptor behind
  *   no dma-buf  with no descriptors left (RLIMIT_NOFILE) the allocation fails with
  *             VK_ERROR_OUT_OF_DEVICE_MEMORY, which applications handle, rather than succeeding
@@ -336,6 +339,80 @@ int main(void) {
         FAIL("descriptors: %d dma-bufs and %d fds before, %d and %d after", bufsBefore, fdsBefore, bufsAfter, fdsAfter);
     else printf("descriptors: %d rounds of allocate, place, free leave none open\n", rounds);
     if (doBench) printf("bench allocate+place+free of 1 MB: %.0f us\n", perRound);
+
+    /* Dedicated allocations for images: optimal ones are the driver's, linear ones placed. */
+    for (int tiling = 0; tiling < 2; tiling++) {
+        bool optimal = tiling == 0;
+        VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {optimal ? 1920 : 256, optimal ? 1080 : 256, 1},
+                                .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = optimal ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
+                                .usage = optimal ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                                 : VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                .initialLayout = optimal ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_PREINITIALIZED};
+        VkImage image;
+        if ((r = vkCreateImage(dev, &ii, NULL, &image))) { FAIL("vkCreateImage %d", r); continue; }
+        VkMemoryRequirements ir;
+        vkGetImageMemoryRequirements(dev, image, &ir);
+        uint32_t t = 0;
+        while (t < mp.memoryTypeCount && !(((ir.memoryTypeBits >> t) & 1) &&
+                                           (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))) t++;
+        VkMemoryDedicatedAllocateInfo dedicated = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .image = image};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &dedicated, .allocationSize = ir.size,
+                                   .memoryTypeIndex = t};
+        int before = dmabufs(NULL, NULL);
+        VkDeviceMemory memory;
+        double t0 = now();
+        if ((r = vkAllocateMemory(dev, &ai, NULL, &memory))) { FAIL("dedicated image memory: vkAllocateMemory %d", r); continue; }
+        double took = (now() - t0) * 1e3;
+        int added = dmabufs(NULL, NULL) - before;
+        vkBindImageMemory(dev, image, memory, 0);
+        if (optimal) {
+            if (added) FAIL("dedicated optimal image (type %u): %d dma-bufs, want the driver's memory", t, added);
+            else printf("dedicated optimal image (type %u): the driver's memory, no dma-buf\n", t);
+            if (doBench) printf("bench dedicated 1920x1080 image memory, %llu KB: %.2f ms\n", (unsigned long long)(ir.size >> 10), took);
+            Placed out;
+            if (place(&out, coherentType, lowA, (VkDeviceSize)1920 * 1080 * 4)) {
+                begin();
+                VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                           .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                           .image = image, .subresourceRange = range};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+                VkClearColorValue color = {.float32 = {1.0f, 0.0f, 1.0f, 1.0f}};
+                vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+                ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+                VkBufferImageCopy region = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {1920, 1080, 1}};
+                vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1, &region);
+                barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+                submitWait();
+                size_t wrong = 0;
+                for (size_t i = 0; i < 1920 * 1080; i++) wrong += out.at[i] != 0xffff00ffu;
+                if (wrong) FAIL("  cleared image read back through placed memory: %zu wrong pixels", wrong);
+                else printf("  cleared it on the GPU and read it back through placed memory: ok\n");
+                release(&out);
+                if (mmap(lowA, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != lowA) FAIL("re-reserve");
+            }
+        } else {
+            VkMemoryMapPlacedInfoEXT pi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = lowA};
+            VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pi, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
+                                     .memory = memory, .size = VK_WHOLE_SIZE};
+            void* data = NULL;
+            r = map2(dev, &mi, &data);
+            if (added != 1 || r || data != lowA) FAIL("dedicated linear image (type %u): %d dma-bufs, placed map %d at %p", t, added, r, data);
+            else printf("dedicated linear image (type %u): a dma-buf, placed-mapped\n", t);
+            VkMemoryUnmapInfoKHR ui = {.sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, .memory = memory, .flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT};
+            if (!r) unmap2(dev, &ui);
+        }
+        vkDestroyImage(dev, image, NULL);
+        vkFreeMemory(dev, memory, NULL);
+    }
 
     /* No descriptor left for a dma-buf. */
     struct rlimit saved, none;
