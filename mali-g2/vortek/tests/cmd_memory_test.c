@@ -53,6 +53,24 @@ int main(void) {
     CHECK(cmdmem_parse_every("-1") == 0 && cmdmem_parse_every("1") == 1);
     CHECK(cmdmem_parse_bytes("1048576g", 7) == CMDMEM_MAX_BYTES && CMDMEM_DEFAULT_TOTAL(CMDMEM_MAX_BYTES) == CMDMEM_MAX_BYTES);
 
+    /* the policy (MODE, EVERY, a byte limit set, the default): Vortek defaults to 32, hybris to -1 */
+    const char* ignored;
+    CHECK(cmdmem_release_policy(NULL, NULL, false, 32, &ignored) == 32 && !ignored);
+    CHECK(cmdmem_release_policy("", "", false, -1, &ignored) == -1 && !ignored);
+    CHECK(cmdmem_release_policy(NULL, NULL, true, 32, &ignored) == -1 && !ignored);
+    CHECK(cmdmem_release_policy("adaptive", NULL, false, 32, &ignored) == -1 && !ignored);
+    CHECK(cmdmem_release_policy("Estimate", "auto", false, 32, &ignored) == -1 && !ignored);
+    CHECK(cmdmem_release_policy("adaptive", "32", false, 32, &ignored) == -1 && ignored && !strcmp(ignored, "EVERY"));
+    CHECK(cmdmem_release_policy("every", NULL, true, -1, &ignored) == 32 && !ignored);
+    CHECK(cmdmem_release_policy("fixed", "8", false, -1, &ignored) == 8 && !ignored);
+    CHECK(cmdmem_release_policy(NULL, "0", true, 32, &ignored) == 0 && !ignored);
+    CHECK(cmdmem_release_policy(NULL, "auto", false, 32, &ignored) == -1 && !ignored);
+    CHECK(cmdmem_release_policy(NULL, "every", false, -1, &ignored) == 32 && !ignored);
+    CHECK(cmdmem_release_policy(NULL, "32x", false, 32, &ignored) == 32 && ignored && !strcmp(ignored, "EVERY"));
+    CHECK(cmdmem_release_policy(NULL, "32x", false, -1, &ignored) == -1 && ignored && !strcmp(ignored, "EVERY"));
+    CHECK(cmdmem_release_policy("sometimes", NULL, false, 32, &ignored) == 32 && ignored && !strcmp(ignored, "MODE"));
+    CHECK(cmdmem_release_policy("sometimes", "4", false, 32, &ignored) == 4 && ignored && !strcmp(ignored, "MODE"));
+
     /* per-pool limit: 1 MiB = 2497 renderings of 420 bytes */
     CmdMem* m = cmdmem_create(1 * MIB, 64 * MIB, 1);
     uint64_t pool = 0x1000, cb = 0x2000, other = 0x3000;

@@ -40,6 +40,9 @@
  *     DROIDDECK_HYBRIS_CMD_RELEASE_EVERY (else VORTEK_CMD_RELEASE_EVERY) set, every Nth reset of the
  *     same pool or command buffer releases instead (1 = every reset, 0 = never) and nothing is
  *     counted: only the two reset calls are wrapped then (a value that is not a number is ignored).
+ *     *_CMD_RELEASE_MODE=every forces that (32 without a number), =adaptive the estimate
+ *     (cmdmem_release_policy). The estimate stays the default here; the Vortek server's default is
+ *     every 32nd reset.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -440,16 +443,14 @@ static PFN_vkVoidFunction layoutProc(VkDevice handle, const char* name) {
 }
 
 /* *_CMD_RELEASE_*: the DROIDDECK_HYBRIS_ variable, else the VORTEK_ one (droiddeck-env sets those for
- * the server). */
-static const char* releaseEnv(const char* suffix, const char** used) {
-    static char name[64];
-    snprintf(name, sizeof(name), "DROIDDECK_HYBRIS_CMD_RELEASE_%s", suffix);
+ * the server); `name` (64 bytes) gets the one read. */
+static const char* releaseEnv(const char* suffix, char* name) {
+    snprintf(name, 64, "DROIDDECK_HYBRIS_CMD_RELEASE_%s", suffix);
     const char* text = getenv(name);
     if (!text || !*text) {
-        snprintf(name, sizeof(name), "VORTEK_CMD_RELEASE_%s", suffix);
+        snprintf(name, 64, "VORTEK_CMD_RELEASE_%s", suffix);
         text = getenv(name);
     }
-    if (used) *used = name;
     return text && *text ? text : NULL;
 }
 
@@ -460,18 +461,25 @@ static CmdMem* commandMemory;
 static pthread_once_t releaseOnce = PTHREAD_ONCE_INIT;
 
 static void readReleaseConfig(void) {
-    const char* name;
-    const char* text = releaseEnv("EVERY", &name);
-    int every = cmdmem_parse_every(text);
+    char modeName[64], everyName[64], bytesName[64], totalName[64], logName[64];
+    const char* mode = releaseEnv("MODE", modeName);
+    const char* text = releaseEnv("EVERY", everyName);
+    const char* bytes = releaseEnv("BYTES", bytesName);
+    const char* totalBytes = releaseEnv("TOTAL_BYTES", totalName);
+    const char* ignored;
+    /* the default stays the estimate here (the Vortek server's is every 32nd reset) */
+    int every = cmdmem_release_policy(mode, text, bytes || totalBytes, -1, &ignored);
+    if (ignored) fprintf(stderr, "hybris-icd: %s=%s ignored\n", *ignored == 'M' ? modeName : everyName, *ignored == 'M' ? mode : text);
+    if (ignored && *ignored == 'M') mode = NULL;
     if (every >= 0) {
         releaseEvery_ = every;
-        fprintf(stderr, "hybris-icd: %s=%d\n", name, releaseEvery_);
+        fprintf(stderr, "hybris-icd: %s=%s, command memory released every %d resets\n", mode ? modeName : everyName,
+                mode ? mode : text, releaseEvery_);
         return;
     }
-    if (text) fprintf(stderr, "hybris-icd: %s=%s is not a number, releasing by the estimate\n", name, text);
-    uint64_t perPool = cmdmem_parse_bytes(releaseEnv("BYTES", NULL), CMDMEM_DEFAULT_PER_POOL);
-    uint64_t total = cmdmem_parse_bytes(releaseEnv("TOTAL_BYTES", NULL), CMDMEM_DEFAULT_TOTAL(perPool));
-    const char* log = releaseEnv("LOG", NULL);
+    uint64_t perPool = cmdmem_parse_bytes(bytes, CMDMEM_DEFAULT_PER_POOL);
+    uint64_t total = cmdmem_parse_bytes(totalBytes, CMDMEM_DEFAULT_TOTAL(perPool));
+    const char* log = releaseEnv("LOG", logName);
     commandMemory = cmdmem_create(perPool, total, log && *log != '0');
     releaseEvery_ = commandMemory ? -1 : 32;
 }

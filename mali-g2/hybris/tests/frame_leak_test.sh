@@ -8,7 +8,10 @@
 #                per frame on the Mali-G2)
 #   pool-every32 the fixed interval (DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=32): must stay flat; it
 #                releases 31.25 times per 1000 frames here (one pool reset per frame)
-#   *-adaptive   the default, release by the estimate: must stay bounded (no growth over the last half,
+#   pool-mode-every  DROIDDECK_HYBRIS_CMD_RELEASE_MODE=every (32 without *_EVERY): flat, like pool-every32
+#   pool-default no *_CMD_RELEASE_* at all: the estimate is the default here (the Vortek server's
+#                default is every 32nd reset), so it must stay bounded like pool-adaptive and release
+#   *-adaptive   release by the estimate (*_BYTES set): must stay bounded (no growth over the last half,
 #                peak at most FL_MAX_PEAK_KB above the first report, default 2 x the total limit +
 #                8 MiB) and release at most 1000/32/8 = 3.9 times per 1000 frames
 #   pool-total   FL_INFLIGHT=4 pools, *_BYTES=8m, *_TOTAL_BYTES=8m: the limit over all pools (peak at
@@ -34,7 +37,8 @@ cc -O2 -o "$TESTS/frame_leak_test" "$HERE/../../vortek/tests/frame_leak_test.c" 
 export FL_FRAMES FL_PASSES=16 FL_REPORT=1000 FL_SERVER_PID=self DROIDDECK_HYBRIS_CMD_RELEASE_LOG=1
 max=${FL_MAX_GROWTH:-64}
 bytes=${DROIDDECK_HYBRIS_CMD_RELEASE_BYTES:-16m}
-unset DROIDDECK_HYBRIS_CMD_RELEASE_EVERY VORTEK_CMD_RELEASE_EVERY VORTEK_CMD_RELEASE_BYTES VORTEK_CMD_RELEASE_TOTAL_BYTES
+unset DROIDDECK_HYBRIS_CMD_RELEASE_EVERY DROIDDECK_HYBRIS_CMD_RELEASE_MODE VORTEK_CMD_RELEASE_EVERY VORTEK_CMD_RELEASE_MODE \
+  VORTEK_CMD_RELEASE_BYTES VORTEK_CMD_RELEASE_TOTAL_BYTES
 kb() { awk -v t="$1" 'BEGIN { v = t + 0; u = substr(t, length(t)); if (u == "g" || u == "G") v *= 1048576; else if (u == "m" || u == "M") v *= 1024; else if (u != "k" && u != "K") v /= 1024; printf "%d", v }'; }
 total=${DROIDDECK_HYBRIS_CMD_RELEASE_TOTAL_BYTES:-$(( $(kb "$bytes") * 2 ))k}
 peak=${FL_MAX_PEAK_KB:-$(( $(kb "$total") * 2 + 8192 ))}
@@ -64,6 +68,8 @@ A="DROIDDECK_HYBRIS_CMD_RELEASE_BYTES=$bytes DROIDDECK_HYBRIS_CMD_RELEASE_TOTAL_
 {
 run pool-off grow DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=0 FL_STEPS=$POOL
 run pool-every32 flat DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=32 FL_STEPS=$POOL
+run pool-mode-every flat DROIDDECK_HYBRIS_CMD_RELEASE_MODE=every FL_STEPS=$POOL
+run pool-default bounded FL_STEPS=$POOL
 run pool-adaptive bounded $A FL_STEPS=$POOL
 run pool-total bounded-total DROIDDECK_HYBRIS_CMD_RELEASE_BYTES=8m DROIDDECK_HYBRIS_CMD_RELEASE_TOTAL_BYTES=8m FL_INFLIGHT=4 FL_STEPS=$POOL
 run cmdbuf-off grow DROIDDECK_HYBRIS_CMD_RELEASE_EVERY=0 FL_STEPS=$CB FL_CB_RESET=1
@@ -80,6 +86,8 @@ run renderpass flat $A FL_STEPS=$POOL FL_RENDERPASS=1
 # so each release frees about a quarter of it
 n=$(releases pool-total)
 if [ "$n" -lt $((FL_FRAMES * 6700 / 8388608 - 2)) ]; then echo "pool-total: only $n releases"; fail=1; fi
+n=$(releases pool-default)
+if [ "$n" -eq 0 ]; then echo "pool-default: no release by the estimate"; fail=1; fi
 n=$(releases noquery)
 if [ "$n" -ne 0 ]; then echo "noquery: $n releases without a query"; fail=1; fi
 n=$(releases renderpass)

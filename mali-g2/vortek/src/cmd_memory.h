@@ -52,6 +52,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define CMDMEM_RENDERING_BYTES 420u
 #define CMDMEM_POOL_BITS 10
@@ -127,13 +128,51 @@ static inline uint64_t cmdmem_parse_bytes(const char* text, uint64_t fallback) {
 }
 
 /* *_CMD_RELEASE_EVERY: a whole number, negative ones mean 0 (never); -1 when unset, empty or not a
- * number ("auto", "32x"), which means: release by the estimate. */
+ * number ("auto", "32x"), see cmdmem_release_policy. */
 static inline int cmdmem_parse_every(const char* text) {
     if (!text || !*text) return -1;
     char* end = NULL;
     long value = strtol(text, &end, 10);
     if (end == text || *end) return -1;
     return value < 0 ? 0 : value > 0x7fffffff ? 0x7fffffff : (int)value;
+}
+
+/* A word for the policy in *_CMD_RELEASE_MODE or *_CMD_RELEASE_EVERY, any case: 1 for the estimate
+ * ("adaptive", "estimate", "auto"), 0 for the fixed interval ("every", "fixed"), -1 otherwise. */
+static inline int cmdmem_policy_word(const char* text) {
+    static const char* const words[] = {"adaptive", "estimate", "auto", "every", "fixed"};
+    if (!text || !*text) return -1;
+    for (int i = 0; i < 5; i++)
+        if (!strcasecmp(text, words[i])) return i < 3;
+    return -1;
+}
+
+/* How resets release: every Nth reset (N >= 0; 1 = every reset, 0 = never) or -1, by the estimate.
+ *   MODE adaptive/estimate/auto   the estimate (EVERY ignored)
+ *   MODE every/fixed              EVERY if it is a number, else CMDMEM_FALLBACK_EVERY
+ *   no MODE (or an unknown one)   EVERY if it is a number (or every/fixed: CMDMEM_FALLBACK_EVERY); the
+ *                                 estimate if EVERY is adaptive/estimate/auto or a byte limit is set
+ *                                 (`bytesSet`: *_BYTES or *_TOTAL_BYTES); else `defaultEvery` (-1: the
+ *                                 estimate). The Vortek server defaults to 32, the in-process path to -1.
+ * `*ignored` gets "MODE" or "EVERY" when that variable is set but not used (an unknown word, or EVERY
+ * under MODE=adaptive), for the caller to log, else NULL. */
+static inline int cmdmem_release_policy(const char* mode, const char* every, bool bytesSet, int defaultEvery,
+                                        const char** ignored) {
+    int interval = cmdmem_parse_every(every);
+    int everyWord = interval < 0 ? cmdmem_policy_word(every) : -1;
+    int modeWord = cmdmem_policy_word(mode);
+    *ignored = NULL;
+    if (mode && *mode && modeWord < 0) *ignored = "MODE";
+    else if (every && *every && interval < 0 && everyWord < 0) *ignored = "EVERY";
+    if (modeWord == 1) {
+        if (every && *every && everyWord != 1) *ignored = "EVERY";
+        return -1;
+    }
+    if (modeWord == 0) return interval >= 0 ? interval : (int)CMDMEM_FALLBACK_EVERY;
+    if (interval >= 0) return interval;
+    if (everyWord == 0) return (int)CMDMEM_FALLBACK_EVERY;
+    if (everyWord == 1 || bytesSet) return -1;
+    return defaultEvery;
 }
 
 static inline CmdMem* cmdmem_create(uint64_t perPool, uint64_t total, int logEvery) {

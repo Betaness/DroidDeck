@@ -11,7 +11,15 @@ no longer map memory (abort in malloc under vkBeginCommandBuffer). VkRenderPass 
 (vkCmdBeginRenderPass/2) keep nothing, nor does a pool whose only query command is
 vkCmdResetQueryPool (tests/frame_leak_test.c).
 
-By default the server now estimates, per command pool of the connection, what the driver keeps
+By default every 32nd reset of the same pool or command buffer adds RELEASE_RESOURCES (a 64-entry
+table per connection, a new or colliding handle releases). On the device the estimate below kept the
+server's Scudo secondary maps (72 KB blocks) growing steadily over a 30-minute run (+21 a minute,
+Native Heap +1.5 MB a minute) where every 32nd reset saws up and down, so the server defaults to the
+fixed interval; VORTEK_CMD_RELEASE_MODE=adaptive (or VORTEK_CMD_RELEASE_BYTES / _TOTAL_BYTES set, or
+VORTEK_CMD_RELEASE_EVERY=auto) selects the estimate, VORTEK_CMD_RELEASE_MODE=every forces the interval
+(cmdmem_release_policy in cmd_memory.h; the in-process path keeps the estimate as its default).
+
+With the estimate the server tracks, per command pool of the connection, what the driver keeps
 (mali-g2/vortek/src/cmd_memory.h): the command batches replayed into a command buffer are scanned for
 vkCmdBeginRendering and query writes; a query marks the pool until it releases, and at
 vkEndCommandBuffer a recording into a marked pool adds 420 bytes per vkCmdBeginRendering to its
@@ -27,8 +35,8 @@ that allows single resets resets it with RELEASE_RESOURCES first, unless the cli
 explicitly (with flags 0 the memory is the pool's then). Pools without queries never release; marked
 pools release at least at every 4096th reset. VORTEK_CMD_RELEASE_LOG=1 logs every release (otherwise the first four and every 64th). With
 VORTEK_CMD_RELEASE_EVERY set to a number, every Nth reset of the same pool or command buffer releases
-as before (1 = always, 0 = never; a 64-entry table per connection, a new or colliding handle
-releases) and nothing is counted; any other value is ignored (logged). The estimate's
+(1 = always, 0 = never) and nothing is counted; a value that is neither a number nor a policy word is
+ignored (logged). The estimate's
 tables have fixed sizes; when one is full, the server falls back to every 32nd reset.
 Tests: tests/frame_leak_test.c, tests/frame_leak_test.sh.
 
@@ -85,7 +93,7 @@ index 9b27820..8a8ad7f 100644
      VkContext_destroyDevice(context, device);
  }
  
-@@ -1341,6 +1344,75 @@ void vt_handle_vkGetRenderAreaGranularity(VkContext* context) {
+@@ -1341,6 +1344,87 @@ void vt_handle_vkGetRenderAreaGranularity(VkContext* context) {
      vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
  }
  
@@ -94,17 +102,23 @@ index 9b27820..8a8ad7f 100644
 + * tests/frame_leak_test.c, cmd_memory.h) until the pool is reset with RELEASE_RESOURCES or destroyed
 + * (or, for single command buffer resets, the buffer is reset that way). DXVK resets its
 + * pools with flags 0, so a game issuing D3D11 queries grew the server by tens of MB a minute until
-+ * malloc failed. Resets add RELEASE_RESOURCES:
-+ *   - by default when the estimate of what the driver keeps (cmd_memory.h) reaches
++ * malloc failed. Resets add RELEASE_RESOURCES (cmdmem_release_policy):
++ *   - by default every 32nd reset of the same pool or command buffer, or every
++ *     VORTEK_CMD_RELEASE_EVERY-th (1 = every reset, 0 = never; a 64-entry table per connection, a new
++ *     or colliding handle releases). The estimate kept the server's Scudo secondary maps (72 KB
++ *     blocks) growing steadily over 30 minutes on the device where every 32nd reset saws. Only the
++ *     two reset calls count: the implicit reset of vkBeginCommandBuffer is not covered (DXVK resets
++ *     its pools; a client that relies on implicit resets needs the estimate).
++ *   - with VORTEK_CMD_RELEASE_MODE=adaptive (or VORTEK_CMD_RELEASE_BYTES / _TOTAL_BYTES set, or
++ *     VORTEK_CMD_RELEASE_EVERY=auto) when the estimate of what the driver keeps (cmd_memory.h) reaches
 + *     VORTEK_CMD_RELEASE_BYTES for the pool (default 16m) or VORTEK_CMD_RELEASE_TOTAL_BYTES over all
 + *     pools of the connection (default 2 x VORTEK_CMD_RELEASE_BYTES) and the pool (buffer) holds at
 + *     least 1/16 of the smaller limit; pools without queries never release. Implicit resets by
 + *     vkBeginCommandBuffer are covered for pools that allow single resets (an explicit releasing
 + *     vkResetCommandBuffer first). VORTEK_CMD_RELEASE_LOG=1 logs every release (otherwise the first
-+ *     four and every 64th).
-+ *   - with VORTEK_CMD_RELEASE_EVERY set to a number: every VORTEK_CMD_RELEASE_EVERY-th reset of the
-+ *     same pool or command buffer (1 = every reset, 0 = never; a 64-entry table per connection, a new
-+ *     or colliding handle releases), the policy before the estimate. Not a number: the estimate. */
++ *     four and every 64th). VORTEK_CMD_RELEASE_MODE=every forces the fixed interval. */
++#define COMMAND_RELEASE_DEFAULT_EVERY 32
++
 +typedef struct CommandReleaseConfig {
 +    int every;               /* -1: by the estimate */
 +    uint64_t perPool, total;
@@ -114,15 +128,21 @@ index 9b27820..8a8ad7f 100644
 +static CommandReleaseConfig commandRelease;
 +
 +static void readCommandReleaseConfig(void) {
++    const char* mode = getenv("VORTEK_CMD_RELEASE_MODE");
 +    const char* value = getenv("VORTEK_CMD_RELEASE_EVERY");
-+    commandRelease.every = cmdmem_parse_every(value);
++    const char* bytes = getenv("VORTEK_CMD_RELEASE_BYTES");
++    const char* totalBytes = getenv("VORTEK_CMD_RELEASE_TOTAL_BYTES");
++    const char* ignored;
++    commandRelease.every = cmdmem_release_policy(mode, value, (bytes && *bytes) || (totalBytes && *totalBytes),
++                                                 COMMAND_RELEASE_DEFAULT_EVERY, &ignored);
++    if (ignored) println("vortek: VORTEK_CMD_RELEASE_%s=%s ignored", ignored, *ignored == 'M' ? mode : value);
 +    if (commandRelease.every >= 0) {
-+        println("vortek: VORTEK_CMD_RELEASE_EVERY=%d", commandRelease.every);
++        println("vortek: VORTEK_CMD_RELEASE_EVERY=%d%s", commandRelease.every,
++                (mode && *mode) || (value && *value) ? "" : " (default; VORTEK_CMD_RELEASE_MODE=adaptive releases by the estimate)");
 +        return;
 +    }
-+    if (value && *value) println("vortek: VORTEK_CMD_RELEASE_EVERY=%s is not a number, releasing by the estimate", value);
-+    commandRelease.perPool = cmdmem_parse_bytes(getenv("VORTEK_CMD_RELEASE_BYTES"), CMDMEM_DEFAULT_PER_POOL);
-+    commandRelease.total = cmdmem_parse_bytes(getenv("VORTEK_CMD_RELEASE_TOTAL_BYTES"), CMDMEM_DEFAULT_TOTAL(commandRelease.perPool));
++    commandRelease.perPool = cmdmem_parse_bytes(bytes, CMDMEM_DEFAULT_PER_POOL);
++    commandRelease.total = cmdmem_parse_bytes(totalBytes, CMDMEM_DEFAULT_TOTAL(commandRelease.perPool));
 +    const char* log = getenv("VORTEK_CMD_RELEASE_LOG");
 +    commandRelease.log = log && *log && *log != '0';
 +    println("vortek: command memory released by estimate: %.1f MiB per pool, %.1f MiB in all", commandRelease.perPool / 1048576.0,
@@ -135,7 +155,7 @@ index 9b27820..8a8ad7f 100644
 +    return &commandRelease;
 +}
 +
-+/* The connection's estimate, created with its first command pool; NULL with VORTEK_CMD_RELEASE_EVERY. */
++/* The connection's estimate, created with its first command pool; NULL with a fixed interval. */
 +static CmdMem* commandMemoryOf(VkContext* context) {
 +    const CommandReleaseConfig* config = commandReleaseConfig();
 +    if (config->every >= 0) return NULL;
@@ -161,7 +181,7 @@ index 9b27820..8a8ad7f 100644
  void vt_handle_vkCreateCommandPool(VkContext* context) {
      uint64_t deviceId;
      VkCommandPoolCreateInfo createInfo = {0};
-@@ -1350,7 +1422,11 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
+@@ -1350,7 +1434,11 @@ void vt_handle_vkCreateCommandPool(VkContext* context) {
  
      VkCommandPool commandPool;
      VkResult result = vulkanWrapper.vkCreateCommandPool(device, &createInfo, NULL, &commandPool);
@@ -174,7 +194,7 @@ index 9b27820..8a8ad7f 100644
  
      VT_SERIALIZE_CMD(VkCommandPool, commandPool);
      vt_send(context->clientRing, result, outputBuffer, bufferSize);
-@@ -1364,7 +1440,10 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
+@@ -1364,7 +1452,10 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
      VkDevice device = VkObject_fromId(deviceId);
      VkCommandPool commandPool = VkObject_fromId(commandPoolId);
  
@@ -186,7 +206,7 @@ index 9b27820..8a8ad7f 100644
  }
  
  void vt_handle_vkResetCommandPool(VkContext* context) {
-@@ -1376,6 +1455,8 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
+@@ -1376,6 +1467,8 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
      VkDevice device = VkObject_fromId(deviceId);
      VkCommandPool commandPool = VkObject_fromId(commandPoolId);
  
@@ -195,7 +215,7 @@ index 9b27820..8a8ad7f 100644
      vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
  }
  
-@@ -1388,6 +1469,9 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
+@@ -1388,6 +1481,9 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
  
      VkCommandBuffer commandBuffers[allocateInfo.commandBufferCount];
      VkResult result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, commandBuffers);
@@ -205,7 +225,7 @@ index 9b27820..8a8ad7f 100644
  
      VT_SERIALIZE_CMD(vkAllocateCommandBuffers, VK_NULL_HANDLE, &allocateInfo, commandBuffers);
      vt_send(context->clientRing, result, outputBuffer, bufferSize);
-@@ -1404,6 +1488,7 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
+@@ -1404,6 +1500,7 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
  
      VkCommandBuffer commandBuffers[commandBufferCount];
      vt_unserialize_vkFreeCommandBuffers(VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, commandBuffers, context->inputBuffer, &context->memoryPool);
@@ -213,7 +233,7 @@ index 9b27820..8a8ad7f 100644
  
      vulkanWrapper.vkFreeCommandBuffers(device, commandPool, commandBufferCount, commandBuffers);
  }
-@@ -1414,6 +1499,9 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
+@@ -1414,6 +1511,9 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
      vt_unserialize_vkBeginCommandBuffer((VkCommandBuffer)&commandBufferId, &beginInfo, context->inputBuffer, &context->memoryPool);
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
  
@@ -223,7 +243,7 @@ index 9b27820..8a8ad7f 100644
      vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
  }
  
-@@ -1441,11 +1529,27 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+@@ -1441,11 +1541,27 @@ static VkCommandBuffer replayCommands(VkContext* context) {
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
      if (commandBuffer == VK_NULL_HANDLE) return VK_NULL_HANDLE;
      position += VK_HANDLE_BYTE_COUNT;
@@ -251,7 +271,7 @@ index 9b27820..8a8ad7f 100644
  
          context->inputBuffer = inputBuffer + position + HEADER_SIZE;
          HandleRequestFunc handleRequestFunc = getHandleRequestFunc(requestCode);
-@@ -1460,12 +1564,16 @@ static VkCommandBuffer replayCommands(VkContext* context) {
+@@ -1460,12 +1576,16 @@ static VkCommandBuffer replayCommands(VkContext* context) {
          position += size + HEADER_SIZE;
      }
  
@@ -269,7 +289,7 @@ index 9b27820..8a8ad7f 100644
  }
  
  #ifdef VORTEK_STANDALONE
-@@ -1487,6 +1595,8 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
+@@ -1487,6 +1607,8 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
      vt_unserialize_vkResetCommandBuffer((VkCommandBuffer)&commandBufferId, &flags, context->inputBuffer, &context->memoryPool);
      VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
  

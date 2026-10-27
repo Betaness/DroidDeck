@@ -8,11 +8,12 @@
 # FL_PASSES=16 FL_FRAMES=12000), VORTEK_* to the server (VORTEK_CMD_RELEASE_LOG=1 is set: every
 # release is counted). FL_EXPECT (default bounded) and FL_MAX_GROWTH (default 64 bytes per frame) as
 # in frame_leak_report.awk: bounded = no growth over the last half of the reports, the default
-# (release by the estimate, cmd_memory.h) and VORTEK_CMD_RELEASE_EVERY=N >= 1 pass; FL_MAX_PEAK_KB and
+# (every 32nd reset), VORTEK_CMD_RELEASE_EVERY=N >= 1 and VORTEK_CMD_RELEASE_MODE=adaptive (release by
+# the estimate, cmd_memory.h) pass; flat = no growth at all (the default does); FL_MAX_PEAK_KB and
 # FL_MAX_RELEASES (per 1000 frames) add limits. Prints "server heap: ..." (first report, peak, steady
 # state, growth, releases per 1000 frames, server CPU per frame) and FRAMELEAK-PASS or FRAMELEAK-FAIL.
 # Without RELEASE_RESOURCES (VORTEK_CMD_RELEASE_EVERY=0, FL_EXPECT=grow) the default frame grows the
-# server by about 6.7 KB per frame on the Mali-G2. For the default 16m per pool, FL_FRAMES=12000
+# server by about 6.7 KB per frame on the Mali-G2. For the estimate's default 16m per pool, FL_FRAMES=12000
 # reaches the plateau in the first half (2 pools x 16 MiB at 6.7 KB per frame: ~5000 frames).
 set -u
 srv=$1 cdir=$2 test=$3 mock=$4
@@ -45,7 +46,7 @@ rc=$?
 kill $spid 2>/dev/null; wait $spid 2>/dev/null
 kill $mpid $xpid 2>/dev/null; wait $mpid $xpid 2>/dev/null
 grep -E "^FL (frame|done)|FAIL" $tmp/client.log
-grep -E "VORTEK_CMD_RELEASE_EVERY|command memory: (rel|.*full)|abort|Scudo" $tmp/server.log | head -6
+grep -E "VORTEK_CMD_RELEASE_|released by estimate|command memory: (rel|.*full)|abort|Scudo" $tmp/server.log | head -6
 verdict="server $(awk -v expect="${FL_EXPECT:-bounded}" -v max="${FL_MAX_GROWTH:-64}" -v maxpeak="${FL_MAX_PEAK_KB:-}" \
   -v maxrel="${FL_MAX_RELEASES:-}" -f "$(dirname "$0")/frame_leak_report.awk" $tmp/client.log $tmp/server.log)"
 echo "$verdict"
