@@ -3,9 +3,14 @@
  * below 4 GB. Without it winevulkan falls back to VK_EXT_external_memory_host, which fails on the
  * Mali (vkCreateImage -1000158000 with HOST_ALLOCATION_BIT_EXT, and mappings of the 0x7 types above
  * 4 GB; tests/wow64_memory_test.c). As the Vortek client and server do it: on a device that enables
- * the extension, host-visible memory is a dma-buf from the system-uncached heap imported into the
- * requested type, and a placed map is an mmap of that dma-buf at the caller's address. Other memory
- * and other devices go to the driver untouched. DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
+ * the extension, host-visible memory is a dma-buf imported into the requested type, and a placed map
+ * is an mmap of that dma-buf at the caller's address. Other memory and other devices go to the
+ * driver untouched. DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
+ *
+ * The GPU does not snoop the CPU's caches (tests/placed_memory_test.c), so HOST_COHERENT types get
+ * the system-uncached heap and nothing else. The HOST_CACHED, non-coherent types get the CPU-cached
+ * system heap: the application flushes and invalidates them, and those calls clean or clean and
+ * invalidate the CPU cache over the given range (DROIDDECK_HYBRIS_PLACED_CACHED=0: uncached too).
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -15,7 +20,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/dma-buf.h>
 #include <linux/dma-heap.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +41,7 @@ typedef struct PlacedMemory {
     int fd;
     VkDeviceSize size;
     void* at;
+    bool cached; /* from the CPU-cached heap: flush and invalidate maintain the CPU cache */
     struct PlacedMemory* next;
 } PlacedMemory;
 
@@ -60,19 +65,40 @@ void placed_fill_properties(void* chain) {
             ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT*)s)->minPlacedMemoryMapAlignment = (VkDeviceSize)sysconf(_SC_PAGESIZE);
 }
 
-static int dmabufAlloc(VkDeviceSize size) {
-    static const char* const heaps[] = {"/dev/dma_heap/system-uncached", "/dev/dma_heap/system"};
-    for (size_t i = 0; i < ARRAY_LEN(heaps); i++) {
-        int heap = open(heaps[i], O_RDONLY | O_CLOEXEC);
-        if (heap < 0) continue;
-        struct dma_heap_allocation_data data = {.len = size, .fd_flags = O_RDWR | O_CLOEXEC};
-        int result;
-        do result = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &data);
-        while (result < 0 && (errno == EINTR || errno == EAGAIN));
-        close(heap);
-        if (result == 0) return (int)data.fd;
+enum { HEAP_UNCACHED, HEAP_CACHED, HEAP_COUNT };
+static const char* const heapPaths[HEAP_COUNT] = {"/dev/dma_heap/system-uncached", "/dev/dma_heap/system"};
+static int heapFds[HEAP_COUNT] = {-1, -1};
+static bool cachedWanted;
+static pthread_once_t heapsOnce = PTHREAD_ONCE_INIT;
+
+/* Opened once: under proot every open() is a round trip through the tracer. */
+static void openHeaps(void) {
+    cachedWanted = icd_env_int("DROIDDECK_HYBRIS_PLACED_CACHED", 1) != 0;
+    for (int i = 0; i < HEAP_COUNT; i++) {
+        heapFds[i] = open(heapPaths[i], O_RDONLY | O_CLOEXEC);
+        if (heapFds[i] < 0) fprintf(stderr, "hybris-icd: %s: %s\n", heapPaths[i], strerror(errno));
     }
-    return -1;
+}
+
+/* A dma-buf for a memory type with these flags, or -1; *cached tells which heap it came from. */
+static int dmabufAlloc(VkDeviceSize size, VkMemoryPropertyFlags flags, bool* cached) {
+    pthread_once(&heapsOnce, openHeaps);
+    int heap = HEAP_UNCACHED;
+    /* Coherent memory is never flushed: only the uncached heap will do. */
+    if (!(flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
+        cachedWanted && heapFds[HEAP_CACHED] >= 0)
+        heap = HEAP_CACHED;
+    if (heapFds[heap] < 0) {
+        errno = ENODEV;
+        return -1;
+    }
+    struct dma_heap_allocation_data data = {.len = size, .fd_flags = O_RDWR | O_CLOEXEC};
+    int result;
+    do result = ioctl(heapFds[heap], DMA_HEAP_IOCTL_ALLOC, &data);
+    while (result < 0 && (errno == EINTR || errno == EAGAIN));
+    if (result) return -1;
+    *cached = heap == HEAP_CACHED;
+    return (int)data.fd;
 }
 
 static PlacedMemory** slot(Device* device, VkDeviceMemory memory) {
@@ -117,17 +143,21 @@ static VkResult VKAPI_CALL AllocateMemory(VkDevice handle, const VkMemoryAllocat
         importsOrExports(info->pNext))
         return device->AllocateMemory(handle, info, allocator, memory);
 
-    static int okLogged, failLogged;
+    static int okLogged, failLogged, importLogged;
     long page = sysconf(_SC_PAGESIZE);
+    VkMemoryPropertyFlags flags = device->memory.memoryTypes[info->memoryTypeIndex].propertyFlags;
     VkDeviceSize size = (info->allocationSize + page - 1) & ~(VkDeviceSize)(page - 1);
     PlacedMemory* record = calloc(1, sizeof(*record));
-    int fd = record ? dmabufAlloc(size) : -1;
+    if (!record) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    /* Without a dma-buf the memory could not be placed-mapped. A failed allocation is what an
+     * application expects and handles (DXVK tries again elsewhere); a failed map is not. */
+    int fd = dmabufAlloc(size, flags, &record->cached);
     int driverFd = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (driverFd < 0) {
-        logOnce(&failLogged, "no dma-buf for host-visible memory, placed maps of it will fail", errno);
+        logOnce(&failLogged, "no dma-buf for host-visible memory, allocation fails", errno);
         if (fd >= 0) close(fd);
         free(record);
-        return device->AllocateMemory(handle, info, allocator, memory);
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     VkImportMemoryFdInfoKHR import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .pNext = info->pNext,
                                       .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = driverFd};
@@ -135,13 +165,15 @@ static VkResult VKAPI_CALL AllocateMemory(VkDevice handle, const VkMemoryAllocat
     copy.pNext = &import;
     VkResult result = device->AllocateMemory(handle, &copy, allocator, memory);
     if (result != VK_SUCCESS) {
-        logOnce(&failLogged, "importing a dma-buf as host-visible memory failed, placed maps of it will fail", result);
+        logOnce(&importLogged, "importing a dma-buf as host-visible memory failed, allocation fails", result);
         close(driverFd);
         close(fd);
         free(record);
-        return device->AllocateMemory(handle, info, allocator, memory);
+        return result == VK_ERROR_OUT_OF_HOST_MEMORY ? result : VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
     logOnce(&okLogged, "host-visible memory is dma-buf backed for placed maps, first type", (int)info->memoryTypeIndex);
+    static int cachedLogged;
+    if (record->cached) logOnce(&cachedLogged, "HOST_CACHED memory from the cached dma-buf heap, first type", (int)info->memoryTypeIndex);
     record->memory = *memory;
     record->fd = fd;
     record->size = size;
@@ -238,27 +270,57 @@ static void VKAPI_CALL UnmapMemory(VkDevice handle, VkDeviceMemory memory) {
     else device->UnmapMemory(handle, memory);
 }
 
+/* Cache maintenance by virtual address over [begin, end): clean (flush: the CPU's writes reach
+ * memory for the GPU) or clean and invalidate (invalidate: later reads miss and fetch what the GPU
+ * wrote). Linux lets user space do both (SCTLR_EL1.UCI), and unlike DMA_BUF_IOCTL_SYNC, which always
+ * covers the whole dma-buf, it costs only the range. */
+static void cacheMaintain(uintptr_t begin, uintptr_t end, bool invalidate) {
+#if defined(__aarch64__)
+    static uintptr_t line;
+    if (!line) {
+        uint64_t ctr;
+        __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        line = (uintptr_t)4 << ((ctr >> 16) & 0xf); /* DminLine: the smallest data cache line */
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (invalidate)
+        for (uintptr_t a = begin & ~(line - 1); a < end; a += line) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+    else
+        for (uintptr_t a = begin & ~(line - 1); a < end; a += line) __asm__ volatile("dc cvac, %0" ::"r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+#else
+#error "cache maintenance for this architecture"
+#endif
+}
+
 /* The driver flushes and invalidates through its own mapping, which placed memory does not have (it
- * dereferences a null one); the dma-buf is synced instead. */
+ * dereferences a null one). Uncached memory needs only its write buffers drained; cached memory gets
+ * cache maintenance over the range. */
 static VkResult syncRanges(VkDevice handle, uint32_t count, const VkMappedMemoryRange* ranges, bool flush) {
     Device* device = icd_device(handle);
     if (!device) return VK_ERROR_DEVICE_LOST;
     VkMappedMemoryRange* rest = NULL;
     uint32_t restCount = 0;
+    bool drain = false;
     for (uint32_t i = 0; i < count; i++) {
         PlacedMemory* record = find(device, ranges[i].memory);
         if (record && record->at) {
-            uint64_t direction = flush ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ;
-            struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | direction};
-            ioctl(record->fd, DMA_BUF_IOCTL_SYNC, &sync);
-            sync.flags = DMA_BUF_SYNC_END | direction;
-            ioctl(record->fd, DMA_BUF_IOCTL_SYNC, &sync);
+            if (!record->cached || ranges[i].offset >= record->size) {
+                drain = true;
+                continue;
+            }
+            VkDeviceSize size = record->size - ranges[i].offset;
+            if (ranges[i].size != VK_WHOLE_SIZE && ranges[i].size < size) size = ranges[i].size;
+            uintptr_t begin = (uintptr_t)record->at + ranges[i].offset;
+            cacheMaintain(begin, begin + size, !flush);
             continue;
         }
         if (!rest && !(rest = malloc(count * sizeof(*rest)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
         rest[restCount++] = ranges[i];
     }
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#if defined(__aarch64__)
+    if (drain) __asm__ volatile("dsb sy" ::: "memory");
+#endif
     VkResult result = VK_SUCCESS;
     if (restCount)
         result = flush ? device->FlushMappedMemoryRanges(handle, restCount, rest) : device->InvalidateMappedMemoryRanges(handle, restCount, rest);
