@@ -76,6 +76,12 @@ NDK=/path/to/ndk ./build-server.sh out/libvortekserver.so
 - `gpu/TurnipDriver.java`：没有 Adreno 但有厂商 Vulkan HAL 时，合成器用系统 Vulkan 驱动。
 - `core/DeviceSupport.kt`、`MainActivity.kt`：这类设备不再弹「不是 Adreno」的对话框。
 - `app/build.gradle`：包名 `com.droiddeck.launcher.g2`，应用名「DroidDeck G2」，可以和官方版并存。
+- `droiddeck-game-env` 的 A/B 开关（默认不设，行为不变；可写进 droiddeck-env 或某个游戏的环境）：
+  `DROIDDECK_DXVK_DESCRIPTOR_BUFFER=1/0` 往 `DXVK_CONFIG` 加 `dxvk.enableDescriptorBuffer = True/False`
+  （DXVK 默认不对 Mali 打开；Vortek 不转发 VK_EXT_descriptor_buffer，所以只在 libhybris 路径上起作用）；
+  `DROIDDECK_DXVK_UPDATE_TEMPLATES=1/0/32` 加 `dxvk.enableDescriptorUpdateTemplates`，`32` 只对 32 位游戏 exe。
+  `WINE_OFFSCREEN_CHECK_MS=100` 让带 winex11 补丁（droiddeck-esync 包 rev 3 起）的 Proton 在呈现路径上
+  复用窗口离屏检查，每帧少几次 wineserver 往返。
 
 ## 限制
 

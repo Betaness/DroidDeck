@@ -371,6 +371,61 @@ def frame_rate_limit(command, env):
     return result
 
 
+# [mali-g2] A/B switches for DXVK options DXVK leaves off on Mali; unset keeps DXVK's own choice.
+DXVK_SWITCHES = (
+    # Descriptor buffers (VK_EXT_descriptor_buffer): DXVK enables them by default only on RADV, NVK,
+    # llvmpipe and some NVIDIA, AMD and Intel GPUs. The Mali driver has them; Vortek does not forward them.
+    ("DROIDDECK_DXVK_DESCRIPTOR_BUFFER", "dxvk.enableDescriptorBuffer"),
+    # vkUpdateDescriptorSetWithTemplate instead of vkUpdateDescriptorSets where descriptor buffers are
+    # not used; "32" only for a 32-bit game executable, whose Vulkan calls go through the WoW64 thunks.
+    ("DROIDDECK_DXVK_UPDATE_TEMPLATES", "dxvk.enableDescriptorUpdateTemplates"),
+)
+SWITCH_ON = ("1", "on", "true", "yes")
+SWITCH_OFF = ("0", "off", "false", "no")
+
+
+def pe_machine(path):
+    """The machine field of a PE executable's header, or None."""
+    try:
+        with open(path, "rb") as source:
+            head = source.read(4096)
+    except OSError:
+        return None
+    if head[:2] != b"MZ" or len(head) < 64:
+        return None
+    offset = int.from_bytes(head[60:64], "little")
+    if offset + 6 > len(head) or head[offset:offset + 4] != b"PE\0\0":
+        return None
+    return int.from_bytes(head[offset + 4:offset + 6], "little")
+
+
+def dxvk_switches(command, env):
+    """[mali-g2] DROIDDECK_DXVK_DESCRIPTOR_BUFFER and DROIDDECK_DXVK_UPDATE_TEMPLATES (1/0, or 32 for the
+    templates) add the DXVK option to DXVK_CONFIG for games; an option DXVK_CONFIG already sets is kept."""
+    if len(command) < 3 or command[1] != "waitforexitandrun":
+        return env
+    own = env.get("DXVK_CONFIG", "").strip().rstrip(";").strip()
+    added = []
+    for name, option in DXVK_SWITCHES:
+        value = env.get(name, "").strip().lower()
+        if not value:
+            continue
+        if value == "32" and option == "dxvk.enableDescriptorUpdateTemplates":
+            if pe_machine(command[2]) != 0x14c:
+                continue
+            value = "1"
+        if value not in SWITCH_ON + SWITCH_OFF:
+            print("droiddeck-game-env: %s=%s is not 1 or 0; ignored" % (name, env[name]), file=sys.stderr)
+            continue
+        if re.search(r"(?:^|;)\s*" + re.escape(option) + r"\s*=", own):
+            continue
+        added.append("%s = %s" % (option, "True" if value in SWITCH_ON else "False"))
+    if not added:
+        return env
+    print("droiddeck-game-env: " + "; ".join(added), file=sys.stderr)
+    return dict(env, DXVK_CONFIG="; ".join(([own] if own else []) + added))
+
+
 def zink_all_extensions(command, env):
     """[mali-g2] Games get zink with every device extension the Mali has (OpenGL 4.6, GLES 3.2): the
     Vortek server otherwise cuts zink down to Winlator's list, which holds it at OpenGL 3.2. Steam's
@@ -584,6 +639,7 @@ def main():
     if app_id and len(command) > 1 and command[1] == "waitforexitandrun":
         command = offline_without_anticheat(command, env)
     env = frame_rate_limit(command, env)
+    env = dxvk_switches(command, env)
     env = zink_all_extensions(command, env)
     env = hybris_gpu(command, env)
     if mic_enabled == "0":

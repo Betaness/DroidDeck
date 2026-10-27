@@ -1,4 +1,6 @@
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -362,6 +364,42 @@ class GameEnvironmentTest(unittest.TestCase):
             conf.write_text("d3d9.maxFrameRate = 60\n")
             self.assertEqual(limit(command, env), dict(env, VKD3D_FRAME_RATE="40"))
             self.assertIn("DXVK_CONFIG", limit(command, dict(env, DXVK_CONFIG_FILE=str(Path(tmp) / "none.conf"))))
+
+    def test_dxvk_switches_add_options_for_games_only(self):
+        switches = MODULE["dxvk_switches"]
+
+        def pe(path, machine):
+            head = bytearray(512)
+            head[0:2] = b"MZ"
+            head[60:64] = (128).to_bytes(4, "little")
+            head[128:132] = b"PE\0\0"
+            head[132:134] = machine.to_bytes(2, "little")
+            Path(path).write_bytes(bytes(head))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            game32, game64 = str(Path(tmp) / "Game32.exe"), str(Path(tmp) / "Game64.exe")
+            pe(game32, 0x14C)
+            pe(game64, 0x8664)
+            command = ["/proton", "waitforexitandrun", game64]
+            self.assertEqual(switches(command, {}), {})
+            env = {"DROIDDECK_DXVK_DESCRIPTOR_BUFFER": "1"}
+            self.assertEqual(switches(command, env)["DXVK_CONFIG"], "dxvk.enableDescriptorBuffer = True")
+            self.assertEqual(switches(command, {"DROIDDECK_DXVK_DESCRIPTOR_BUFFER": "0"})["DXVK_CONFIG"],
+                             "dxvk.enableDescriptorBuffer = False")
+            self.assertEqual(switches(["/proton", "run", game64], env), env)
+            both = dict(env, DROIDDECK_DXVK_UPDATE_TEMPLATES="1", DXVK_CONFIG="dxvk.maxFrameRate = 40;")
+            self.assertEqual(switches(command, both)["DXVK_CONFIG"],
+                             "dxvk.maxFrameRate = 40; dxvk.enableDescriptorBuffer = True; dxvk.enableDescriptorUpdateTemplates = True")
+            own = dict(env, DXVK_CONFIG="dxvk.enableDescriptorBuffer = False")
+            self.assertEqual(switches(command, own), own)
+            only32 = {"DROIDDECK_DXVK_UPDATE_TEMPLATES": "32"}
+            self.assertEqual(switches(command, only32), only32)
+            self.assertEqual(switches(["/proton", "waitforexitandrun", game32], only32)["DXVK_CONFIG"],
+                             "dxvk.enableDescriptorUpdateTemplates = True")
+            self.assertEqual(switches(["/proton", "waitforexitandrun", str(Path(tmp) / "missing.exe")], only32), only32)
+            bad = {"DROIDDECK_DXVK_DESCRIPTOR_BUFFER": "maybe"}
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(switches(command, bad), bad)
 
     def test_arkham_city_gets_full_x87_precision_over_the_preset(self):
         with tempfile.TemporaryDirectory() as tmp:
