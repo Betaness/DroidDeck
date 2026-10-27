@@ -1328,6 +1328,12 @@ class ForceSsbsTest(unittest.TestCase):
                 self.assertEqual(got["VK_DRIVER_FILES"], str(files["icd.json"]))
                 self.assertEqual(got["LD_PRELOAD"], str(files["libhybris-common.so.1"]) + ":/usr/local/lib/libssbs.so")
                 self.assertEqual(got["VORTEK_PRESENT_SOCKET"], "/run/droiddeck/vortek-present")
+                self.assertEqual(hybris(game, dict(env, XDG_CACHE_HOME="/root/.cache"))["DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR"],
+                                 "/root/.cache/droiddeck/hybris-pipelines")
+                self.assertEqual(hybris(game, dict(env, HOME="/home/deck"))["DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR"],
+                                 "/home/deck/.cache/droiddeck/hybris-pipelines")
+                own = dict(env, DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR="/games/pipelines")
+                self.assertEqual(hybris(game, own)["DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR"], "/games/pipelines")
                 self.assertEqual(hybris(game, got)["LD_PRELOAD"], got["LD_PRELOAD"])
                 self.assertEqual(hybris(game, got)["GLIBC_TUNABLES"], got["GLIBC_TUNABLES"])
                 self.assertEqual(hybris([str(arm / "proton"), "run", "iscriptevaluator.exe"], env), env)

@@ -1,5 +1,6 @@
 /*
- * [mali-g2] Persistent implicit pipeline cache of the Vortek server (pipeline_cache.c).
+ * [mali-g2] Persistent implicit pipeline cache of the Vortek server and the in-process libhybris
+ * ICD (pipeline_cache.c).
  *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * This library is free software; you can redistribute it and/or modify it
@@ -29,13 +30,22 @@ void PipelineCache_noteCreated(VkDevice device, uint32_t count, uint64_t elapsed
  * new, logs the device's pipeline statistics and destroys the implicit cache. */
 void PipelineCache_deviceDestroyed(VkDevice device);
 
+/* The cache for a vkCreateGraphicsPipelines / vkCreateComputePipelines call to which the application
+ * passed `cache`: that one when it is not VK_NULL_HANDLE, else the device's implicit cache
+ * (PipelineCache_get), except for calls that only fast-link libraries (cheap, they would only fill
+ * the cache) and calls with a shader module identifier (the identifier hashes the application's
+ * SPIR-V, not what the client or the in-process ICD rewrote it to, so a cached pipeline could be
+ * the wrong code): VK_NULL_HANDLE for those. */
+VkPipelineCache PipelineCache_forGraphics(VkDevice device, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* createInfos,
+                                          uint32_t count);
+VkPipelineCache PipelineCache_forCompute(VkDevice device, VkPipelineCache cache, const VkComputePipelineCreateInfo* createInfos,
+                                         uint32_t count);
+
 /* True for a create info that only fast-links pipeline libraries (no LINK_TIME_OPTIMIZATION):
  * not worth a cache entry. */
 bool PipelineCache_isFastLink(const VkGraphicsPipelineCreateInfo* createInfo);
 
-/* True when a stage passes a shader module identifier (VK_EXT_shader_module_identifier): such a
- * call must not use the implicit cache, the identifier hashes the application's SPIR-V, which the
- * client may have rewritten differently when the cached pipeline was compiled. */
+/* True when a stage passes a shader module identifier (VK_EXT_shader_module_identifier). */
 bool PipelineCache_usesModuleIdentifier(const VkPipelineShaderStageCreateInfo* stages, uint32_t stageCount);
 
 #endif

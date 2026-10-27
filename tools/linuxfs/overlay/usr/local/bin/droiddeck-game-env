@@ -444,6 +444,15 @@ ANDROID_VULKAN = "/system/lib64/libvulkan.so"
 HYBRIS_STATIC_TLS = "glibc.rtld.optional_static_tls=16384"
 
 
+def hybris_pipeline_cache(env):
+    """[mali-g2] Compiled pipelines of in-process games (mali-g2/hybris/src/pipeline_cache_hybris.c): one file per
+    executable and driver build, in one directory with one size limit, as the Vortek server keeps them. The server's
+    directory is in the app's Android cache, which the guest does not see; the guest's own cache directory lasts with
+    the rootfs, as Mesa's shader cache does."""
+    cache = env.get("XDG_CACHE_HOME") or os.path.join(env.get("HOME") or str(Path.home()), ".cache")
+    return os.path.join(cache, "droiddeck", "hybris-pipelines")
+
+
 def hybris_gpu(command, env):
     """[mali-g2] DROIDDECK_GPU_PATH=hybris (the app's gpuPath setting, or a game's environment): the game's
     processes run the Mali driver themselves through libhybris (mali-g2/hybris) instead of forwarding every
@@ -469,6 +478,7 @@ def hybris_gpu(command, env):
     result = dict(env, VK_ICD_FILENAMES=HYBRIS_ICD, VK_DRIVER_FILES=HYBRIS_ICD, LD_PRELOAD=":".join([HYBRIS_PRELOAD] + parts),
                   GLIBC_TUNABLES=":".join(tunables + [HYBRIS_STATIC_TLS]))
     result.setdefault("VORTEK_PRESENT_SOCKET", os.path.join(env.get("XDG_RUNTIME_DIR") or "/run/droiddeck", "vortek-present"))
+    result.setdefault("DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR", hybris_pipeline_cache(env))
     print("droiddeck-game-env: Vulkan in-process (libhybris), Steam stays on Vortek", file=sys.stderr)
     return result
 

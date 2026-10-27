@@ -48,6 +48,8 @@ typedef struct Instance {
     VkInstance handle;
     struct Instance* next;
     bool vkd3d;  /* the application is vkd3d-proton */
+    char* appName;    /* VkApplicationInfo's, for the pipeline cache's file name */
+    char* engineName;
 #define INSTANCE_FUNCS(X) \
     X(DestroyInstance) X(EnumeratePhysicalDevices) X(EnumeratePhysicalDeviceGroups) X(GetPhysicalDeviceProperties) \
     X(GetPhysicalDeviceProperties2) X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
@@ -132,7 +134,7 @@ typedef struct Device {
     X(CreateShaderModule) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
     X(MapMemory2KHR) X(UnmapMemory2KHR) X(FlushMappedMemoryRanges) X(GetImageSubresourceLayout) X(GetImageSubresourceLayout2) \
     X(GetImageSubresourceLayout2KHR) X(GetImageSubresourceLayout2EXT) X(GetDeviceImageSubresourceLayout) \
-    X(GetDeviceImageSubresourceLayoutKHR)
+    X(GetDeviceImageSubresourceLayoutKHR) X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) X(MergePipelineCaches)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
 #undef X

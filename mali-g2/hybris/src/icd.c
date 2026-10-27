@@ -11,6 +11,7 @@
  */
 #define _GNU_SOURCE
 #include "icd.h"
+#include "pipeline_cache.h"
 
 #include <dlfcn.h>
 #include <limits.h>
@@ -283,8 +284,13 @@ static VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo* info, cons
         instance->EnumeratePhysicalDeviceGroups = (PFN_vkEnumeratePhysicalDeviceGroups)next.gipa(*out, "vkEnumeratePhysicalDeviceGroupsKHR");
     if (!instance->GetPhysicalDeviceFeatures2)
         instance->GetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)next.gipa(*out, "vkGetPhysicalDeviceFeatures2KHR");
+    if (!instance->GetPhysicalDeviceProperties2)
+        instance->GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)next.gipa(*out, "vkGetPhysicalDeviceProperties2KHR");
     const char* engine = info->pApplicationInfo ? info->pApplicationInfo->pEngineName : NULL;
+    const char* app = info->pApplicationInfo ? info->pApplicationInfo->pApplicationName : NULL;
     instance->vkd3d = engine && !strcmp(engine, "vkd3d");
+    instance->engineName = engine ? strdup(engine) : NULL;
+    instance->appName = app ? strdup(app) : NULL;
     pthread_mutex_lock(&registryLock);
     instance->next = instances;
     instances = instance;
@@ -310,6 +316,8 @@ static void VKAPI_CALL DestroyInstance(VkInstance handle, const VkAllocationCall
     pthread_mutex_unlock(&registryLock);
     if (!instance) return;
     instance->DestroyInstance(handle, allocator);
+    free(instance->appName);
+    free(instance->engineName);
     free(instance);
 }
 
@@ -534,6 +542,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
     device->next = devices;
     devices = device;
     pthread_mutex_unlock(&registryLock);
+    PipelineCache_deviceCreated(physical, *out, instance->appName, instance->engineName);
     return VK_SUCCESS;
 }
 
@@ -543,6 +552,7 @@ static void VKAPI_CALL DestroyDevice(VkDevice handle, const VkAllocationCallback
     if (!device) return;
     wsi_device_destroyed(device);
     mali_device_destroyed(device);
+    PipelineCache_deviceDestroyed(handle);
     pthread_mutex_lock(&registryLock);
     Device** link = &devices;
     while (*link && *link != device) link = &(*link)->next;

@@ -1,5 +1,8 @@
 /*
- * [mali-g2] Persistent implicit pipeline cache of the Vortek server.
+ * [mali-g2] Persistent implicit pipeline cache of the Vortek server, also built into the in-process
+ * libhybris ICD (mali-g2/hybris/src/pipeline_cache_hybris.c defines PCACHE_LOG, PCACHE_VK, PCACHE_ENV
+ * and includes this file: the driver is reached through its device table, the variables are
+ * DROIDDECK_HYBRIS_PIPELINE_CACHE_*, logs go to stderr).
  *
  * DXVK passes VK_NULL_HANDLE as the VkPipelineCache and the Mali driver keeps no shader cache of
  * its own (in memory across devices or on disk), so every game start compiled every pipeline again
@@ -13,8 +16,10 @@
  *     (the app kills the server with SIGKILL at the end of a session, so there is no exit hook);
  *   - when the device is destroyed, also by the cleanup after a client that is gone (killed game).
  * Writes go to a temporary file that is renamed over the old one; one save at a time in the
- * process. When the file changed on disk since this device read it (two devices of the same game),
- * the saved data is the union of both, and nothing is written when that union adds nothing.
+ * directory (a mutex in the process, flock() of the directory between processes: game processes
+ * of the in-process path share it). When the file changed on disk since this device read it (two
+ * devices of the same game), the saved data is the union of both, and nothing is written when that
+ * union adds nothing.
  * Calls that pass a shader module identifier (VK_EXT_shader_module_identifier, DXVK's library
  * recompiles) do not use the cache: the identifier is the driver's hash of the application's
  * SPIR-V, which the client may have rewritten (spec composites, clip distances) differently in the
@@ -27,12 +32,14 @@
  * 64-byte header carries the same identity, the data size and a hash of the data; a file that does
  * not match, or whose data does not start with this driver's VkPipelineCacheHeaderVersionOne, is
  * ignored and replaced. Data that passes those checks can still crash the driver (a bug of the
- * driver's own output): <file>.loading exists while the driver parses a file, so a file whose
- * marker a crashed server left behind is deleted instead of being loaded again (and crashing every
- * start of that game).
+ * driver's own output): <file>.loading exists while the driver parses a file, flock()ed by the
+ * parsing process, which removes it before it lets go. A marker nobody holds is what a process that
+ * died there left behind: that file is deleted instead of being loaded again (and crashing every
+ * start of that game). A marker a live process holds is waited for (up to 10 s, else no load).
  *
  * Environment:
- *   VORTEK_PIPELINE_CACHE_DIR       directory of the cache files; unset = no implicit cache
+ *   VORTEK_PIPELINE_CACHE_DIR       directory of the cache files (made with its parents); unset = no
+ *                                   implicit cache
  *   VORTEK_PIPELINE_CACHE=0         no implicit cache even with a directory
  *   VORTEK_PIPELINE_CACHE_MAX_MB    largest file written (default 64): a cache that grows past it
  *                                   keeps the file it started from
@@ -51,12 +58,20 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef PCACHE_LOG
 #include "vulkan_helper.h"
+#define PCACHE_LOG(fmt, ...) println("vortek: " fmt, ##__VA_ARGS__)
+#define PCACHE_VK(device, name) vulkanWrapper.vk##name
+#define PCACHE_VK_PHYSICAL(physicalDevice, name) vulkanWrapper.vk##name
+#define PCACHE_ENV "VORTEK_PIPELINE_CACHE"
+#endif
 #include "pipeline_cache.h"
 
 #define FILE_MAGIC "VTKPCv1"
@@ -64,6 +79,7 @@
 #define IDLE_BEFORE_SAVE_NS 2000000000ull
 #define MIN_SAVE_INTERVAL_NS 10000000000ull
 #define STALE_TEMP_S 600
+#define MARKER_WAIT_MS 10000
 #define HIST_BUCKETS 5
 
 typedef struct {
@@ -103,6 +119,7 @@ static uint64_t maxUnsavedNs;
 static pthread_mutex_t tableLock = PTHREAD_MUTEX_INITIALIZER;
 /* one driver parse of file data (load or merge) at a time, so the .loading marker is unambiguous */
 static pthread_mutex_t parseLock = PTHREAD_MUTEX_INITIALIZER;
+static bool exiting; /* under parseLock */
 /* one save at a time: two writers of one file would each rename over the other's data */
 static pthread_mutex_t saveLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t idleCond = PTHREAD_COND_INITIALIZER;
@@ -116,32 +133,60 @@ static uint64_t nowNs(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
-static long envLong(const char* name, long def) {
+/* PCACHE_ENV + suffix, else (PCACHE_ENV_FALLBACK, not for the directory) the fallback's variable. */
+static const char* pcacheEnv(const char* suffix) {
+    char name[96];
+    snprintf(name, sizeof(name), "%s%s", PCACHE_ENV, suffix);
     const char* value = getenv(name);
-    if (!value || !*value) return def;
+#ifdef PCACHE_ENV_FALLBACK
+    if ((!value || !*value) && strcmp(suffix, "_DIR") != 0) {
+        snprintf(name, sizeof(name), "%s%s", PCACHE_ENV_FALLBACK, suffix);
+        value = getenv(name);
+    }
+#endif
+    return value && *value ? value : NULL;
+}
+
+static long envLong(const char* suffix, long def) {
+    const char* value = pcacheEnv(suffix);
+    if (!value) return def;
     char* end;
     long result = strtol(value, &end, 10);
     return end != value && result >= 0 ? result : def;
 }
 
+static bool makeDirs(char* path) {
+    for (char* slash = strchr(path + 1, '/'); slash; slash = strchr(slash + 1, '/')) {
+        *slash = 0;
+        bool ok = mkdir(path, 0700) == 0 || errno == EEXIST;
+        *slash = '/';
+        if (!ok) return false;
+    }
+    return mkdir(path, 0700) == 0 || errno == EEXIST;
+}
+
+static void waitForParsesAtExit(void);
+
 static void loadConfig(void) {
-    const char* dir = getenv("VORTEK_PIPELINE_CACHE_DIR");
-    const char* toggle = getenv("VORTEK_PIPELINE_CACHE");
-    if (!dir || !*dir || (toggle && strcmp(toggle, "0") == 0)) return;
+    const char* dir = pcacheEnv("_DIR");
+    const char* toggle = pcacheEnv("");
+    if (!dir || (toggle && strcmp(toggle, "0") == 0)) return;
     if (strlen(dir) >= sizeof(cacheDir) - 128) return;
     strcpy(cacheDir, dir);
-    if (mkdir(cacheDir, 0700) != 0 && errno != EEXIST) {
-        println("vortek: pipeline cache: cannot create %s (%s), off", cacheDir, strerror(errno));
+    if (!makeDirs(cacheDir)) {
+        PCACHE_LOG("pipeline cache: cannot create %s (%s), off", cacheDir, strerror(errno));
         return;
     }
-    maxFileBytes = (size_t)envLong("VORTEK_PIPELINE_CACHE_MAX_MB", 64) << 20;
-    maxTotalBytes = (size_t)envLong("VORTEK_PIPELINE_CACHE_TOTAL_MB", 256) << 20;
-    maxUnsavedNs = (uint64_t)envLong("VORTEK_PIPELINE_CACHE_SAVE_S", 30) * 1000000000ull;
+    maxFileBytes = (size_t)envLong("_MAX_MB", 64) << 20;
+    maxTotalBytes = (size_t)envLong("_TOTAL_MB", 256) << 20;
+    maxUnsavedNs = (uint64_t)envLong("_SAVE_S", 30) * 1000000000ull;
     if (maxUnsavedNs < MIN_SAVE_INTERVAL_NS) maxUnsavedNs = MIN_SAVE_INTERVAL_NS;
     enabled = maxFileBytes > 0;
-    if (enabled)
-        println("vortek: pipeline cache in %s (file limit %zu MB, all files %zu MB, saved within %llu s)", cacheDir, maxFileBytes >> 20,
-                maxTotalBytes >> 20, (unsigned long long)(maxUnsavedNs / 1000000000ull));
+    if (enabled) {
+        atexit(waitForParsesAtExit);
+        PCACHE_LOG("pipeline cache in %s (file limit %zu MB, all files %zu MB, saved within %llu s)", cacheDir, maxFileBytes >> 20,
+                   maxTotalBytes >> 20, (unsigned long long)(maxUnsavedNs / 1000000000ull));
+    }
 }
 
 /* not cryptographic: detects truncated or damaged files */
@@ -163,7 +208,7 @@ static uint64_t hashBytes(const void* data, size_t size, uint64_t h) {
 static void driverIdentity(VkPhysicalDevice physicalDevice, DriverIdentity* id) {
     VkPhysicalDeviceDriverProperties driver = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
-    vulkanWrapper.vkGetPhysicalDeviceProperties2(physicalDevice, &properties);
+    PCACHE_VK_PHYSICAL(physicalDevice, GetPhysicalDeviceProperties2)(physicalDevice, &properties);
     memset(id, 0, sizeof(*id));
     id->vendorID = properties.properties.vendorID;
     id->deviceID = properties.properties.deviceID;
@@ -207,27 +252,92 @@ static bool vulkanHeaderMatches(const DriverIdentity* id, const uint8_t* data, s
            vendorID == id->vendorID && deviceID == id->deviceID && memcmp(data + 16, id->uuid, VK_UUID_SIZE) == 0;
 }
 
+static bool sameFile(const struct stat* a, const struct stat* b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* <path>.loading for this process, created under a temporary name, locked and renamed into place,
+ * so no other process sees it unlocked; -1 when it could not be made (the parse goes ahead). */
+static int publishMarker(const char* marker) {
+    char tmp[PATH_MAX + 48];
+    snprintf(tmp, sizeof(tmp), "%s.tmp-%d", marker, getpid());
+    int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX) != 0 || rename(tmp, marker) != 0) {
+        unlink(tmp);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+typedef enum { MARKER_NONE, MARKER_STALE, MARKER_BUSY } MarkerState;
+
+/* Whether <path>.loading is there and nobody holds it (left by a process that died while the driver
+ * parsed the file), or a live process parses it now (waited for up to MARKER_WAIT_MS first). The
+ * parser removes the marker before it unlocks, so a marker that is still in place once its lock is
+ * free is stale. */
+static MarkerState checkMarker(const char* marker) {
+    for (int waited = 0;; waited += 20) {
+        int fd = open(marker, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return MARKER_NONE;
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+            struct stat held, now;
+            bool stale = fstat(fd, &held) == 0 && stat(marker, &now) == 0 && sameFile(&held, &now);
+            close(fd);
+            if (stale) return MARKER_STALE;
+            continue;
+        }
+        close(fd);
+        if (waited >= MARKER_WAIT_MS) return MARKER_BUSY;
+        usleep(20000);
+    }
+}
+
 /* vkCreatePipelineCache from file data with <path>.loading present while the driver parses it.
- * False (and the file deleted) when a previous server died there. */
+ * False (and the file deleted) when a previous process died there; also false, without parsing,
+ * when another one has been parsing it for too long or this process is exiting. */
 static bool createFromFileData(VkDevice device, const char* path, const char* name, const void* data, size_t size, VkPipelineCache* cache,
                                VkResult* result) {
     char marker[PATH_MAX + 16];
     snprintf(marker, sizeof(marker), "%s.loading", path);
     pthread_mutex_lock(&parseLock);
-    if (access(marker, F_OK) == 0) {
-        unlink(path);
-        unlink(marker);
+    if (exiting) {
         pthread_mutex_unlock(&parseLock);
-        println("vortek: pipeline cache %s: the server died while the driver read this file last time, deleted it", name);
         return false;
     }
-    int fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    if (fd >= 0) close(fd);
+    MarkerState state = checkMarker(marker);
+    if (state != MARKER_NONE) {
+        if (state == MARKER_STALE) {
+            unlink(path);
+            unlink(marker);
+        }
+        pthread_mutex_unlock(&parseLock);
+        if (state == MARKER_STALE)
+            PCACHE_LOG("pipeline cache %s: a process died while the driver read this file last time, deleted it", name);
+        else
+            PCACHE_LOG("pipeline cache %s: another process has been reading this file for %d s, not loaded", name, MARKER_WAIT_MS / 1000);
+        return false;
+    }
+    int fd = publishMarker(marker);
     VkPipelineCacheCreateInfo info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, size, data};
-    *result = vulkanWrapper.vkCreatePipelineCache(device, &info, NULL, cache);
-    unlink(marker);
+    *result = PCACHE_VK(device, CreatePipelineCache)(device, &info, NULL, cache);
+    if (fd >= 0) {
+        struct stat mine, now;
+        if (fstat(fd, &mine) == 0 && stat(marker, &now) == 0 && sameFile(&mine, &now)) unlink(marker);
+        close(fd);
+    }
     pthread_mutex_unlock(&parseLock);
     return true;
+}
+
+/* exit() while another thread has the driver parse a file would leave a marker nobody holds, and
+ * the next start would take the file for one that crashed the driver: exit waits for a parse under
+ * way, and none starts after it. */
+static void waitForParsesAtExit(void) {
+    pthread_mutex_lock(&parseLock);
+    exiting = true;
+    pthread_mutex_unlock(&parseLock);
 }
 
 /* The pipeline cache data of a valid file (malloc'd, *size bytes), or NULL; *st gets its stat. */
@@ -318,8 +428,8 @@ static void trimDirectory(const char* keep) {
             if (strcmp(items[i].name, keepName) == 0) continue;
             if (unlinkat(dirfd(dir), items[i].name, 0) == 0) {
                 total -= items[i].size;
-                println("vortek: pipeline cache: removed %s (%lld KB, least recently used beyond %zu MB)", items[i].name,
-                        (long long)items[i].size >> 10, maxTotalBytes >> 20);
+                PCACHE_LOG("pipeline cache: removed %s (%lld KB, least recently used beyond %zu MB)", items[i].name,
+                           (long long)items[i].size >> 10, maxTotalBytes >> 20);
             }
         }
     }
@@ -357,12 +467,12 @@ static bool writeFileAtomically(CacheEntry* e, const void* data, size_t size) {
 static void* getCacheData(VkDevice device, VkPipelineCache cache, size_t* size) {
     for (int attempt = 0; attempt < 4; attempt++) {
         *size = 0;
-        if (vulkanWrapper.vkGetPipelineCacheData(device, cache, size, NULL) != VK_SUCCESS || *size == 0) return NULL;
+        if (PCACHE_VK(device, GetPipelineCacheData)(device, cache, size, NULL) != VK_SUCCESS || *size == 0) return NULL;
         size_t want = *size + *size / 8 + 4096; /* room for pipelines added in between */
         void* data = malloc(want);
         if (!data) return NULL;
         *size = want;
-        VkResult result = vulkanWrapper.vkGetPipelineCacheData(device, cache, size, data);
+        VkResult result = PCACHE_VK(device, GetPipelineCacheData)(device, cache, size, data);
         if (result == VK_SUCCESS) return data;
         free(data);
         if (result != VK_INCOMPLETE) return NULL;
@@ -396,7 +506,7 @@ static bool saveLocked(CacheEntry* e) {
             VkResult result = VK_ERROR_UNKNOWN;
             if (!createFromFileData(e->device, e->path, e->name, disk, diskSize, &merged, &result) || result != VK_SUCCESS)
                 merged = VK_NULL_HANDLE;
-            else if (vulkanWrapper.vkMergePipelineCaches(e->device, merged, 1, &e->cache) == VK_SUCCESS)
+            else if (PCACHE_VK(e->device, MergePipelineCaches)(e->device, merged, 1, &e->cache) == VK_SUCCESS)
                 source = merged;
             free(disk);
         }
@@ -410,9 +520,9 @@ static bool saveLocked(CacheEntry* e) {
     size_t expected = source == merged ? diskSize : (size_t)(e->knownSize - FILE_HEADER_SIZE);
     size_t size = 0;
     void* data = NULL;
-    if (!haveExpected || vulkanWrapper.vkGetPipelineCacheData(e->device, source, &size, NULL) != VK_SUCCESS || size != expected)
+    if (!haveExpected || PCACHE_VK(e->device, GetPipelineCacheData)(e->device, source, &size, NULL) != VK_SUCCESS || size != expected)
         data = getCacheData(e->device, source, &size);
-    if (merged) vulkanWrapper.vkDestroyPipelineCache(e->device, merged, NULL);
+    if (merged) PCACHE_VK(e->device, DestroyPipelineCache)(e->device, merged, NULL);
     if (haveExpected && size == expected) {
         if (source == merged) noteOnDisk(e, &st);
         free(data);
@@ -421,8 +531,8 @@ static bool saveLocked(CacheEntry* e) {
     if (!data) return false;
     if (size > maxFileBytes) {
         if (!e->overCapLogged)
-            println("vortek: pipeline cache %s: %zu KB is over the %zu MB limit, keeping the file it started from", e->name, size >> 10,
-                    maxFileBytes >> 20);
+            PCACHE_LOG("pipeline cache %s: %zu KB is over the %zu MB limit, keeping the file it started from", e->name, size >> 10,
+                       maxFileBytes >> 20);
         e->overCapLogged = true;
         free(data);
         return true;
@@ -430,14 +540,14 @@ static bool saveLocked(CacheEntry* e) {
     bool ok = writeFileAtomically(e, data, size);
     free(data);
     if (!ok) {
-        println("vortek: pipeline cache %s: could not write %s (%s)", e->name, e->path, strerror(errno));
+        PCACHE_LOG("pipeline cache %s: could not write %s (%s)", e->name, e->path, strerror(errno));
         return false;
     }
     e->savedBytes = size;
     e->saves++;
-    if (e->saves == 1 || getenv("VORTEK_PIPELINE_CACHE_LOG"))
-        println("vortek: pipeline cache %s: saved %zu KB in %.1f ms%s", e->name, size >> 10, (nowNs() - t0) / 1e6,
-                source == merged ? " (merged with a newer file)" : "");
+    if (e->saves == 1 || pcacheEnv("_LOG"))
+        PCACHE_LOG("pipeline cache %s: saved %zu KB in %.1f ms%s", e->name, size >> 10, (nowNs() - t0) / 1e6,
+                   source == merged ? " (merged with a newer file)" : "");
     trimDirectory(e->path);
     return true;
 }
@@ -445,7 +555,10 @@ static bool saveLocked(CacheEntry* e) {
 static bool saveEntry(CacheEntry* e) {
     if (e->overCapLogged || !e->cache) return true;
     pthread_mutex_lock(&saveLock);
+    int dirFd = open(cacheDir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirFd >= 0) flock(dirFd, LOCK_EX);
     bool ok = saveLocked(e);
+    if (dirFd >= 0) close(dirFd);
     pthread_mutex_unlock(&saveLock);
     return ok;
 }
@@ -491,7 +604,11 @@ void PipelineCache_deviceCreated(VkPhysicalDevice physicalDevice, VkDevice devic
     e->device = device;
     driverIdentity(physicalDevice, &e->identity);
     sanitize(e->name, sizeof(e->name), appName && *appName ? appName : engineName);
-    snprintf(e->path, sizeof(e->path), "%s/%s.%016llx.vkpc", cacheDir, e->name, (unsigned long long)e->identity.driverKey);
+    if (snprintf(e->path, sizeof(e->path), "%s/%s.%016llx.vkpc", cacheDir, e->name, (unsigned long long)e->identity.driverKey) >=
+        (int)sizeof(e->path)) {
+        free(e);
+        return;
+    }
 
     pthread_mutex_lock(&tableLock);
     e->next = entries;
@@ -520,12 +637,12 @@ static VkPipelineCache loadEntry(CacheEntry* e) {
     if (result != VK_SUCCESS) {
         VkPipelineCacheCreateInfo info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         cache = VK_NULL_HANDLE;
-        result = vulkanWrapper.vkCreatePipelineCache(e->device, &info, NULL, &cache);
+        result = PCACHE_VK(e->device, CreatePipelineCache)(e->device, &info, NULL, &cache);
         size = 0;
     }
     free(data);
     if (result != VK_SUCCESS) {
-        println("vortek: pipeline cache %s: vkCreatePipelineCache failed (%d)", e->name, result);
+        PCACHE_LOG("pipeline cache %s: vkCreatePipelineCache failed (%d)", e->name, result);
         return VK_NULL_HANDLE;
     }
     if (size) {
@@ -534,8 +651,8 @@ static VkPipelineCache loadEntry(CacheEntry* e) {
         if (stat(e->path, &st) == 0) noteOnDisk(e, &st);
     }
     e->loadedBytes = size;
-    println("vortek: pipeline cache %s: %s%zu KB in %.1f ms (%s)", e->name, size ? "loaded " : exists ? "unusable file, new; " : "new, ",
-            size >> 10, (nowNs() - t0) / 1e6, e->path);
+    PCACHE_LOG("pipeline cache %s: %s%zu KB in %.1f ms (%s)", e->name, size ? "loaded " : exists ? "unusable file, new; " : "new, ",
+               size >> 10, (nowNs() - t0) / 1e6, e->path);
     return cache;
 }
 
@@ -616,11 +733,11 @@ void PipelineCache_deviceDestroyed(VkDevice device) {
 
     if (e->dirty) saveEntry(e);
     if (e->loadTried || e->others)
-        println("vortek: pipeline cache %s: %u pipelines in %.0f ms (longest %.1f ms; by time: <2 ms %u, <10 ms %u, <50 ms %u, <200 ms %u, "
-                "more %u), %u fast links/own-cache/identifier in %.0f ms; loaded %zu KB, saved %zu KB",
-                e->name, e->pipelines, e->compileNs / 1e6, e->maxNs / 1e6, e->hist[0], e->hist[1], e->hist[2], e->hist[3], e->hist[4],
-                e->others, e->othersNs / 1e6, e->loadedBytes >> 10, e->savedBytes >> 10);
-    if (e->cache) vulkanWrapper.vkDestroyPipelineCache(device, e->cache, NULL);
+        PCACHE_LOG("pipeline cache %s: %u pipelines in %.0f ms (longest %.1f ms; by time: <2 ms %u, <10 ms %u, <50 ms %u, <200 ms %u, "
+                   "more %u), %u fast links/own-cache/identifier in %.0f ms; loaded %zu KB, saved %zu KB",
+                   e->name, e->pipelines, e->compileNs / 1e6, e->maxNs / 1e6, e->hist[0], e->hist[1], e->hist[2], e->hist[3], e->hist[4],
+                   e->others, e->othersNs / 1e6, e->loadedBytes >> 10, e->savedBytes >> 10);
+    if (e->cache) PCACHE_VK(device, DestroyPipelineCache)(device, e->cache, NULL);
     free(e);
 }
 
@@ -645,4 +762,25 @@ bool PipelineCache_isFastLink(const VkGraphicsPipelineCreateInfo* createInfo) {
     }
     return libraries && libraries->libraryCount > 0 && !(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) &&
            !(flags & VK_PIPELINE_CREATE_2_LINK_TIME_OPTIMIZATION_BIT_EXT);
+}
+
+VkPipelineCache PipelineCache_forGraphics(VkDevice device, VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* createInfos,
+                                          uint32_t count) {
+    if (cache) return cache;
+    bool allFastLinks = true;
+    for (uint32_t i = 0; i < count && allFastLinks; i++) allFastLinks = PipelineCache_isFastLink(&createInfos[i]);
+    if (allFastLinks) return VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < count; i++) {
+        if (PipelineCache_usesModuleIdentifier(createInfos[i].pStages, createInfos[i].stageCount)) return VK_NULL_HANDLE;
+    }
+    return PipelineCache_get(device);
+}
+
+VkPipelineCache PipelineCache_forCompute(VkDevice device, VkPipelineCache cache, const VkComputePipelineCreateInfo* createInfos,
+                                         uint32_t count) {
+    if (cache) return cache;
+    for (uint32_t i = 0; i < count; i++) {
+        if (PipelineCache_usesModuleIdentifier(&createInfos[i].stage, 1)) return VK_NULL_HANDLE;
+    }
+    return PipelineCache_get(device);
 }

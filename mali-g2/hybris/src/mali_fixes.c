@@ -21,6 +21,8 @@
  *     and shaderClipDistance / shaderCullDistance while their writes are removed from shaders.
  *     Without them DXVK finds no adapter ("Device does not support required feature
  *     'fillModeNonSolid'").
+ *   - Pipelines the application creates without a VkPipelineCache of its own (DXVK) use the
+ *     device's persistent implicit cache (pipeline_cache_hybris.c, the Vortek server's code).
  *   - Command pool and command buffer resets add RELEASE_RESOURCES as the Vortek server's do
  *     (winlator-0018): the Mali keeps ~420 bytes of host heap per vkCmdBeginRendering in a command
  *     buffer that also writes a query until it is reset with RELEASE_RESOURCES, and DXVK resets its
@@ -43,10 +45,12 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
 #include "linear_row_pitch.h"
+#include "pipeline_cache.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
 #include "cmd_memory.h"
 
@@ -191,47 +195,61 @@ static const VkShaderModuleCreateInfo* inlineModule(const VkPipelineShaderStageC
     return next && next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO ? next : NULL;
 }
 
+static uint64_t nowNs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 /* Inline stage code (DXVK 3.x, pipeline libraries): a stage whose pNext chain starts with its
- * VkShaderModuleCreateInfo is copied with the rewritten code. */
+ * VkShaderModuleCreateInfo is copied with the rewritten code. Without a cache of the application's,
+ * pipelines go through the persistent one (pipeline_cache_hybris.c). */
 static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCache cache, uint32_t count,
                                                    const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator,
                                                    VkPipeline* pipelines) {
     Device* device = icd_device(handle);
     if (!device) return VK_ERROR_DEVICE_LOST;
-    if (!rewritesOn()) return device->CreateGraphicsPipelines(handle, cache, count, infos, allocator, pipelines);
+    VkPipelineCache use = PipelineCache_forGraphics(handle, cache, infos, count);
+    uint64_t start = nowNs();
     uint32_t totalStages = 0;
     bool inline_ = false;
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < count && rewritesOn(); i++) {
         totalStages += infos[i].stageCount;
         for (uint32_t s = 0; s < infos[i].stageCount; s++) inline_ = inline_ || inlineModule(&infos[i].pStages[s]);
     }
-    if (!inline_) return device->CreateGraphicsPipelines(handle, cache, count, infos, allocator, pipelines);
-    VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
-    VkPipelineShaderStageCreateInfo* stages = calloc(totalStages, sizeof(*stages));
-    VkShaderModuleCreateInfo* modules = calloc(totalStages, sizeof(*modules));
-    uint32_t** codes = calloc(totalStages, sizeof(*codes));
+    VkGraphicsPipelineCreateInfo* copy = NULL;
+    VkPipelineShaderStageCreateInfo* stages = NULL;
+    VkShaderModuleCreateInfo* modules = NULL;
+    uint32_t** codes = NULL;
     uint32_t used = 0;
     bool any = false;
-    if (!copy || !stages || !modules || !codes) goto out;
-    memcpy(copy, infos, count * sizeof(*copy));
-    for (uint32_t i = 0; i < count; i++) {
-        bool rewritten = false;
-        uint32_t base = used;
-        for (uint32_t s = 0; s < infos[i].stageCount; s++, used++) {
-            stages[used] = infos[i].pStages[s];
-            const VkShaderModuleCreateInfo* inl = inlineModule(&infos[i].pStages[s]);
-            if (inl && rewriteShader(inl, &modules[used], &codes[used])) {
-                stages[used].pNext = &modules[used];
-                rewritten = true;
+    if (inline_) {
+        copy = malloc(count * sizeof(*copy));
+        stages = calloc(totalStages, sizeof(*stages));
+        modules = calloc(totalStages, sizeof(*modules));
+        codes = calloc(totalStages, sizeof(*codes));
+    }
+    if (copy && stages && modules && codes) {
+        memcpy(copy, infos, count * sizeof(*copy));
+        for (uint32_t i = 0; i < count; i++) {
+            bool rewritten = false;
+            uint32_t base = used;
+            for (uint32_t s = 0; s < infos[i].stageCount; s++, used++) {
+                stages[used] = infos[i].pStages[s];
+                const VkShaderModuleCreateInfo* inl = inlineModule(&infos[i].pStages[s]);
+                if (inl && rewriteShader(inl, &modules[used], &codes[used])) {
+                    stages[used].pNext = &modules[used];
+                    rewritten = true;
+                }
+            }
+            if (rewritten) {
+                copy[i].pStages = &stages[base];
+                any = true;
             }
         }
-        if (rewritten) {
-            copy[i].pStages = &stages[base];
-            any = true;
-        }
     }
-out:;
-    VkResult result = device->CreateGraphicsPipelines(handle, cache, count, any ? copy : infos, allocator, pipelines);
+    VkResult result = device->CreateGraphicsPipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
+    if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
     for (uint32_t i = 0; codes && i < used; i++) free(codes[i]);
     free(codes);
     free(modules);
@@ -245,12 +263,13 @@ static VkResult VKAPI_CALL CreateComputePipelines(VkDevice handle, VkPipelineCac
                                                   VkPipeline* pipelines) {
     Device* device = icd_device(handle);
     if (!device) return VK_ERROR_DEVICE_LOST;
+    VkPipelineCache use = PipelineCache_forCompute(handle, cache, infos, count);
+    uint64_t start = nowNs();
     bool inline_ = false;
     for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = inlineModule(&infos[i].stage);
-    if (!inline_) return device->CreateComputePipelines(handle, cache, count, infos, allocator, pipelines);
-    VkComputePipelineCreateInfo* copy = malloc(count * sizeof(*copy));
-    VkShaderModuleCreateInfo* modules = calloc(count, sizeof(*modules));
-    uint32_t** codes = calloc(count, sizeof(*codes));
+    VkComputePipelineCreateInfo* copy = inline_ ? malloc(count * sizeof(*copy)) : NULL;
+    VkShaderModuleCreateInfo* modules = inline_ ? calloc(count, sizeof(*modules)) : NULL;
+    uint32_t** codes = inline_ ? calloc(count, sizeof(*codes)) : NULL;
     bool any = false;
     if (copy && modules && codes) {
         memcpy(copy, infos, count * sizeof(*copy));
@@ -262,7 +281,8 @@ static VkResult VKAPI_CALL CreateComputePipelines(VkDevice handle, VkPipelineCac
             }
         }
     }
-    VkResult result = device->CreateComputePipelines(handle, cache, count, any ? copy : infos, allocator, pipelines);
+    VkResult result = device->CreateComputePipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
+    if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
     for (uint32_t i = 0; codes && i < count; i++) free(codes[i]);
     free(codes);
     free(modules);
