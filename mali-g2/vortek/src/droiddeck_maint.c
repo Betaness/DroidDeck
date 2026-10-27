@@ -633,15 +633,25 @@ static void dd_vkGetRenderingAreaGranularityKHR(VkDevice device, const VkRenderi
     granularity->height = 1;
 }
 
+#include "linear_row_pitch.h"
+
+static void dd_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource* sub, VkSubresourceLayout* layout) {
+    vt_call_vkGetImageSubresourceLayout(device, image, sub, layout);
+    if (dd_fix_linear_row_pitch(layout)) {
+        static int logged;
+        if (!logged) { logged = 1; fprintf(stderr, "vortek: rowPitch 0 of a one-row linear image reported as %llu (Mali)\n", (unsigned long long)layout->rowPitch); }
+    }
+}
+
 static void dd_vkGetImageSubresourceLayout2KHR(VkDevice device, VkImage image, const VkImageSubresource2KHR* sub, VkSubresourceLayout2KHR* layout) {
-    vt_call_vkGetImageSubresourceLayout(device, image, &sub->imageSubresource, &layout->subresourceLayout);
+    dd_vkGetImageSubresourceLayout(device, image, &sub->imageSubresource, &layout->subresourceLayout);
 }
 
 static void dd_vkGetDeviceImageSubresourceLayoutKHR(VkDevice device, const VkDeviceImageSubresourceInfoKHR* info, VkSubresourceLayout2KHR* layout) {
     memset(&layout->subresourceLayout, 0, sizeof(layout->subresourceLayout));
     VkImage image = VK_NULL_HANDLE;
     if (vt_call_vkCreateImage(device, info->pCreateInfo, NULL, &image) != VK_SUCCESS) return;
-    vt_call_vkGetImageSubresourceLayout(device, image, &info->pSubresource->imageSubresource, &layout->subresourceLayout);
+    dd_vkGetImageSubresourceLayout(device, image, &info->pSubresource->imageSubresource, &layout->subresourceLayout);
     vt_call_vkDestroyImage(device, image, NULL);
 }
 
@@ -842,6 +852,7 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkCmdBindIndexBuffer2", dd_vkCmdBindIndexBuffer2KHR},
     {"vkGetRenderingAreaGranularityKHR", dd_vkGetRenderingAreaGranularityKHR},
     {"vkGetRenderingAreaGranularity", dd_vkGetRenderingAreaGranularityKHR},
+    {"vkGetImageSubresourceLayout", dd_vkGetImageSubresourceLayout},
     {"vkGetImageSubresourceLayout2KHR", dd_vkGetImageSubresourceLayout2KHR},
     {"vkGetImageSubresourceLayout2EXT", dd_vkGetImageSubresourceLayout2KHR},
     {"vkGetImageSubresourceLayout2", dd_vkGetImageSubresourceLayout2KHR},

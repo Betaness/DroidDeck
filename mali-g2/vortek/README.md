@@ -37,6 +37,7 @@ Mali 设备（例如 Mali-G2 / v15，Android 17）也能在 DroidDeck 的 Linux 
 | `src/droiddeck_defaults.h` | 客户端默认 socket 路径 `/run/droiddeck/vortek/V0` |
 | `src/spirv_clip_cull.h` | 去掉着色器里 ClipDistance/CullDistance 写入（Mali 编译器遇到会崩），客户端（`droiddeck_maint.c`）和进程内路径（`../hybris`）共用 |
 | `src/spirv_spec_composite.h` | 由 spec 常量组成的 `OpConstantComposite` 改成 `OpSpecConstantComposite`（同长度、原地改；由它组成的组合常量一并改）。Mali（r56p0 也是）把这种组合按 spec 常量的默认值折叠，管线给的特化值对它无效；DXVK 的绑定检查（`OpSelect` 的条件是 spec bool 组成的 bvec4）就是这种形状，纹理读出默认值。客户端（`droiddeck_maint.c`）对着色器模块和管线阶段内联的 `VkShaderModuleCreateInfo`（图形和计算）都做，和进程内路径（`../hybris`）共用；`VORTEK_SPEC_COMPOSITE_FIX=0` 关闭。测试 `tests/mali_quirks_test.c`（`MQ_PARTS=spec,bound`；编成 bionic 程序直接跑驱动，`MQ_FIX=1` 时测试自己做这个改写） |
+| `src/linear_row_pitch.h` | Mali（r56p0）对只有一行的 LINEAR 子资源（1D、高 1 的 2D 及 mip、高 1 的 3D）在 `vkGetImageSubresourceLayout` 里报 `rowPitch` 0，其余字段对；这时取 depthPitch、arrayPitch、size 里最小的非零值（就是对齐后的一行，16x1 RGBA8 为 64，300x1 R8 为 320，和 300x2 一样）。DXVK 把它当 D3D11 映射的 RowPitch 交给游戏，0 会让按行拷贝丢数据。客户端在 `vkGetImageSubresourceLayout`、`...2`/`2KHR`/`2EXT` 和 `vkGetDeviceImageSubresourceLayout` 上修，和进程内路径共用。测试 `tests/mali_quirks_test.c`（`MQ_PARTS=linear`，`MQ_INLINE=1` 时也查 `...2KHR`） |
 | `src/zero_copy.c/.h` | 零拷贝出图的线上协议（发给合成器），服务端和进程内路径（`../hybris`）共用；合成器同时接受多个连接（Vortek 服务端和各游戏进程） |
 | `build-client.sh` | 在 aarch64 Linux 上编译客户端和 ICD 清单（CI：`ubuntu-24.04-arm`） |
 | `build-server.sh` | 用 Android NDK 编译服务端（CI：`build` 任务里的 NDK） |

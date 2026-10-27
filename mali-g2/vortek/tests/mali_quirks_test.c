@@ -12,8 +12,8 @@
  *   dmabuf  a LINEAR image created with VkExternalMemoryImageCreateInfo(DMA_BUF), which Mali refuses
  * MQ_PARTS (default all) picks parts, comma-separated; MQ_INLINE=1 hands the shaders to the pipelines
  * as VkShaderModuleCreateInfo in the stage's pNext (maintenance5) instead of modules; MQ_ENGINE sets
- * the engine name; MQ_FIX=1 applies ../src/spirv_spec_composite.h to the shaders itself (to check
- * the rewrite on the bare driver, as the in-process path uses it). Prints "MQ <part> PASS|FAIL ..." per part and exits 1 when one failed.
+ * the engine name; MQ_FIX=1 applies ../src/spirv_spec_composite.h and ../src/linear_row_pitch.h
+ * itself (to check them on the bare driver, as the in-process path uses them). Prints "MQ <part> PASS|FAIL ..." per part and exits 1 when one failed.
  * Build: cc -O2 -o mali_quirks_test mali_quirks_test.c -lvulkan
  *        clang --target=aarch64-linux-android30 -O2 -o mali_quirks_test mali_quirks_test.c -lvulkan */
 #include <stdbool.h>
@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 #include "mali_quirks_spv.h"
 #include "../src/spirv_spec_composite.h"
+#include "../src/linear_row_pitch.h"
 
 #define CK(x) do { VkResult r_ = (x); if (r_ < 0) { printf("FAIL %s = %d (line %d)\n", #x, r_, __LINE__); exit(1); } } while (0)
 
@@ -32,7 +33,7 @@ static VkDevice dev;
 static VkQueue queue;
 static uint32_t qfam;
 static VkCommandPool pool;
-static bool inlineStages, fixShaders;
+static bool inlineStages, fixShaders; /* MQ_INLINE, MQ_FIX */
 static int failures;
 
 static bool part(const char* name) {
@@ -364,16 +365,20 @@ static void testLinear(void) {
         {"1D 4096 R32F", VK_IMAGE_TYPE_1D, VK_FORMAT_R32_SFLOAT, 4, 4096, 1, 1, 1, 1, 0},
         {"2D 64x1 RGBA16F", VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, 8, 64, 1, 1, 1, 1, 0},
         {"2D 16x1 RGBA8 4 layers", VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 4, 16, 1, 1, 1, 4, 0},
+        {"3D 16x1x4 RGBA8", VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 4, 16, 1, 4, 1, 1, 0},
+        {"3D 16x2x4 RGBA8", VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, 4, 16, 2, 4, 1, 1, 0},
+        {"2D 16x2 RGBA8 mip 1 (8x1)", VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 4, 16, 2, 1, 2, 1, 1},
     };
-    VkImageSubresource sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         const LinearCase* c = &cases[i];
+        VkImageSubresource sub = {VK_IMAGE_ASPECT_COLOR_BIT, c->mip, 0};
+        uint32_t w = c->w >> c->mip ? c->w >> c->mip : 1, h = c->h >> c->mip ? c->h >> c->mip : 1;
         VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, c->type, c->format, {c->w, c->h, c->d}, c->mips, c->layers,
                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                 VK_SHARING_MODE_EXCLUSIVE};
         VkImage img;
         VkResult r = vkCreateImage(dev, &ci, NULL, &img);
-        char d[200];
+        char d[240];
         if (r != VK_SUCCESS) {
             snprintf(d, sizeof(d), "%s: vkCreateImage %d (skipped)", c->name, r);
             printf("MQ linear SKIP %s\n", d);
@@ -382,11 +387,24 @@ static void testLinear(void) {
         VkSubresourceLayout l;
         memset(&l, 0, sizeof(l));
         vkGetImageSubresourceLayout(dev, img, &sub, &l);
-        uint32_t rowBytes = c->w * c->bpp;
-        bool ok = l.rowPitch >= rowBytes && l.size >= rowBytes && l.offset + l.rowPitch * (c->h - 1) + rowBytes <= l.offset + l.size;
-        snprintf(d, sizeof(d), "%s: rowPitch %llu arrayPitch %llu size %llu offset %llu (a row is %u bytes)", c->name,
-                 (unsigned long long)l.rowPitch, (unsigned long long)l.arrayPitch, (unsigned long long)l.size, (unsigned long long)l.offset, rowBytes);
+        if (fixShaders) dd_fix_linear_row_pitch(&l);
+        uint32_t rowBytes = w * c->bpp;
+        VkDeviceSize slice = c->type == VK_IMAGE_TYPE_3D ? l.depthPitch : l.size;
+        bool ok = l.rowPitch >= rowBytes && slice >= l.rowPitch * (h - 1) + rowBytes && l.size >= slice;
+        snprintf(d, sizeof(d), "%s: rowPitch %llu depthPitch %llu arrayPitch %llu size %llu offset %llu (a row is %u bytes)", c->name,
+                 (unsigned long long)l.rowPitch, (unsigned long long)l.depthPitch, (unsigned long long)l.arrayPitch, (unsigned long long)l.size,
+                 (unsigned long long)l.offset, rowBytes);
         result("linear", ok, d);
+        PFN_vkGetImageSubresourceLayout2KHR layout2 =
+            inlineStages ? (PFN_vkGetImageSubresourceLayout2KHR)vkGetDeviceProcAddr(dev, "vkGetImageSubresourceLayout2KHR") : NULL;
+        if (layout2) {
+            VkImageSubresource2KHR sub2 = {VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR, NULL, sub};
+            VkSubresourceLayout2KHR l2 = {VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_KHR};
+            layout2(dev, img, &sub2, &l2);
+            if (fixShaders) dd_fix_linear_row_pitch(&l2.subresourceLayout);
+            snprintf(d, sizeof(d), "%s through vkGetImageSubresourceLayout2KHR: rowPitch %llu", c->name, (unsigned long long)l2.subresourceLayout.rowPitch);
+            result("linear", l2.subresourceLayout.rowPitch == l.rowPitch && l.rowPitch, d);
+        }
         vkDestroyImage(dev, img, NULL);
     }
 }
@@ -427,7 +445,7 @@ int main(void) {
     VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drv};
     vkGetPhysicalDeviceProperties2(pd, &props);
     printf("MQ device %s, driver %u %s, engine %s%s%s\n", props.properties.deviceName, drv.driverID, drv.driverInfo, app.pEngineName,
-           inlineStages ? ", inline stages" : "", fixShaders ? ", shaders rewritten by the test" : "");
+           inlineStages ? ", inline stages" : "", fixShaders ? ", fixes applied by the test" : "");
 
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, NULL);
