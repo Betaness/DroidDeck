@@ -272,6 +272,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val resumeKeysDown = mutableSetOf<Pair<Int, Int>>()
 
     private var drawerOpen by mutableStateOf(false)
+    /** [mali-g2] When the drawer was last opened: a problem the owner marks from it happened before then. */
+    private var drawerOpenedAt = 0L
     private var quitFrom by mutableStateOf<androidx.compose.ui.geometry.Rect?>(null)
     private var quitFlooded = false
     private var leaving by mutableStateOf(false)
@@ -412,8 +414,15 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val output = glassesScreen?.display
             ?: (if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay) ?: return
         if (output.displayId != displayId) return
+        // [mali-g2] Each change of the panel's rate goes on the play journal's timeline.
+        val hz = kotlin.math.round(output.mode.refreshRate).toInt()
+        if (hz != journalHz) {
+            journalHz = hz
+            com.droiddeck.launcher.session.play.PlayJournal.displayHz(hz)
+        }
         applyOutputPacing()
     }
+    private var journalHz = 0
     private var isHomeApp by mutableStateOf(false)
     private var androidApps by mutableStateOf<List<HomeApp.LaunchableApp>>(emptyList())
 
@@ -745,6 +754,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 )
                 androidx.compose.runtime.LaunchedEffect(drawerOpen) {
                     if (drawerOpen) {
+                        drawerOpenedAt = System.currentTimeMillis()
                         syncLossless()
                         releasePads()
                         androidx.compose.runtime.withFrameNanos { }
@@ -961,6 +971,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     onUnfoldedControlsWithController = ::chooseUnfoldedControlsWithController,
                     onBackground = { drawerOpen = false; pip.background(); moveTaskToBack(true) },
                     onShareLogs = { drawerOpen = false; shareCurrentSessionLogs() },
+                    onMarkProblem = ::markProblem,
                     onStop = { drawerOpen = false; SessionService.stop(this@SessionActivity); finish() },
                     onStopFrom = { onScreen ->
                         drawerOpen = false
@@ -1421,6 +1432,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             else getString(R.string.load_starting_steam)
     }
 
+    /** [mali-g2] The owner says something just went wrong: noted in the play journal, the session's logs kept 30 days. */
+    private fun markProblem() {
+        val at = com.droiddeck.launcher.session.play.PlayJournal.mark(drawerOpenedAt)
+        val time = java.text.DateFormat.getTimeInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(at))
+        Toast.makeText(this, getString(R.string.drawer_mark_problem_done, time), Toast.LENGTH_LONG).show()
+    }
+
     private fun shareCurrentSessionLogs() {
         val folder = SessionPaths.current() ?: SessionPaths.lastEnded()
         if (folder == null || !folder.isDirectory) {
@@ -1766,6 +1784,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        SessionState.freeform = isInMultiWindowMode
         if (refreshActivityDisplayId() && started) {
             SessionService.setActivityDisplay(this, sessionActivityDisplayId)
         }
@@ -1833,8 +1852,19 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun outputFpsLimit(): Int = GlassesRendering.fpsLimit(SessionState.fpsLimit, mirrorRefreshLimit())
 
+    /** [mali-g2] The rate the session asks the panel for: the requested mode (else the current one), after the caps. */
+    private fun wantedRefreshHz(): Float {
+        val display = if (Build.VERSION.SDK_INT >= 30) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
+        val wanted = window.attributes.preferredDisplayModeId
+        val hz = display?.supportedModes?.firstOrNull { wanted != 0 && it.modeId == wanted }?.refreshRate
+            ?: display?.mode?.refreshRate ?: return 0f
+        val mirrorCap = mirrorRefreshLimit().takeIf { it > 0 }?.toFloat() ?: Float.POSITIVE_INFINITY
+        return minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
+    }
+
     private fun applyOutputPacing() {
         Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(), mirrorRefreshLimit()))
+        SessionState.wantedHz = runCatching { wantedRefreshHz() }.getOrDefault(0f)
         if (CompositorHost.isStarted) {
             val hz = refreshHz()
             val changed = kotlin.math.abs(SessionState.refreshHz - hz) > 0.1f
@@ -2989,6 +3019,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
+        SessionState.freeform = isInMultiWindowMode
         if (refreshActivityDisplayId() && started) {
             SessionService.setActivityDisplay(this, sessionActivityDisplayId)
         }

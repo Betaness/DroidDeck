@@ -69,11 +69,16 @@ class VortekServerComponent(
         pid = HostProcess.start(command, env.toTypedArray(), app().filesDir, { status ->
             Log.i(TAG, "vortek-server exited: $status")
             log?.let { synchronized(it) { it.println("== vortek-server exited: $status"); it.flush() } }
+            if (mine == generation) {
+                runningPid = -1
+                if (!stopping) com.droiddeck.launcher.session.play.PlayJournal.vortekExited(status ?: -1)
+            }
             if (mine == generation) restartAfterCrash()
         }) { line ->
             Log.i(TAG, line)
             log?.let { synchronized(it) { it.println(line); it.flush() } }
         }
+        runningPid = pid
         Log.i(TAG, "started pid=$pid socket=$socket hal=$hal")
     }
 
@@ -103,6 +108,7 @@ class VortekServerComponent(
         generation++
         if (pid > 1) android.os.Process.killProcess(pid)
         pid = -1
+        runningPid = -1
     }
 
     companion object {
@@ -117,6 +123,10 @@ class VortekServerComponent(
         private const val PIPELINE_CACHE_DIR = "vortek-pipelines"
         private const val MAX_RESTARTS = 5
         private const val RESTART_WINDOW_MS = 60_000L
+
+        /** [mali-g2] The running server's pid (one per session), for the play journal's memory samples; -1 when none. */
+        @Volatile @JvmStatic var runningPid = -1
+            private set
 
         fun binary(context: Context): File = File(context.applicationInfo.nativeLibraryDir, BINARY)
 

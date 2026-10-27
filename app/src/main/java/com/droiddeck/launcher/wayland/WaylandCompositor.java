@@ -50,6 +50,17 @@ public final class WaylandCompositor {
     /** Frames the game has presented since the app started; the rate is the difference over time. */
     public static long gameFrameCount() { return gameFrames; }
 
+    /** [mali-g2] Frames the compositor composited since it started (none for a game on its own layer); -1 without the library. */
+    public static long screenFrameCount() {
+        try {
+            return nativeScreenFrameCount();
+        } catch (UnsatisfiedLinkError e) {
+            return -1;
+        }
+    }
+
+    private static native long nativeScreenFrameCount();
+
     public static long recentFrameIntervalMs() {
         long last = lastFrameNanos;
         if (last == 0) return -1;
@@ -69,6 +80,8 @@ public final class WaylandCompositor {
             long interval = now - previous;
             long smoothed = frameIntervalNanos;
             frameIntervalNanos = smoothed == 0 ? interval : (smoothed * 3 + interval) / 4;
+            // [mali-g2] One histogram increment for the play journal's frame times.
+            com.droiddeck.launcher.session.play.FrameTimes.record(interval);
         }
         GameListener l = gameListener;
         if (l != null) l.onGameFrame();

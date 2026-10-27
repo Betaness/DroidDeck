@@ -43,6 +43,7 @@ class BatteryComponent(val dir: File, private val vpowerDir: File) : SessionPart
             val pct = if (level >= 0) level * 100 / scale else (bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 50)
             val voltageUv = ((sticky?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0).toLong() * 1000L).takeIf { it > 0 } ?: 3_800_000L
             val tempDeci = sticky?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+            lastTempDeci = tempDeci
             val tech = sticky?.getStringExtra(BatteryManager.EXTRA_TECHNOLOGY)?.takeIf { it.isNotBlank() } ?: "Li-ion"
             val chargeNowUah = bm?.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)?.takeIf { it > 0 && it != Long.MIN_VALUE } ?: 0L
             val currentNowUa = toMicroamps(bm?.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)?.takeIf { it != Long.MIN_VALUE } ?: 0L)
@@ -125,6 +126,8 @@ class BatteryComponent(val dir: File, private val vpowerDir: File) : SessionPart
     }
 
     companion object {
+        /** [mali-g2] The battery temperature last written, tenths of a degree; Int.MIN_VALUE before the first. */
+        @Volatile @JvmStatic var lastTempDeci = Int.MIN_VALUE
         private const val TAG = "SessionService"
         // CURRENT_NOW/CURRENT_AVERAGE are documented as µA, but Samsung and other vendors report mA,
         // which made every lifetime estimate 1000x too long. No real µA reading under load is below 10 mA,

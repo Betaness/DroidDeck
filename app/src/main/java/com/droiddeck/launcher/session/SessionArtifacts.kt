@@ -83,7 +83,9 @@ object SessionArtifacts {
 
     /**
      * [mali-g2] Copy a finished, scrubbed session folder to getExternalFilesDir()/logs, where
-     * `adb shell` can read it (the app is not debuggable, so run-as cannot). Keeps the newest 5.
+     * `adb shell` can read it (the app is not debuggable, so run-as cannot). Which mirrored folders stay,
+     * which are cut to their session's time window and which go is play.MirrorRetention's call: the newest
+     * ten, and older ones the play journal marked (.keep) while their time lasts, within 1 GiB.
      */
     fun mirrorToExternal(context: Context, dir: File) {
         try {
@@ -91,8 +93,15 @@ object SessionArtifacts {
             val dest = File(base, dir.name)
             dest.deleteRecursively()
             dir.copyRecursively(dest, overwrite = true)
-            base.listFiles { f -> f.isDirectory }?.sortedByDescending { it.name }?.drop(5)?.forEach { it.deleteRecursively() }
             Log.i(TAG, "session logs mirrored to $dest")
+            val protect = HashSet<String>()
+            SessionPaths.current()?.let { protect += it.name }
+            collectingLock.lock()
+            try { collecting.forEach { protect += it.name } } finally { collectingLock.unlock() }
+            protect -= dir.name
+            Log.i(TAG, com.droiddeck.launcher.session.play.MirrorRetention.apply(
+                base, System.currentTimeMillis(), base.usableSpace, protect, SessionPaths.chronological, SessionPaths::isSessionFolder,
+            ))
         } catch (e: Exception) {
             Log.w(TAG, "mirroring session logs", e)
         }
@@ -102,7 +111,7 @@ object SessionArtifacts {
     fun mirrorRecent(context: Context) {
         val base = context.getExternalFilesDir(null)?.let { File(it, "logs") }
         LinuxRuntime.logDir(context).listFiles { f -> SessionPaths.isSessionFolder(f) && File(f, COMPLETE_MARKER).exists() }
-            ?.sortedByDescending { it.name }?.take(3)
+            ?.sortedWith(SessionPaths.chronological)?.takeLast(3)
             ?.filter { base == null || !File(base, it.name).exists() }
             ?.forEach { mirrorToExternal(context, it) }
     }
@@ -252,12 +261,13 @@ object SessionArtifacts {
      * last hours. Scrubbed like the Steam logs; each file capped at 4 MiB, 40 files in total.
      */
     private fun copyGameLogs(context: Context, steamRoot: File, dir: File, record: Record) {
-        val since = System.currentTimeMillis() - 6L * 3600 * 1000
+        // [mali-g2] Only what this session wrote: another game's log from earlier the same day misleads.
+        val since = sessionStartMs(dir)?.minus(60_000L) ?: (System.currentTimeMillis() - 6L * 3600 * 1000)
         val out = File(dir, "game").apply { mkdirs() }
         val found = ArrayList<File>()
         fun wanted(f: File): Boolean {
             val n = f.name
-            return f.isFile && f.lastModified() >= since && f.length() in 1..(4L * 1024 * 1024) &&
+            return f.isFile && f.lastModified() >= since && f.length() > 0 &&
                 (n.startsWith("steam-") && n.endsWith(".log") || n == "Player.log" || n == "Player-prev.log" ||
                     n == "error.log" || n.endsWith("_d3d11.log") || n.endsWith("_d3d9.log") ||
                     n.endsWith("_dxgi.log") || n.endsWith("_d3d12.log") || n.endsWith("_d3d10core.log"))
@@ -276,13 +286,21 @@ object SessionArtifacts {
         found.forEachIndexed { i, src ->
             try {
                 val dst = File(out, "%02d-%s-%s".format(i, src.parentFile?.name ?: "", src.name))
-                dst.bufferedWriter().use { w -> src.forEachLine { line -> w.write(LogRedactor.redact(line)); w.newLine() } }
+                dst.bufferedWriter().use { w -> com.droiddeck.launcher.session.play.SteamLogSlim.headAndTail(src) { line -> w.write(LogRedactor.redact(line)); w.newLine() } }
                 record.files[dst] = Scrubbed(dst.length(), dst.lastModified())
             } catch (e: Exception) {
                 Log.w(TAG, "could not copy ${src.path}", e)
             }
         }
         Log.i(TAG, "collected ${found.size} game log(s) into $out")
+    }
+
+    /** [mali-g2] When the session started: events.jsonl's first event. */
+    private fun sessionStartMs(dir: File): Long? = try {
+        File(dir, "events.jsonl").bufferedReader().use { it.readLine() }
+            ?.let { Regex("\"t\":(\\d{12,})").find(it)?.groupValues?.get(1)?.toLong() }
+    } catch (_: Exception) {
+        null
     }
 
     @Synchronized

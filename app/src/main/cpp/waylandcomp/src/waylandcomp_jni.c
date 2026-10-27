@@ -19,6 +19,7 @@
 #include "droiddeck_color.h"
 
 extern int droiddeck_wayland_run(void);
+extern uint64_t droiddeck_screen_frames(void);
 extern void droiddeck_wayland_set_scale_mode(int mode, int alignment);
 extern void droiddeck_wayland_send_pointer(int action, int x, int y);
 extern void droiddeck_wayland_send_touch(int action, int pointer_id, int x, int y);
@@ -656,6 +657,12 @@ JNIEXPORT void JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetGpuTurbo(JNIEnv *env, jclass clazz, jboolean on) {
     (void)env; (void)clazz;
     adrenotools_set_turbo(on == JNI_TRUE);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeScreenFrameCount(JNIEnv *env, jclass clazz) {
+    (void)env; (void)clazz;
+    return (jlong)droiddeck_screen_frames();
 }
 
 JNIEXPORT jint JNICALL

@@ -305,6 +305,8 @@ static struct wl_event_source *g_release_source;
 static int g_scene_w, g_scene_h;
 static int g_desktop_w, g_desktop_h;
 static unsigned g_stat_frames, g_stat_dmabuf, g_stat_shm;
+/* [mali-g2] Composited frames since start, never reset: the play journal samples it (copy-path games). */
+static volatile uint64_t g_screen_frames_total;
 
 static struct {
     unsigned ticks;
@@ -797,6 +799,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
 }
 
 uint64_t droiddeck_game_frames(void) { return g_game_frames; }
+uint64_t droiddeck_screen_frames(void) { return g_screen_frames_total; }
 
 /* [mali-g2] A frame a game presented without a Wayland surface (Vortek's zero-copy layer): counted
  * for the app (WaylandCompositor.gameFrameCount), not in g_game_frames, which frame generation reads
@@ -2068,6 +2071,7 @@ static void render_scene(void) {
     if (rendered) {
         int64_t t = presented_ns(t_scene);
         g_stat_frames++;
+        g_screen_frames_total++;
         wl_list_for_each(s, &g_surfaces, link) {
             if (s->drawn) feedback_present_all(&s->feedback, t);
             else feedback_discard_all(&s->feedback);

@@ -91,6 +91,18 @@ object SessionState {
     @Volatile
     var refreshHz: Float = 60f
 
+    /** [mali-g2] The refresh rate the session asked for (requested mode, after the peak and mirror caps); 0 unknown. */
+    @Volatile
+    var wantedHz: Float = 0f
+
+    /** [mali-g2] The session window is in a multi-window (freeform) mode, composed by SurfaceFlinger on the GPU. */
+    @Volatile
+    var freeform = false
+
+    /** [mali-g2] The session is on screen (activity shown, display on), as the suspend policy sees it. */
+    @Volatile
+    var visible = true
+
     @Volatile
     var upscaleRatio: Float = 0f
 
