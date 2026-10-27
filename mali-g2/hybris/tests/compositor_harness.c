@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <wayland-server-core.h>
 
+#include "frame_sched_feed.h"
 #include "sc_layer.h"
 #include "vortek_present.h"
 #include "vortek_upscale.h"
@@ -75,6 +76,13 @@ int vku_present(const struct vku_frame* f, int acquire_fd, struct ASurfaceTransa
 void vku_init(struct wl_event_loop* loop) { (void)loop; }
 void vku_layer_hidden(int slot) { (void)slot; }
 void vku_chain_gone(uint32_t chain) { (void)chain; }
+int vku_pending(int slot) { (void)slot; return 0; }
+const void* sc_layer_vortek_surface(int slot, const char** name) { (void)slot; *name = "harness"; return NULL; }
+float sc_layer_frame_rate_want(void) { return 0; }
+int fsf_enabled(void) { return 0; } /* the frame governor feed (frame_sched_feed.c) is off by default */
+void fsf_game_frame(const void* surface_control, const char* layer_name, int fence_fd, int images, float target_fps) {
+    if (fence_fd >= 0) close(fence_fd);
+}
 
 int main(int argc, char** argv) {
     int expected = argc > 1 ? atoi(argv[1]) : 1;
