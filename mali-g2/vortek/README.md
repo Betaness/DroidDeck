@@ -35,6 +35,7 @@ Mali 设备（例如 Mali-G2 / v15，Android 17）也能在 DroidDeck 的 Linux 
 | `src/client_x11_present.c/.h` | 客户端的软件 X11 呈现（MIT-SHM / PutImage） |
 | `src/droiddeck_defaults.h` | 客户端默认 socket 路径 `/run/droiddeck/vortek/V0` |
 | `src/spirv_clip_cull.h` | 去掉着色器里 ClipDistance/CullDistance 写入（Mali 编译器遇到会崩），客户端（`droiddeck_maint.c`）和进程内路径（`../hybris`）共用 |
+| `src/spirv_spec_composite.h` | 由 spec 常量组成的 `OpConstantComposite` 改成 `OpSpecConstantComposite`（同长度、原地改；由它组成的组合常量一并改）。Mali（r56p0 也是）把这种组合按 spec 常量的默认值折叠，管线给的特化值对它无效；DXVK 的绑定检查（`OpSelect` 的条件是 spec bool 组成的 bvec4）就是这种形状，纹理读出默认值。客户端（`droiddeck_maint.c`）对着色器模块和管线阶段内联的 `VkShaderModuleCreateInfo`（图形和计算）都做，和进程内路径（`../hybris`）共用；`VORTEK_SPEC_COMPOSITE_FIX=0` 关闭。测试 `tests/mali_quirks_test.c`（`MQ_PARTS=spec,bound`；编成 bionic 程序直接跑驱动，`MQ_FIX=1` 时测试自己做这个改写） |
 | `src/zero_copy.c/.h` | 零拷贝出图的线上协议（发给合成器），服务端和进程内路径（`../hybris`）共用；合成器同时接受多个连接（Vortek 服务端和各游戏进程） |
 | `build-client.sh` | 在 aarch64 Linux 上编译客户端和 ICD 清单（CI：`ubuntu-24.04-arm`） |
 | `build-server.sh` | 用 Android NDK 编译服务端（CI：`build` 任务里的 NDK） |

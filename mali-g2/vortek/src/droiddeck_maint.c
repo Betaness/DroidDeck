@@ -421,6 +421,7 @@ static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
 /* ---- 64-bit flag structs folded into the legacy fields ---- */
 
 #include "spirv_clip_cull.h"
+#include "spirv_spec_composite.h"
 
 static bool clipStripOn(void) {
     static int on = -1;
@@ -428,14 +429,32 @@ static bool clipStripOn(void) {
     return on;
 }
 
-/* Returns a rewritten copy of `info` in *out (code to free in *freeCode), or false to use `info`. */
-static bool stripClipCull(const VkShaderModuleCreateInfo* info, VkShaderModuleCreateInfo* out, uint32_t** freeCode) {
-    if (!clipStripOn() || !info->pCode || info->codeSize < 20) return false;
-    size_t words = 0;
-    uint32_t* code = dd_strip_clip_cull(info->pCode, info->codeSize / 4, &words);
+/* VORTEK_SPEC_COMPOSITE_FIX=0 leaves constant composites of spec constants as they are. */
+static bool specFixOn(void) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VORTEK_SPEC_COMPOSITE_FIX"); on = !(e && *e == '0'); }
+    return on;
+}
+
+/* Returns a rewritten copy of `info` in *out (code to free in *freeCode), or false to use `info`:
+ * clip/cull distance stores removed, spec-constant composites made specializable. */
+static bool rewriteShader(const VkShaderModuleCreateInfo* info, VkShaderModuleCreateInfo* out, uint32_t** freeCode) {
+    if (!info->pCode || info->codeSize < 20) return false;
+    size_t words = info->codeSize / 4;
+    uint32_t* code = clipStripOn() ? dd_strip_clip_cull(info->pCode, words, &words) : NULL;
+    if (code) {
+        static int logged;
+        if (!logged) { logged = 1; fprintf(stderr, "vortek: clip/cull distance writes removed from a shader (the Mali compiler crashes on them)\n"); }
+    }
+    if (specFixOn() && dd_spec_composites(code ? code : info->pCode, words, NULL)) {
+        if (!code && (code = malloc(words * 4))) memcpy(code, info->pCode, words * 4);
+        if (code) {
+            size_t n = dd_spec_composites(code, words, code);
+            static int logged;
+            if (!logged) { logged = 1; fprintf(stderr, "vortek: %zu spec-constant composite(s) made specializable in a shader (Mali folds them at their defaults)\n", n); }
+        }
+    }
     if (!code) return false;
-    static int logged;
-    if (!logged) { logged = 1; fprintf(stderr, "vortek: clip/cull distance writes removed from a shader (the Mali compiler crashes on them)\n"); }
     *out = *info;
     out->pCode = code;
     out->codeSize = words * 4;
@@ -497,7 +516,7 @@ VkResult vt_call_vkCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*,
 static VkResult dd_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* alloc, VkShaderModule* module) {
     VkShaderModuleCreateInfo stripped;
     uint32_t* strippedCode = NULL;
-    VkResult r = vt_call_vkCreateShaderModule(device, stripClipCull(info, &stripped, &strippedCode) ? &stripped : info, alloc, module);
+    VkResult r = vt_call_vkCreateShaderModule(device, rewriteShader(info, &stripped, &strippedCode) ? &stripped : info, alloc, module);
     free(strippedCode);
     if (dumpDir() && r == VK_SUCCESS) {
         char name[96];
@@ -512,8 +531,8 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
     VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
     if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memcpy(copy, infos, count * sizeof(*copy));
-    /* Inline stage code (DXVK 3.x, pipeline libraries) gets the clip/cull rewrite: the stage and its
-     * VkShaderModuleCreateInfo are copied when the latter heads the stage's pNext chain. */
+    /* Inline stage code (DXVK 3.x, pipeline libraries) gets the same rewrites as modules: the stage
+     * and its VkShaderModuleCreateInfo are copied when the latter heads the stage's pNext chain. */
     uint32_t totalStages = 0;
     for (uint32_t i = 0; i < count; i++) totalStages += infos[i].stageCount;
     VkPipelineShaderStageCreateInfo* stageCopies = totalStages ? calloc(totalStages, sizeof(*stageCopies)) : NULL;
@@ -531,7 +550,7 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
             stageCopies[used] = infos[i].pStages[s];
             const VkShaderModuleCreateInfo* inl = infos[i].pStages[s].pNext;
             if (inl && inl->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO &&
-                stripClipCull(inl, &moduleCopies[used], &codes[used])) {
+                rewriteShader(inl, &moduleCopies[used], &codes[used])) {
                 stageCopies[used].pNext = &moduleCopies[used];
                 rewritten = true;
             }
@@ -575,11 +594,20 @@ static VkResult dd_vkCreateComputePipelines(VkDevice device, VkPipelineCache cac
     VkComputePipelineCreateInfo* copy = malloc(count * sizeof(*copy));
     if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memcpy(copy, infos, count * sizeof(*copy));
+    VkShaderModuleCreateInfo* moduleCopies = calloc(count, sizeof(*moduleCopies));
+    uint32_t** codes = calloc(count, sizeof(*codes));
     for (uint32_t i = 0; i < count; i++) {
         const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
         if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
+        const VkShaderModuleCreateInfo* inl = infos[i].stage.pNext;
+        if (moduleCopies && codes && inl && inl->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO &&
+            rewriteShader(inl, &moduleCopies[i], &codes[i]))
+            copy[i].stage.pNext = &moduleCopies[i];
     }
     VkResult result = vt_call_vkCreateComputePipelines(device, cache, count, copy, alloc, pipelines);
+    for (uint32_t i = 0; codes && i < count; i++) free(codes[i]);
+    free(codes);
+    free(moduleCopies);
     free(copy);
     return result;
 }

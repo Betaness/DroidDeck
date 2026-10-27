@@ -1,0 +1,65 @@
+; DXVK-style texture reads (mali_quirks_test.c): location 0 is guarded by a bound check, a
+; vector OpConstantComposite of a spec constant (default false); location 1 by a runtime condition
+; from a push constant, the shape of an ordinary movc after a sample.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %o0 %o1
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %o0 Location 0
+               OpDecorate %o1 Location 1
+               OpDecorate %timg DescriptorSet 0
+               OpDecorate %timg Binding 0
+               OpDecorate %smp DescriptorSet 0
+               OpDecorate %smp Binding 1
+               OpDecorate %sb SpecId 0
+               OpDecorate %PC Block
+               OpMemberDecorate %PC 0 Offset 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+        %v4f = OpTypeVector %float 4
+        %v2f = OpTypeVector %float 2
+       %bool = OpTypeBool
+        %v4b = OpTypeVector %bool 4
+       %uint = OpTypeInt 32 0
+        %img = OpTypeImage %float 2D 0 0 0 1 Unknown
+        %sam = OpTypeSampler
+       %simg = OpTypeSampledImage %img
+       %pimg = OpTypePointer UniformConstant %img
+       %psam = OpTypePointer UniformConstant %sam
+       %timg = OpVariable %pimg UniformConstant
+        %smp = OpVariable %psam UniformConstant
+        %pvo = OpTypePointer Output %v4f
+         %o0 = OpVariable %pvo Output
+         %o1 = OpVariable %pvo Output
+         %PC = OpTypeStruct %uint
+        %pPC = OpTypePointer PushConstant %PC
+         %pc = OpVariable %pPC PushConstant
+         %pu = OpTypePointer PushConstant %uint
+         %sb = OpSpecConstantFalse %bool
+       %cond = OpConstantComposite %v4b %sb %sb %sb %sb
+         %f0 = OpConstant %float 0
+        %f05 = OpConstant %float 0.5
+       %zero = OpConstantComposite %v4f %f0 %f0 %f0 %f0
+         %uv = OpConstantComposite %v2f %f05 %f05
+         %u0 = OpConstant %uint 0
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %i1 = OpLoad %img %timg
+         %m1 = OpLoad %sam %smp
+         %s1 = OpSampledImage %simg %i1 %m1
+         %t1 = OpImageSampleExplicitLod %v4f %s1 %uv Lod %f0
+         %r1 = OpSelect %v4f %cond %t1 %zero
+               OpStore %o0 %r1
+         %i2 = OpLoad %img %timg
+         %m2 = OpLoad %sam %smp
+         %s2 = OpSampledImage %simg %i2 %m2
+         %t2 = OpImageSampleExplicitLod %v4f %s2 %uv Lod %f0
+        %pcp = OpAccessChain %pu %pc %u0
+          %x = OpLoad %uint %pcp
+          %c = OpINotEqual %bool %x %u0
+         %cv = OpCompositeConstruct %v4b %c %c %c %c
+         %r2 = OpSelect %v4f %cv %t2 %zero
+               OpStore %o1 %r2
+               OpReturn
+               OpFunctionEnd
