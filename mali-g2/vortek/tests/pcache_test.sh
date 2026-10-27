@@ -16,6 +16,12 @@
 #  6 limits    VORTEK_PIPELINE_CACHE_MAX_MB=1 keeps a cache over 1 MB out; TOTAL_MB=1 removes the
 #              least recently used file of another application
 #  7 off       without VORTEK_PIPELINE_CACHE_DIR nothing is written and the second run is cold
+#  8 ident     vertex libraries asked for by shader module identifier (DXVK's recompiles) do not
+#              come from the cache (PC_IDENT: none of them may be created without compiling)
+#  9 marker    a <file>.loading left behind (the server died while the driver parsed the file):
+#              the file is deleted instead of loaded, the run is cold, the next one warm again
+# 10 no-merge  device X only takes pipelines from the file while device Y adds new ones and
+#              saves: X's save finds nothing of its own missing and writes nothing
 # "Warm" means the median monolithic pipeline (and fragment library) took under a third of the
 # cold median. Every run also checks each pipeline's pixel (pcache_test's PC verify), so a
 # pipeline taken from the cache under a wrong key fails. Prints PCACHE-PASS or PCACHE-FAIL.
@@ -167,6 +173,46 @@ run $tmp/off2.out
 kill_server
 check_cold $tmp/cold.out $tmp/off2.out
 grep -q 'pipeline cache' $tmp/server10.log && fail "off: the server still used a pipeline cache"
+
+# 8
+start_server $c1
+run $tmp/ident.out PC_IDENT=20
+kill_server
+grep -q '^PC ident: 0/20 ' $tmp/ident.out || fail "ident: $(grep '^PC ident' $tmp/ident.out): pipelines came from the cache by identifier"
+
+# 9
+f=$(ls $c1/*.vkpc | head -1)
+: >"$f.loading"
+start_server $c1
+run $tmp/marker.out
+sleep 1
+kill_server
+grep -q 'died while the driver read' $log || fail "marker: the file was loaded despite its .loading marker"
+[ -e "$f.loading" ] && fail "marker: the .loading marker stayed"
+check_cold $tmp/cold.out $tmp/marker.out
+start_server $c1
+run $tmp/marker-warm.out
+kill_server
+check_warm $tmp/cold.out $tmp/marker-warm.out
+ls $c1 | grep -q '\.loading$' && fail "marker: a .loading marker was left after a good load"
+
+# 10: X (PC_SALT 20000, all from the file) holds its device while Y (40000) compiles and saves
+start_server $c4 VORTEK_PIPELINE_CACHE_LOG=1
+run $tmp/nomergeX.out PC_SALT=20000 PC_HOLD_S=12 &
+xpid=$!
+i=0; while ! grep -q 'PC verify' $tmp/nomergeX.out 2>/dev/null && [ $i -lt 600 ]; do sleep 0.5; i=$((i + 1)); done
+run $tmp/nomergeY.out PC_SALT=40000 PC_THREADS=3
+wait $xpid
+sleep 1
+kill_server
+grep -q ': saved [0-9]* KB in' $log || fail "no-merge: Y's new pipelines were not saved"
+grep -q 'merged with a newer file' $log && fail "no-merge: X rewrote the file although it added nothing"
+start_server $c4
+run $tmp/nomergeY2.out PC_SALT=40000
+run $tmp/nomergeA3.out PC_SALT=20000
+kill_server
+check_warm $tmp/nomergeY.out $tmp/nomergeY2.out
+check_warm $tmp/mergeA.out $tmp/nomergeA3.out
 
 for f in cold warm periodic-cold periodic-warm mergeA mergeA2 damaged off2; do
   printf '%-14s full %6s ms  fslib %6s ms  vslib %6s ms  link %6s ms (medians)\n' $f "$(median $tmp/$f.out full)" "$(median $tmp/$f.out fslib)" \

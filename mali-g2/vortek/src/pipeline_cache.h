@@ -12,11 +12,13 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-/* After vkCreateDevice: loads the cache file of (application, driver) into a VkPipelineCache of the
- * device. appName/engineName come from the instance's VkApplicationInfo (either may be NULL). */
+/* After vkCreateDevice: registers the device; its first PipelineCache_get loads the cache file of
+ * (application, driver). appName/engineName come from the instance's VkApplicationInfo (either may
+ * be NULL). */
 void PipelineCache_deviceCreated(VkPhysicalDevice physicalDevice, VkDevice device, const char* appName, const char* engineName);
 
-/* The device's implicit cache, or VK_NULL_HANDLE (disabled, or no such device). */
+/* The device's implicit cache (loaded by the first call), or VK_NULL_HANDLE (disabled, no such
+ * device, or it could not be created). */
 VkPipelineCache PipelineCache_get(VkDevice device);
 
 /* After a vkCreate*Pipelines call: count pipelines and compile time; withImplicitCache marks the
@@ -30,5 +32,10 @@ void PipelineCache_deviceDestroyed(VkDevice device);
 /* True for a create info that only fast-links pipeline libraries (no LINK_TIME_OPTIMIZATION):
  * not worth a cache entry. */
 bool PipelineCache_isFastLink(const VkGraphicsPipelineCreateInfo* createInfo);
+
+/* True when a stage passes a shader module identifier (VK_EXT_shader_module_identifier): such a
+ * call must not use the implicit cache, the identifier hashes the application's SPIR-V, which the
+ * client may have rewritten differently when the cached pipeline was compiled. */
+bool PipelineCache_usesModuleIdentifier(const VkPipelineShaderStageCreateInfo* stages, uint32_t stageCount);
 
 #endif

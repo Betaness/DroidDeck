@@ -2,11 +2,12 @@
 
 DXVK passes no VkPipelineCache and the Mali driver keeps no shader cache of its own, so every game
 start compiled every pipeline again (~15 ms for a material-sized shader on the Mali-G2, ~0.2 ms
-from a cache). The connection remembers VkApplicationInfo.pApplicationName; vkCreateDevice gives the
-device a VkPipelineCache loaded from <VORTEK_PIPELINE_CACHE_DIR>/<application>.<driver key>.vkpc;
-pipeline creation uses it when the application passes none (not for plain GPL fast links) and
-reports counts and times; releasing a device (vkDestroyDevice, or the cleanup after a client that is
-gone) saves what is new and destroys the cache. Test: tests/pcache_test.sh.
+from a cache). The connection remembers VkApplicationInfo.pApplicationName; vkCreateDevice
+registers the device, whose first pipeline loads a VkPipelineCache from
+<VORTEK_PIPELINE_CACHE_DIR>/<application>.<driver key>.vkpc; pipeline creation uses it when the
+application passes none (not for plain GPL fast links, nor for calls with a shader module
+identifier) and reports counts and times; releasing a device (vkDestroyDevice, or the cleanup after
+a client that is gone) saves what is new and destroys the cache. Test: tests/pcache_test.sh.
 
 diff --git a/app/src/main/cpp/vortekrenderer/include/async_pipeline_creator.h b/app/src/main/cpp/vortekrenderer/include/async_pipeline_creator.h
 index 0f1caaf..d4a350e 100644
@@ -35,7 +36,7 @@ index ecec294..20e9e4b 100644
  
      /* [mali-g2] What this connection created and has not destroyed yet (OwnedDevice*, VkInstance),
 diff --git a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
-index a63c582..de3dd77 100644
+index a63c582..d7e4006 100644
 --- a/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
 +++ b/app/src/main/cpp/vortekrenderer/src/async_pipeline_creator.c
 @@ -2,6 +2,7 @@
@@ -46,7 +47,7 @@ index a63c582..de3dd77 100644
  
  typedef struct PipelineCreateRequest {
      VkDevice device;
-@@ -132,10 +133,41 @@ void AsyncPipelineCreator_destroyDevice(VkDevice device) {
+@@ -132,10 +133,51 @@ void AsyncPipelineCreator_destroyDevice(VkDevice device) {
      pthread_mutex_unlock(&libraryRefsMutex);
  }
  
@@ -58,8 +59,9 @@ index a63c582..de3dd77 100644
 +}
 +
 +/* [mali-g2] The device's persistent implicit cache (src/pipeline_cache.c) when the application
-+ * passes none (DXVK), except for calls that only fast-link libraries: those are cheap and would
-+ * only fill the cache. */
++ * passes none (DXVK), except for calls that only fast-link libraries (cheap, they would only fill
++ * the cache) and calls with a shader module identifier (the identifier hashes the application's
++ * SPIR-V, not what the client rewrote it to, so a cached pipeline could be the wrong code). */
 +static VkPipelineCache choosePipelineCache(PipelineCreateRequest* request) {
 +    if (request->pipelineCache) return request->pipelineCache;
 +    if (request->type == PIPELINE_TYPE_GRAPHICS) {
@@ -67,6 +69,15 @@ index a63c582..de3dd77 100644
 +        bool allFastLinks = true;
 +        for (uint32_t i = 0; i < request->pipelineCount && allFastLinks; i++) allFastLinks = PipelineCache_isFastLink(&createInfos[i]);
 +        if (allFastLinks) return VK_NULL_HANDLE;
++        for (uint32_t i = 0; i < request->pipelineCount; i++) {
++            if (PipelineCache_usesModuleIdentifier(createInfos[i].pStages, createInfos[i].stageCount)) return VK_NULL_HANDLE;
++        }
++    }
++    else if (request->type == PIPELINE_TYPE_COMPUTE) {
++        const VkComputePipelineCreateInfo* createInfos = request->pipelineInfos;
++        for (uint32_t i = 0; i < request->pipelineCount; i++) {
++            if (PipelineCache_usesModuleIdentifier(&createInfos[i].stage, 1)) return VK_NULL_HANDLE;
++        }
 +    }
 +    return PipelineCache_get(request->device);
 +}
@@ -88,7 +99,7 @@ index a63c582..de3dd77 100644
  
      /* [mali-g2] the client is gone: nobody would get or destroy the pipelines (winlator-0015) */
      if (__atomic_load_n(&pipelineCreateRequest->context->status, __ATOMIC_ACQUIRE) < 0) {
-@@ -171,6 +203,11 @@ static void pipelineCreateThread(void* param) {
+@@ -171,6 +213,11 @@ static void pipelineCreateThread(void* param) {
          result = vulkanWrapper.vkCreateComputePipelines(pipelineCreateRequest->device, pipelineCreateRequest->pipelineCache, pipelineCreateRequest->pipelineCount, createInfos, NULL, pipelines);
      }
  

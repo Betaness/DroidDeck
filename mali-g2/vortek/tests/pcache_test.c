@@ -21,6 +21,9 @@
  * VkPipelineCache, loaded from and saved to that file (what an application with its own cache
  * does; for comparing with the server's implicit cache). PC_NO_DESTROY=1 exits without
  * destroying anything (a killed game). PC_THREADS=<n> creates the sets from n threads. PC_HOLD_S=<s> keeps the device that long after the check.
+ * PC_IDENT=<k> then asks for the vertex libraries of the first k sets again the way DXVK does
+ * with VK_EXT_shader_module_identifier (only the identifier, FAIL_ON_PIPELINE_COMPILE_REQUIRED) and
+ * prints "PC ident: H/k from the identifier" (the Vortek server keeps such calls off its cache).
  *
  * Build: cc -O2 -o pcache_test pcache_test.c -lvulkan -lpthread
  *   (shaders: glslangValidator -V --vn pcache_vert_spv pcache.vert, the same for pcache.frag, -> pcache_spv.h) */
@@ -183,6 +186,49 @@ static VkPipeline createLibrary(const States* s, VkGraphicsPipelineLibraryFlagsE
     return create(&info, times);
 }
 
+/* PC_IDENT: vertex libraries of sets 0..k-1 from their module identifier only; how many the
+ * driver could create without compiling, or -1 without the extension */
+static int identifierProbe(const States* s, VkPipelineLayout layout, int k, int salt) {
+    PFN_vkGetShaderModuleCreateInfoIdentifierEXT getIdentifier =
+        (PFN_vkGetShaderModuleCreateInfoIdentifierEXT)vkGetDeviceProcAddr(dev, "vkGetShaderModuleCreateInfoIdentifierEXT");
+    if (!getIdentifier) return -1;
+    int hits = 0;
+    for (int i = 0; i < k; i++) {
+        uint8_t rgb[3];
+        saltColor(i + salt, rgb);
+        float value[3] = {rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f};
+        static const float magic[3] = {0.4444444f, 0.5555555f, 0.6666666f};
+        uint32_t* vs = saltModule(pcache_vert_spv, sizeof(pcache_vert_spv), magic, value);
+        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, 0, 0, sizeof(pcache_vert_spv), vs};
+        VkShaderModuleIdentifierEXT id = {VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT};
+        getIdentifier(dev, &mi, &id);
+        free(vs);
+        VkPipelineShaderStageModuleIdentifierCreateInfoEXT idInfo = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT, 0,
+                                                                      id.identifierSize, id.identifier};
+        VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &idInfo, 0, VK_SHADER_STAGE_VERTEX_BIT, 0, "main"};
+        VkGraphicsPipelineLibraryCreateInfoEXT lib = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, (void*)&rendering,
+                                                      VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT};
+        VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib};
+        info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        info.stageCount = 1;
+        info.pStages = &stage;
+        info.pViewportState = &s->vp;
+        info.pRasterizationState = &s->rs;
+        info.pDynamicState = &s->dy;
+        info.layout = layout;
+        info.basePipelineIndex = -1;
+        VkPipeline p = VK_NULL_HANDLE;
+        VkResult r = vkCreateGraphicsPipelines(dev, appCache, 1, &info, 0, &p);
+        if (r == VK_SUCCESS && p) {
+            hits++;
+            vkDestroyPipeline(dev, p, 0);
+        } else if (r != VK_PIPELINE_COMPILE_REQUIRED) {
+            printf("PC ident: set %d: %d\n", i, r);
+        }
+    }
+    return hits;
+}
+
 typedef struct {
     int first, step, n, salt, useGpl;
     const States* s;
@@ -246,11 +292,18 @@ int main(void) {
 
     VkPhysicalDeviceVulkan13Features e13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     e13.dynamicRendering = VK_TRUE;
+    int identK = useGpl ? envInt("PC_IDENT", 0) : 0;
+    if (identK > n) identK = n;
+    VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT eid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT, 0, VK_TRUE};
+    if (identK > 0) {
+        e13.pNext = &eid;
+        e13.pipelineCreationCacheControl = VK_TRUE;
+    }
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT egpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, &e13, VK_TRUE};
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, 0, 0, 0, 1, &prio};
-    const char* exts[] = {VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME};
-    VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, useGpl ? (void*)&egpl : (void*)&e13, 0, 1, &qi, 0, 0, useGpl ? 2 : 0, exts};
+    const char* exts[] = {VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME};
+    VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, useGpl ? (void*)&egpl : (void*)&e13, 0, 1, &qi, 0, 0, useGpl ? (identK > 0 ? 3 : 2) : 0, exts};
     CK(vkCreateDevice(pd, &di, 0, &dev));
     VkQueue queue;
     vkGetDeviceQueue(dev, 0, 0, &queue);
@@ -478,6 +531,7 @@ int main(void) {
         }
     }
     printf("PC verify: %d/%d right\n", right, rows * n);
+    if (identK > 0) printf("PC ident: %d/%d from the identifier\n", identifierProbe(&s, layoutLib, identK, salt), identK);
     fflush(stdout);
     int hold = envInt("PC_HOLD_S", 0);
     if (hold > 0) sleep(hold);
