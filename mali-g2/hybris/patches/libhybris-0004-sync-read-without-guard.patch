@@ -1,0 +1,70 @@
+Every bionic pthread_mutex/cond/rwlock call the vendor driver makes goes through a libhybris hook that
+reads the object's storage (a host pointer published there) under one process-wide mutex,
+static_sync_guard: two extra lock/unlock pairs per hooked call (about 18 mutex pairs per
+vkQueueSubmit, 55 per command buffer cycle on the Mali-G2), and every driver and game thread
+contending for the same lock. The storage is only four-byte aligned, so a pointer-width atomic is not
+allowed; publish the value as two four-byte atomics instead (low, then high with release) and read
+the high half first with acquire: a non-zero high half is a published pointer (static initializers
+and process-shared values have a zero one), and the low half read after it belongs to it. Everything
+else takes the guard as before.
+
+--- a/hybris/common/bionic_sync.c
++++ b/hybris/common/bionic_sync.c
+@@ -51,9 +51,30 @@ static void hybris_set_mutex_attr(unsigned int android_value, pthread_mutexattr_
+  * section or a wait on its backing mutex. */
+ static pthread_mutex_t static_sync_guard = PTHREAD_MUTEX_INITIALIZER;
+ 
++/* Publication stores the low half, then the high half with release, as two
++ * four-byte atomics (valid at four-byte alignment). */
++static void hybris_publish_sync_value(void *storage, uintptr_t value)
++{
++    uint32_t *half = storage;
++    __atomic_store_n(&half[0], (uint32_t)value, __ATOMIC_RELAXED);
++    __atomic_store_n(&half[1], (uint32_t)((uint64_t)value >> 32), __ATOMIC_RELEASE);
++}
++
++/* Every lock, unlock and wait reads the storage. Static initializers and
++ * process-shared values have a zero high half (bionic's 64-bit objects keep
++ * a zero owner/sequence word there), host pointers practically never do:
++ * a non-zero high half read with acquire is a published value, and the low
++ * half read after it belongs to it, without the guard. Anything else takes
++ * the guard as before. Little-endian AArch64. */
+ uintptr_t hybris_read_sync_value(const void *storage)
+ {
+     uintptr_t value;
++#if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++    const uint32_t *half = storage;
++    uint32_t high = __atomic_load_n(&half[1], __ATOMIC_ACQUIRE);
++    if (high)
++        return ((uintptr_t)high << 32) | __atomic_load_n(&half[0], __ATOMIC_RELAXED);
++#endif
+     pthread_mutex_lock(&static_sync_guard);
+     memcpy(&value, storage, sizeof(value));
+     pthread_mutex_unlock(&static_sync_guard);
+@@ -80,7 +101,7 @@ pthread_mutex_t* hybris_get_static_mutex(void *storage)
+             abort();
+         }
+         value = (uintptr_t)candidate;
+-        memcpy(storage, &value, sizeof(value));
++        hybris_publish_sync_value(storage, value);
+     }
+     pthread_mutex_unlock(&static_sync_guard);
+     return (pthread_mutex_t *)value;
+@@ -103,7 +124,7 @@ pthread_cond_t* hybris_get_static_cond(void *storage)
+             abort();
+         }
+         value = (uintptr_t)candidate;
+-        memcpy(storage, &value, sizeof(value));
++        hybris_publish_sync_value(storage, value);
+     }
+     pthread_mutex_unlock(&static_sync_guard);
+     return (pthread_cond_t *)value;
+@@ -133,7 +154,7 @@ uintptr_t hybris_get_static_rwlock_value(void *storage)
+     memcpy(&value, storage, sizeof(value));
+     if (value <= ANDROID_TOP_ADDR_VALUE_RWLOCK) {
+         value = (uintptr_t)hybris_alloc_init_rwlock();
+-        memcpy(storage, &value, sizeof(value));
++        hybris_publish_sync_value(storage, value);
+     }
+     pthread_mutex_unlock(&static_sync_guard);
+     return value;
