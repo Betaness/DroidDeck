@@ -87,7 +87,7 @@ typedef struct Device {
     X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) \
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) \
     X(ImportSemaphoreFdKHR) X(ImportFenceFdKHR) X(GetFenceFdKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
-    X(CreateShaderModule) X(CreateGraphicsPipelines) X(ResetCommandPool) X(ResetCommandBuffer)
+    X(CreateShaderModule) X(CreateGraphicsPipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
 #undef X
@@ -113,10 +113,12 @@ void wsi_device_destroyed(Device* device);
 
 /* mali_fixes.c */
 PFN_vkVoidFunction mali_instance_proc(const char* name);
-PFN_vkVoidFunction mali_device_proc(const char* name);
+/* `handle` may be VK_NULL_HANDLE (vkGetInstanceProcAddr). */
+PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name);
 /* The device's core features as the application may enable them: the ones reported as emulated
  * but missing in the driver are turned off in `enabled`. */
 void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled);
 void mali_device_created(Device* device);
+void mali_device_destroyed(Device* device);
 
 #endif
