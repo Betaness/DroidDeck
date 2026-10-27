@@ -13,6 +13,10 @@ The app writes getExternalFilesDir()/journal/plays.jsonl (/sdcard/Android/data/<
 per line: "play" records (see PlayRecord.kt for the fields) and "mark" records ("Something went wrong" in the
 session drawer). The package defaults to $DROIDDECK_PACKAGE, else com.droiddeck.launcher.g2. --json prints the
 selected records as JSON lines for further scripting. Lines that do not parse are skipped and counted.
+
+fps are frames the game presented (its own layer) or, for a game drawn through X11 (copy path, a window paced as
+hidden), frames the compositor composited: the list marks those with "s" (fps.source "screen"). Frame times
+(1% low, p99) exist only for the game layer. Hz per minute is the time-weighted mean refresh rate.
 """
 import argparse
 import json
@@ -28,8 +32,9 @@ SPARK = " .:-=+*#%@"
 FLAG_SHORT = {
     "crash": "CRASH", "device_lost": "DEVLOST", "vortek_exit": "VORTEK", "app_killed": "KILLED", "launch_failed": "NOLAUNCH",
     "freeze": "freeze", "low_fps": "lowfps", "oom": "oom", "hidden_paced": "hidden", "compiler": "compiler",
-    "at60_thermal": "60Hz-hot", "marked": "MARKED",
+    "at60_thermal": "60Hz-hot", "marked": "MARKED", "x11_copy": "x11", "software": "CPU-DRAWN",
 }
+SOURCE_TAG = {"game-layer": "", "screen": "s", "x11-stats": "x", "stats": "t", "x11": "x"}
 
 
 def files_dir(package):
@@ -193,11 +198,12 @@ def row(i, r):
     mem = get(r, "mem", "gameHwmMB") or get(r, "mem", "gameRssMaxMB")
     mean = fps.get("mean")
     if mean is None:
-        mean = fps.get("screenFps") if fps.get("source") == "screen" else fps.get("x11Fps")
+        mean = fps.get("x11Fps") if fps.get("x11Fps") is not None else fps.get("statsFps", fps.get("screenFps"))
+    tag = SOURCE_TAG.get(fps.get("source"), "?") if mean is not None else ""
     return [
         str(i), short_time(r.get("start")), str(r.get("game") or r.get("appid") or "?")[:24], duration(r.get("durS")),
         str(get(r, "exit", "reason") or "?"), str(get(r, "gpu", "used") or get(r, "gpu", "asked") or "?"),
-        f"{num(mean)}/{num(fps.get('low1'))}", num(fps.get("ftP99"), "{:.1f}"),
+        f"{num(mean)}{tag}/{num(fps.get('low1'))}", num(fps.get("ftP99"), "{:.1f}"),
         "-" if at60 is None else f"{at60 * 100:.0f}%" + (f"({(hot or 0) * 100:.0f})" if hot else ""),
         num(skin_max, "{:.1f}") if skin_max is not None else num(batt_max, "b{:.1f}"),
         num(mem), flags_text(r), str(r.get("logs") or ""),
@@ -275,22 +281,52 @@ def per_minute(r):
     hz = get(r, "hz", "perMin") or []
     skin = get(r, "thermal", "skinPerMin") or []
     batt = get(r, "thermal", "batteryPerMin") or []
-    n = max(len(fps), len(hz), len(skin), len(batt))
+    anon = get(r, "mem", "anonPerMin") or []
+    n = max(len(fps), len(hz), len(skin), len(batt), len(anon))
     if not n:
         return ""
 
     def at(lst, i, fmt):
         return fmt.format(lst[i]) if i < len(lst) and lst[i] is not None else "-"
 
-    lines = ["  min   fps    Hz  skinC  battC"]
+    lines = ["  min   fps    Hz  skinC  battC  anonMB"]
     for i in range(n):
-        lines.append(f"  {i:3d}  {at(fps, i, '{:5.1f}'):>5}  {at(hz, i, '{:4d}'):>4}  {at(skin, i, '{:5.1f}'):>5}  {at(batt, i, '{:5.1f}'):>5}")
+        lines.append(f"  {i:3d}  {at(fps, i, '{:5.1f}'):>5}  {at(hz, i, '{:4d}'):>4}  {at(skin, i, '{:5.1f}'):>5}  {at(batt, i, '{:5.1f}'):>5}"
+                     f"  {at(anon, i, '{:6d}'):>6}")
     lines.append(f"  fps  [{sparkline(fps, lo=0)}]")
     if any(isinstance(v, (int, float)) for v in hz):
         lines.append(f"  Hz   [{sparkline(hz, lo=0)}]")
     if any(isinstance(v, (int, float)) for v in skin):
         lines.append(f"  skin [{sparkline(skin)}]")
+    if any(isinstance(v, (int, float)) for v in anon):
+        lines.append(f"  anon [{sparkline(anon)}]")
     return "\n".join(lines)
+
+
+def trend(series):
+    """'first -> last MB, +x.x MB/min' over a per-minute list, or None with under two values."""
+    pts = [(i, v) for i, v in enumerate(series or []) if isinstance(v, (int, float))]
+    if len(pts) < 2:
+        return None
+    n = len(pts)
+    mx = sum(i for i, _ in pts) / n
+    my = sum(v for _, v in pts) / n
+    var = sum((i - mx) ** 2 for i, _ in pts)
+    slope = sum((i - mx) * (v - my) for i, v in pts) / var if var else 0.0
+    return f"{pts[0][1]} -> {pts[-1][1]} MB, {slope:+.1f} MB/min over {pts[-1][0] - pts[0][0]} min"
+
+
+def timeline_text(r):
+    events = r.get("timeline") or []
+    out = []
+    for e in events:
+        if not isinstance(e, list) or len(e) < 2:
+            continue
+        times = f" (x{e[2]})" if len(e) > 2 else ""
+        out.append(f"  +{duration(e[0]):>6}  {e[1]}{times}")
+    if r.get("timelineDropped"):
+        out.append(f"  ({r['timelineDropped']} more not kept)")
+    return "\n".join(out)
 
 
 def kv(d, indent="  "):
@@ -325,15 +361,25 @@ def cmd_show(args, records):
         "thermal:", kv({k: v for k, v in (r.get("thermal") or {}).items() if not k.endswith("PerMin")}),
         "cpu:", kv(r.get("cpu")),
         "mibridge (share granted):", kv(r.get("mibridge")),
-        "memory:", kv(r.get("mem")),
-        "per minute:", per_minute(r) or "  -",
+        "memory:", kv({k: v for k, v in (r.get("mem") or {}).items() if not k.endswith("PerMin")}),
     ]
+    for label, key in (("game anon", "anonPerMin"), ("vortek anon", "vortekAnonPerMin")):
+        t = trend(get(r, "mem", key))
+        if t:
+            out.append(f"  {label}: {t}")
+    out += ["per minute:", per_minute(r) or "  -"]
+    tl = timeline_text(r)
+    out.append("timeline:" + ("\n" + tl if tl else " -"))
     errors = r.get("errors") or []
     out.append("errors:" + ("" if errors else " -"))
     for e in errors:
-        out.append(f"  {e.get('k')} x{e.get('n')}")
+        where = "" if e.get("game", True) else "  (session logs, not the game's)"
+        at = f"  first at +{duration(e['atS'])}" if e.get("atS") is not None else ""
+        out.append(f"  {e.get('k')} x{e.get('n')}{at}{where}")
         for line in e.get("first") or []:
             out.append(f"      {line}")
+    if r.get("scanned"):
+        out.append(f"scanned: {', '.join(r['scanned'])}")
     marks = r.get("marks") or []
     out.append("marks: " + (", ".join(f"{m.get('t')} (+{duration(m.get('atS'))})" for m in marks) or "-"))
     out += ["settings:", kv(r.get("settings")), "env:", kv(r.get("env"))]
