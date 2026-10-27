@@ -8,13 +8,11 @@ package com.droiddeck.launcher.session.play
  * "Crash!!!"), so a crash is decided by the logs as much as by the code.
  */
 object ExitClassifier {
-    /** ApplicationExitInfo of this app's process, when the play ended with the app. */
     class AppExit(val reason: String, val status: Int, val description: String?, val atMs: Long)
 
     class Evidence(
         val durS: Long,
         val appKilled: AppExit? = null,
-        /** The app was killed and no exit record was found (or before Android 11). */
         val appGone: Boolean = false,
         val sessionStopped: Boolean = false,
         val sessionStatus: Int? = null,
@@ -26,10 +24,8 @@ object ExitClassifier {
         val usedVortek: Boolean = false,
         val findings: LogSliceScanner.Findings? = null,
         val steamExitCode: Int? = null,
-        /** Game-layer frames during the play; null when unknown. */
         val gameFrames: Long? = null,
         val screenFramesSeen: Boolean = false,
-        // For the flags.
         val longestZeroRunS: Long = 0,
         val longestStallS: Double? = null,
         val meanFpsAfterWarmup: Double? = null,
@@ -111,7 +107,6 @@ object ExitClassifier {
         return why.maxOf { KEEP_DAYS.getValue(it) } * day to why
     }
 
-    /** Days a session folder is kept past the newest ten, by flag. */
     val KEEP_DAYS = mapOf(
         "crash" to 14L, "device_lost" to 14L, "vortek_exit" to 14L, "freeze" to 14L, "app_killed" to 14L,
         "launch_failed" to 14L, "oom" to 14L, "compiler" to 14L, "low_fps" to 7L, "marked" to 30L,

@@ -71,7 +71,6 @@ object Json {
         out.append('"')
     }
 
-    /** Parses one JSON value; throws [IllegalArgumentException] on malformed text. */
     fun parse(text: String): Any? {
         val p = Parser(text)
         p.ws()
@@ -188,7 +187,6 @@ object Json {
     }
 }
 
-/** Typed reads from parsed JSON maps. */
 internal fun Map<*, *>.str(key: String): String? = this[key] as? String
 internal fun Map<*, *>.long(key: String): Long? = (this[key] as? Number)?.toLong()
 internal fun Map<*, *>.dbl(key: String): Double? = (this[key] as? Number)?.toDouble()

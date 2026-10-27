@@ -2,33 +2,25 @@ package com.droiddeck.launcher.session.play
 
 import kotlin.math.roundToInt
 
-/** One look at the device during a play, every few seconds (and at focus changes). */
 class Sample(
     val tMs: Long,
-    /** The game has input focus (not Steam's menu or overlay). */
     val focused: Boolean,
-    /** The session is on screen (activity shown, screen on). */
     val visible: Boolean,
     val suspended: Boolean,
     /** WaylandCompositor.gameFrameCount(): game-layer frames since the app started. */
     val frames: Long,
-    /** The panel's physical mode. */
     val modeHz: Float? = null,
     /** What the session asked for (the requested mode, after the peak-refresh and mirror caps). */
     val wantedHz: Float? = null,
     /** PowerKeeper's thermal_limit_refresh_rate, through the shell probe; null when unknown. */
     val limitHz: Int? = null,
-    /** PowerManager thermal status (0 none .. 6 shutdown). */
     val thermalStatus: Int? = null,
     val headroom: Float? = null,
     val skinC: Float? = null,
     val socC: Float? = null,
     val batteryC: Float? = null,
-    /** Mean current clock of each cpufreq policy, MHz. */
     val cpuMHz: IntArray? = null,
-    /** scaling_max_freq of each policy, MHz. */
     val capMHz: IntArray? = null,
-    /** MiBridge's last answer per kind (0 granted). */
     val mibridge: Map<String, Int>? = null,
 ) {
     val counting get() = focused && visible && !suspended
@@ -65,12 +57,10 @@ class PlayAccumulator(val startMs: Long) {
     private var zeroRunMs = 0L
     var longestZeroRunMs = 0L; private set
 
-    // Refresh rate, over focused time.
     private var hzMs = 0L
     private var at60Ms = 0L
     private val at60Why = linkedMapOf("thermal" to 0L, "app" to 0L, "system" to 0L)
 
-    // Thermal.
     var statusMax: Int? = null; private set
     var headroomMax: Float? = null; private set
     var skinMin: Float? = null; private set
@@ -79,16 +69,13 @@ class PlayAccumulator(val startMs: Long) {
     var batteryMin: Float? = null; private set
     var batteryMax: Float? = null; private set
 
-    // CPU.
     private var cpuSum: LongArray? = null
     private var cpuN = 0
     private var capMin: IntArray? = null
 
-    // MiBridge: samples granted / samples with an answer, per kind.
     private val miGranted = LinkedHashMap<String, Int>()
     private val miSeen = LinkedHashMap<String, Int>()
 
-    // Memory (kB), from [memory].
     var gameHwmKb = 0L; private set
     var gameRssMaxKb = 0L; private set
     var gameAnonMaxKb = 0L; private set
@@ -201,20 +188,18 @@ class PlayAccumulator(val startMs: Long) {
         return minutes[i]
     }
 
-    /** Mean fps over the counted time; null with under 10 s of it. */
-    fun meanFps(): Double? = countingMs.takeIf { it >= 10_000 }?.let { r1(countedFrames * 1000.0 / it) }
+    /** Mean fps over the counted time; null with under 10 s of it, or when the game layer never presented (copy path). */
+    fun meanFps(): Double? = countingMs.takeIf { it >= 10_000 && firstFrameAt != null }?.let { r1(countedFrames * 1000.0 / it) }
 
-    /** Mean fps after the first minute (loading and the title screen left out). */
-    fun meanFpsAfterWarmup(): Double? = countingAfterWarmupMs.takeIf { it >= 30_000 }?.let { r1(framesAfterWarmup * 1000.0 / it) }
+    fun meanFpsAfterWarmup(): Double? =
+        countingAfterWarmupMs.takeIf { it >= 30_000 && firstFrameAt != null }?.let { r1(framesAfterWarmup * 1000.0 / it) }
 
-    /** Per minute of the play: mean fps over its counted time (null with under 5 s counted). */
     fun perMinuteFps(): List<Double?> = minutes.map { m -> m.countingMs.takeIf { it >= 5_000 }?.let { r1(m.frames * 1000.0 / it) } }
     fun perMinuteHz(): List<Int?> = minutes.map { m -> m.minModeHz?.roundToInt() }
     fun perMinuteSkin(): List<Double?> = minutes.map { m -> m.maxSkin?.let { r1(it.toDouble()) } }
     fun perMinuteBattery(): List<Double?> = minutes.map { m -> m.maxBattery?.let { r1(it.toDouble()) } }
     fun perMinuteStatus(): List<Int?> = minutes.map { m -> m.maxStatus.takeIf { it >= 0 } }
 
-    /** Share of focused time the panel ran at 60 Hz or less; null when the mode was never read. */
     fun at60Share(): Double? = hzMs.takeIf { it > 0 }?.let { r2(at60Ms.toDouble() / it) }
     fun at60Why(): Map<String, Double> = at60Why.mapValues { (_, ms) -> if (hzMs > 0) r2(ms.toDouble() / hzMs) else 0.0 }
 

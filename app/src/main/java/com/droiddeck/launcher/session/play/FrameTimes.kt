@@ -19,7 +19,6 @@ object FrameTimes {
     private const val FINE = 200 // [0, 50 ms) by 250 us
     private const val MID = 150 // [50, 200 ms) by 1 ms
     private const val COARSE = 80 // [200 ms, 1 s) by 10 ms
-    /** First stall bin: gaps of a second or more. */
     const val STALL = FINE + MID + COARSE
     const val BINS = STALL + 9 + 5 + 1
 
@@ -48,7 +47,6 @@ object FrameTimes {
         else -> BINS - 1
     }
 
-    /** Lower edge of bin [i], in microseconds. */
     fun low(i: Int): Long = when {
         i < FINE -> i * 250L
         i < FINE + MID -> 50_000L + (i - FINE) * 1_000L
@@ -58,7 +56,6 @@ object FrameTimes {
         else -> 60_000_000L
     }
 
-    /** Upper edge of bin [i], in microseconds (the last bin is open; a minute is given). */
     fun high(i: Int): Long = if (i >= BINS - 1) 60_000_000L else low(i + 1)
 
     /** [now] - [before], element by element (clamped at 0: a wrapped counter is not a negative frame count). */
@@ -70,9 +67,7 @@ object FrameTimes {
     }
 }
 
-/** Frame-time statistics read from a [FrameTimes] histogram (sums of deltas). */
 class FrameStats(
-    /** Frames below a second apart: what the percentiles describe. */
     val frames: Long,
     val ftP50: Double?,
     val ftP90: Double?,
@@ -85,7 +80,6 @@ class FrameStats(
     val longestStallS: Double?,
 ) {
     companion object {
-        /** Fewer frames than this and the percentiles say nothing. */
         const val MIN_FRAMES = 30
 
         fun of(hist: IntArray): FrameStats {
@@ -106,7 +100,6 @@ class FrameStats(
             )
         }
 
-        /** Frame time in ms at quantile [q], linear within the bin. */
         private fun percentile(hist: IntArray, n: Long, q: Double): Double {
             val target = q * n
             var seen = 0L
@@ -123,7 +116,6 @@ class FrameStats(
             return round2(FrameTimes.low(FrameTimes.STALL) / 1000.0)
         }
 
-        /** fps from the mean frame time of the slowest [share] of frames (bin middles). */
         private fun low(hist: IntArray, n: Long, share: Double): Double {
             val want = ceil(n * share).toLong().coerceAtLeast(1)
             var taken = 0L

@@ -84,6 +84,15 @@ class PlayAccumulatorTest {
         assertEquals(12.0, acc.meanFpsAfterWarmup()!!, 0.5)
     }
 
+    @Test fun noGameLayerFramesMeansNoFps() {
+        // A copy-path game: the compositor's [stats] say how it ran, the game layer says nothing.
+        val acc = PlayAccumulator(t0)
+        run(acc, 0, 300, 0, 0)
+        assertNull(acc.meanFps())
+        assertNull(acc.meanFpsAfterWarmup())
+        assertEquals(0L, acc.longestZeroRunMs)
+    }
+
     @Test fun gapsLongerThanThirtySecondsAreDropped() {
         val acc = PlayAccumulator(t0)
         acc.add(Sample(t0, true, true, false, 0))

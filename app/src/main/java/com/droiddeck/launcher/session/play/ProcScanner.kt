@@ -20,7 +20,6 @@ class ProcScanner(private val proc: File = File("/proc")) {
 
     private val known = HashMap<Int, Entry>()
 
-    /** The processes alive now. Pids gone since the last scan are forgotten. */
     fun scan(): Map<Int, Entry> {
         val names = proc.list() ?: return emptyMap()
         val alive = HashSet<Int>(names.size)
@@ -58,7 +57,6 @@ class ProcScanner(private val proc: File = File("/proc")) {
         null
     }
 
-    /** /proc/<pid>/status values in kB, e.g. VmHWM, VmRSS, RssAnon. */
     fun statusKb(pid: Int, vararg keys: String): Map<String, Long> {
         val out = HashMap<String, Long>()
         try {
@@ -73,7 +71,6 @@ class ProcScanner(private val proc: File = File("/proc")) {
         return out
     }
 
-    /** /proc/<pid>/environ as KEY=VALUE strings; null when it cannot be read. */
     fun environ(pid: Int): List<String>? = try {
         String(File(proc, "$pid/environ").readBytes(), Charsets.UTF_8).split('\u0000').filter { it.isNotEmpty() }
     } catch (_: Exception) {
@@ -81,7 +78,6 @@ class ProcScanner(private val proc: File = File("/proc")) {
     }
 
     companion object {
-        /** Launches by app id: the pids carrying it (wrapper and reaper), the earliest start and the exe. */
         fun launches(entries: Map<Int, Entry>): Map<Long, LaunchGroup> {
             val byApp = entries.values.filter { it.launch != null }.groupBy { it.launch!!.appid }
             return byApp.mapValues { (appid, list) ->
@@ -90,7 +86,17 @@ class ProcScanner(private val proc: File = File("/proc")) {
             }
         }
 
-        /** The game's own process: argv[0] names [exeName]; the newest when several (a launcher that starts the game). */
+        private val WINE_SYSTEM = setOf(
+            "services.exe", "winedevice.exe", "plugplay.exe", "svchost.exe", "rpcss.exe", "explorer.exe", "tabtip.exe",
+            "conhost.exe", "start.exe", "wineboot.exe", "steam.exe", "steamwebhelper.exe", "rundll32.exe", "winemenubuilder.exe",
+            "cmd.exe", "crashpad_handler.exe", "unitycrashhandler64.exe", "easyanticheat.exe", "steamerrorreporter.exe",
+        )
+
+        fun windowsProcesses(entries: Map<Int, Entry>): List<Entry> = entries.values.filter { e ->
+            val base = e.argv0.replace('\\', '/').substringAfterLast('/').lowercase()
+            e.launch == null && base.endsWith(".exe") && base !in WINE_SYSTEM
+        }
+
         fun gameProcess(entries: Map<Int, Entry>, exeName: String?): Entry? {
             if (exeName.isNullOrEmpty()) return null
             return entries.values.filter { it.launch == null && LaunchCmdline.runs(it.argv0, exeName) }

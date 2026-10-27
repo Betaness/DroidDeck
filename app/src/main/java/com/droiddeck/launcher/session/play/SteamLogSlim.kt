@@ -22,7 +22,6 @@ object SteamLogSlim {
     private val STAMP = Regex("""^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})]""")
     private val EVENT_T = Regex("""^\{"t":(\d{10,})""")
 
-    /** Slims [dir]; returns the bytes freed. */
     fun slim(dir: File, zone: TimeZone = TimeZone.getDefault()): Long {
         if (File(dir, MARKER).exists()) return 0L
         val steam = File(dir, "steam")
@@ -49,7 +48,6 @@ object SteamLogSlim {
         return (before - after).coerceAtLeast(0)
     }
 
-    /** First and last event time of a session's events.jsonl. */
     fun window(events: File): Pair<Long, Long>? {
         if (!events.isFile) return null
         var first: Long? = null
@@ -74,7 +72,6 @@ object SteamLogSlim {
         false
     }
 
-    /** Keeps the lines stamped within [fromMs, toMs] and the unstamped lines after them. */
     fun cut(f: File, fromMs: Long, toMs: Long, zone: TimeZone) {
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply { timeZone = zone; isLenient = false }
         val tmp = File(f.parentFile, ".${f.name}.slim")
@@ -96,7 +93,6 @@ object SteamLogSlim {
         }
     }
 
-    /** Keeps the last [bytes] of [f], from a line start. */
     fun tail(f: File, bytes: Long) {
         if (f.length() <= bytes) return
         val tmp = File(f.parentFile, ".${f.name}.slim")

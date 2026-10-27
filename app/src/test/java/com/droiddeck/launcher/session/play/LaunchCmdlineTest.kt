@@ -74,10 +74,12 @@ class LaunchCmdlineTest {
         proc(root, 24022, wrapper.drop(4), 501)
         proc(root, 24248, listOf("C:\\Duckov\\Duckov.exe"), 520, "Name:\tDuckov.exe\nVmHWM:\t 2210000 kB\nVmRSS:\t1900000 kB\nRssAnon:\t1600000 kB\n",
             listOf("DXVK_ASYNC=1", "SteamUser=someone", "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/hybris_icd.json"))
+        proc(root, 24250, listOf("C:\\windows\\system32\\services.exe"), 510)
         File(root, "self").mkdirs()
         val scanner = ProcScanner(root)
         val entries = scanner.scan()
-        assertEquals(setOf(100, 24020, 24022, 24248), entries.keys)
+        assertEquals(setOf(100, 24020, 24022, 24248, 24250), entries.keys)
+        assertEquals(listOf(24248), ProcScanner.windowsProcesses(entries).map { it.pid })
         assertEquals(500L, entries.getValue(24020).startTicks)
         val launches = ProcScanner.launches(entries)
         assertEquals(setOf(3167020L), launches.keys)

@@ -27,7 +27,6 @@ object ShellProbe {
     @Volatile var last: Reading? = null
     @Volatile private var lastRunMs = 0L
 
-    /** From HyperOsGameMode's loop; [shell] runs a command on the connection and returns its output. */
     fun tick(nowMs: Long, shell: (String) -> String) {
         if (!wanted || nowMs - lastRunMs < EVERY_MS) return
         lastRunMs = nowMs

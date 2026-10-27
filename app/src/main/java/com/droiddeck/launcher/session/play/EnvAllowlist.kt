@@ -18,7 +18,6 @@ object EnvAllowlist {
 
     fun allowed(key: String): Boolean = key in EXACT || PREFIXES.any { key.startsWith(it) }
 
-    /** KEY=VALUE strings to the recorded map, sorted by key. */
     fun filter(environ: List<String>): Map<String, String> {
         val out = java.util.TreeMap<String, String>()
         for (entry in environ) {

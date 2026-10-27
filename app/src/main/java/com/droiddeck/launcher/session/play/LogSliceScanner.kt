@@ -24,17 +24,13 @@ class LogSliceScanner(
     class Findings {
         val errors = LinkedHashMap<String, Kind>()
         var kept = 0
-        /** Compositor [stats] lines: frames on screen, GPU frames from games, Vortek zero-copy frames, per 10 s. */
         val screenFrames = ArrayList<Int>()
         val gpuFrames = ArrayList<Int>()
         val zeroCopyFrames = ArrayList<Int>()
-        /** vortek-x11 / hybris-x11 per-window fps reports (VORTEK_X11_STATS). */
         val x11Fps = ArrayList<Double>()
-        /** Swapchain sizes seen, largest first by area at the end ([swapchains]). */
         private val swapchainSet = LinkedHashSet<String>()
         var dxvk: String? = null
         var renderer: String? = null
-        /** "hybris" or "vortek", from droiddeck-game-env's line. */
         var gpuUsed: String? = null
         var steamWrapperPid: Int? = null
         var steamExitCode: Int? = null
@@ -58,7 +54,6 @@ class LogSliceScanner(
 
     fun scan(sources: List<Source>, appid: Long? = null): Findings = Findings().also { scanInto(it, sources, appid) }
 
-    /** Adds [sources] to findings already made. */
     fun scanInto(f: Findings, sources: List<Source>, appid: Long? = null) {
         for (s in sources) {
             if (!s.file.isFile) continue
@@ -70,7 +65,6 @@ class LogSliceScanner(
         }
     }
 
-    /** A finding that is not a log line (a crash report folder). */
     fun note(f: Findings, kind: String, line: String, label: String) = keep(f, kind, line, label)
 
     private fun read(s: Source, each: (String) -> Unit) {
@@ -108,7 +102,6 @@ class LogSliceScanner(
     }
 
     private fun look(line: String, label: String, appid: Long?, f: Findings) {
-        // Facts first; a line is one or the other.
         if (facts(line, label, appid, f)) return
         for (p in PATTERNS) {
             if (line.contains(p.needle)) {

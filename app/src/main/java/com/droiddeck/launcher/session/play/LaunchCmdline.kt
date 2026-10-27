@@ -11,7 +11,6 @@ package com.droiddeck.launcher.session.play
  */
 object LaunchCmdline {
     class Launch(val appid: Long, /** Relative to steamapps/common when it is there. */ val exe: String?) {
-        /** File name of the exe, for finding the game's own process. */
         val exeName: String? get() = exe?.substringAfterLast('/')?.takeIf { it.isNotEmpty() }
     }
 
@@ -33,7 +32,6 @@ object LaunchCmdline {
         return Launch(appid, exe?.let(::relative))
     }
 
-    /** The exe as the journal stores it: below steamapps/common, else its last two path parts. */
     fun relative(path: String): String {
         val p = path.trim().trim('\'', '"').replace('\\', '/')
         val common = p.indexOf("/steamapps/common/")

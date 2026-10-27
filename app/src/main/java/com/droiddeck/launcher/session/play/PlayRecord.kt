@@ -5,10 +5,8 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-/** [mali-g2] Everything known about a play in progress (journal thread only). */
 class PlayState(
     val id: String,
-    /** The session folder's name: the full logs are there (and in the mirror). */
     val logs: String,
     val appid: Long?,
     val game: String?,
@@ -18,11 +16,13 @@ class PlayState(
     val relaunchOf: String? = null,
 ) {
     val acc = PlayAccumulator(startMs)
-    /** Frame-time histogram of the counted stretches. */
     val hist = IntArray(FrameTimes.BINS)
     var pids: Set<Int> = emptySet()
     var gamePid = -1
     var gameProcess: String? = null
+    /** [gamePid] is the busiest Windows process, not one named like the exe: looked at again now and then. */
+    var gameGuessed = false
+    var guessedAt = 0L
     var env: Map<String, String>? = null
     var app: Map<String, Any?> = emptyMap()
     var gpuAsked: String? = null
@@ -33,7 +33,6 @@ class PlayState(
     var vortekExitAtMs: Long? = null
     var shellSeen = false
     var endMs: Long? = null
-    /** Log files and where they stood when the play started. */
     var sources: List<LogSliceScanner.Source> = emptyList()
 }
 
@@ -50,7 +49,6 @@ object PlayRecord {
 
     private fun mb(kb: Long): Long? = kb.takeIf { it > 0 }?.let { (it + 512) / 1024 }
 
-    /** The record as far as the samples go; [finish] adds what the logs and the end tell. */
     fun base(s: PlayState, endMs: Long, zone: TimeZone = TimeZone.getDefault()): LinkedHashMap<String, Any?> {
         val a = s.acc
         val stats = FrameStats.of(s.hist)
@@ -130,7 +128,6 @@ object PlayRecord {
         else -> "STATUS_$status"
     }
 
-    /** "hybris" when the game's Vulkan ICD is the libhybris one, "vortek" for Vortek's. */
     fun gpuFromEnv(env: Map<String, String>?): String? {
         val icd = env?.get("VK_ICD_FILENAMES") ?: env?.get("VK_DRIVER_FILES") ?: return null
         return when {
@@ -160,7 +157,6 @@ object PlayRecord {
         )
     }
 
-    /** Evidence from [evidence]'s map plus what only the end knows. */
     fun evidenceFrom(
         m: Map<*, *>, findings: LogSliceScanner.Findings?, usedVortek: Boolean,
         appKilled: ExitClassifier.AppExit? = null, appGone: Boolean = false,
@@ -189,7 +185,6 @@ object PlayRecord {
         runMode = m["runMode"] == true,
     )
 
-    /** Adds the log findings and the exit to a [base] record (also one read back from open.json). */
     @Suppress("UNCHECKED_CAST")
     fun finish(r: MutableMap<String, Any?>, f: LogSliceScanner.Findings?, exit: ExitClassifier.Exit, zone: TimeZone = TimeZone.getDefault()) {
         r["exit"] = linkedMapOf(

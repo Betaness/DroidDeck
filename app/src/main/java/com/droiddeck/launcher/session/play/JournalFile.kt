@@ -22,7 +22,6 @@ class JournalFile(
     val plays = File(dir, "plays.jsonl")
     val open = File(dir, "open.json")
 
-    /** The line [record] is stored as. */
     fun line(record: Map<String, Any?>): String {
         val values = Json.write(redactValues(record))
         val whole = redact(values)
@@ -45,7 +44,6 @@ class JournalFile(
         if (plays.length() > capBytes) trim()
     }
 
-    /** Keeps the newest whole lines that fit in [keepBytes]. */
     @Synchronized
     fun trim() {
         val lines = plays.readLines(Charsets.UTF_8)

@@ -55,7 +55,6 @@ object PlayJournal {
     private const val RELAUNCH_MS = 15_000L
     private const val SHELL_FRESH_MS = 90_000L
     private const val MARK_KEEP_MS = 30L * 24 * 3600 * 1000
-    /** Steam's own UI in gamescope's focus list. */
     private const val STEAM_UI = 769L
     private const val RUN_KEY = -1L
 
@@ -63,7 +62,6 @@ object PlayJournal {
     private val lock = ReentrantLock()
     @Volatile private var handler: Handler? = null
 
-    // The journal thread's state (under [lock]).
     private var app: Context? = null
     private var dir: File? = null
     private var mode = ""
@@ -86,6 +84,9 @@ object PlayJournal {
     private var headroom: Float? = null
     private var running = false
     private var policies: List<File> = emptyList()
+    private var logFiles: List<Pair<String, File>> = emptyList()
+    /** The logs' lengths at the tick before: a launch is seen up to a tick late, and its first lines matter. */
+    private var lengthsBefore: Map<String, Long> = emptyMap()
     private val clkTck: Long by lazy {
         runCatching { android.system.Os.sysconf(android.system.OsConstants._SC_CLK_TCK) }.getOrDefault(100L).takeIf { it > 0 } ?: 100L
     }
@@ -115,7 +116,6 @@ object PlayJournal {
     private fun journalFor(context: Context): JournalFile? =
         context.getExternalFilesDir(null)?.let { JournalFile(File(it, "journal"), LogRedactor::redact) }
 
-    /** After the session folder is open. */
     fun sessionStarted(context: Context, sessionDir: File, sessionMode: String, sessionProgram: String?) {
         facts.clear()
         val ctx = context.applicationContext
@@ -142,6 +142,13 @@ object PlayJournal {
             policies = File("/sys/devices/system/cpu/cpufreq").listFiles { f -> f.name.startsWith("policy") }
                 ?.sortedBy { it.name.removePrefix("policy").toIntOrNull() ?: 99 }.orEmpty()
             listenThermal(ctx)
+            logFiles = listOf(
+                "session.log" to File(sessionDir, "session.log"),
+                "app.log" to File(sessionDir, "app.log"),
+                "vortek.log" to File(sessionDir, "vortek.log"),
+                "gameprocess_log.txt" to File(SessionPrefs.activeSteamRoot(ctx), "logs/gameprocess_log.txt"),
+            )
+            lengthsBefore = logFiles.associate { (label, f) -> label to f.length() }
             if (sessionMode == SessionService.MODE_RUN) openRun(System.currentTimeMillis())
             thread().removeCallbacks(tickRunnable)
             thread().postDelayed(tickRunnable, TICK_MS)
@@ -156,7 +163,6 @@ object PlayJournal {
         }
     }
 
-    /** gamescope's focus changed (AgentGuest). */
     fun focus(focused: Long?, focusable: List<Long>) = post {
         if (!running) return@post
         val now = System.currentTimeMillis()
@@ -167,7 +173,6 @@ object PlayJournal {
         for ((k, s) in open) counting[k] = focused(s) && SessionState.visible && !SessionState.suspended
     }
 
-    /** vortek-server died on its own (not stopped by the session). */
     fun vortekExited(status: Int) = post {
         val now = System.currentTimeMillis()
         for (s in open.values) if (s.vortekExit == null) { s.vortekExit = status; s.vortekExitAtMs = now }
@@ -202,7 +207,6 @@ object PlayJournal {
         try { done.await(timeoutMs, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
     }
 
-    /** The app is crashing: the open plays as they stand, for [recover]. */
     fun flushOpen() {
         if (!lock.tryLock(2, TimeUnit.SECONDS)) return
         try { checkpoint(System.currentTimeMillis()) } catch (_: Throwable) {} finally { lock.unlock() }
@@ -259,7 +263,6 @@ object PlayJournal {
         if (now - lastCheckpointAt >= CHECKPOINT_MS) checkpoint(now)
     }
 
-    /** Steam launches started and ended since the last tick. */
     private fun track(now: Long) {
         if (mode == SessionService.MODE_RUN) {
             open[RUN_KEY]?.let { s -> resolveGame(s, scanner.scan(), now) }
@@ -276,13 +279,22 @@ object PlayJournal {
             resolveGame(s, entries, now)
         }
         for ((appid, g) in launches) if (appid !in open) openSteam(g, entries, now)
+        lengthsBefore = logFiles.associate { (label, f) -> label to f.length() }
     }
 
     private fun resolveGame(s: PlayState, entries: Map<Int, ProcScanner.Entry>, now: Long) {
-        if (s.gamePid <= 0 || s.gamePid !in entries) {
-            ProcScanner.gameProcess(entries, s.exe?.substringAfterLast('/'))?.let { e ->
+        if (s.gamePid <= 0 || s.gamePid !in entries || (s.gameGuessed && now - s.guessedAt >= SLOW_MS)) {
+            val named = ProcScanner.gameProcess(entries, s.exe?.substringAfterLast('/'))
+            // A launcher exe (start_protected_game.exe) that starts the real game: the busiest other Windows process.
+            val e = named ?: if (now - s.startMs >= ENV_AFTER_MS) {
+                ProcScanner.windowsProcesses(entries).maxByOrNull { scanner.statusKb(it.pid, "VmRSS")["VmRSS"] ?: 0L }
+            } else null
+            if (e != null) {
+                if (e.pid != s.gamePid) s.env = null
                 s.gamePid = e.pid
                 s.gameProcess = e.argv0.replace('\\', '/').substringAfterLast('/')
+                s.gameGuessed = named == null
+                s.guessedAt = now
             }
         }
         if (s.env == null && s.gamePid > 0 && now - s.startMs >= ENV_AFTER_MS) {
@@ -332,14 +344,7 @@ object PlayJournal {
         )
         s.gpuAsked = runCatching { SessionPrefs.gpuPath(ctx) }.getOrNull()
         s.display = display(ctx)
-        val d = dir ?: return
-        val steamLogs = File(SessionPrefs.activeSteamRoot(ctx), "logs/gameprocess_log.txt")
-        s.sources = listOf(
-            LogSliceScanner.Source("session.log", File(d, "session.log")),
-            LogSliceScanner.Source("app.log", File(d, "app.log")),
-            LogSliceScanner.Source("vortek.log", File(d, "vortek.log")),
-            LogSliceScanner.Source("gameprocess_log.txt", steamLogs),
-        ).map { LogSliceScanner.Source(it.label, it.file, it.file.length()) }
+        s.sources = logFiles.map { (label, f) -> LogSliceScanner.Source(label, f, lengthsBefore[label] ?: f.length()) }
     }
 
     private fun display(ctx: Context): Map<String, Any?> {
@@ -495,7 +500,6 @@ object PlayJournal {
         val runStatus: Int? = null,
     )
 
-    /** Game-side logs the play may have written: Unity's Player.log, its crash reports, Proton's log. */
     private fun gameSources(ctx: Context, s: PlayState, f: LogSliceScanner.Findings, scanner: LogSliceScanner): List<LogSliceScanner.Source> {
         val out = ArrayList<LogSliceScanner.Source>()
         val since = s.startMs - 5_000
@@ -574,7 +578,6 @@ object PlayJournal {
         checkpoint(endMs)
     }
 
-    /** Writes .keep into the session folder (and its mirror, when there is one already); returns the days. */
     private fun keep(logs: String, flags: List<String>, now: Long): Long? {
         val (ms, why) = ExitClassifier.keepFor(flags) ?: return null
         val ctx = app ?: return null
