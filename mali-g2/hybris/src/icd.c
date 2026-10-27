@@ -180,6 +180,12 @@ bool icd_placed_available(Instance* instance, VkPhysicalDevice physical) {
 static const char* const DIVISOR_EXT = "VK_EXT_vertex_attribute_divisor";
 static const char* const DIVISOR_KHR = "VK_KHR_vertex_attribute_divisor";
 
+static bool isWsiInstanceExtension(const char* name) {
+    for (uint32_t i = 0; i < wsi_instance_extension_count; i++)
+        if (!strcmp(name, wsi_instance_extensions[i].extensionName)) return true;
+    return false;
+}
+
 static VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char* layer, uint32_t* count, VkExtensionProperties* properties) {
     PFN_vkEnumerateInstanceExtensionProperties enumerate =
         (PFN_vkEnumerateInstanceExtensionProperties)next.gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
@@ -194,6 +200,15 @@ static VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char* laye
         free(all);
         return result;
     }
+    /* Every surface is ours (wsi.c casts the handle): a surface extension of libhybris's (headless,
+     * Wayland, built with --enable-wayland) would hand wsi.c a surface it did not create. */
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        size_t length = strnlen(all[i].extensionName, sizeof(all[i].extensionName));
+        bool surface = length > 8 && !strcmp(all[i].extensionName + length - 8, "_surface");
+        if (!surface || isWsiInstanceExtension(all[i].extensionName)) all[kept++] = all[i];
+    }
+    n = kept;
     for (uint32_t i = 0; i < wsi_instance_extension_count; i++)
         if (!listed(all, n, wsi_instance_extensions[i].extensionName)) all[n++] = wsi_instance_extensions[i];
     result = copyOut(all, n, count, properties);
@@ -237,12 +252,6 @@ static VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice p
 }
 
 /* ---- instance ---- */
-
-static bool isWsiInstanceExtension(const char* name) {
-    for (uint32_t i = 0; i < wsi_instance_extension_count; i++)
-        if (!strcmp(name, wsi_instance_extensions[i].extensionName)) return true;
-    return false;
-}
 
 static VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo* info, const VkAllocationCallbacks* allocator, VkInstance* out) {
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)next.gipa(VK_NULL_HANDLE, "vkCreateInstance");
