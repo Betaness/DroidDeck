@@ -134,7 +134,8 @@ typedef struct Device {
     X(CreateShaderModule) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
     X(MapMemory2KHR) X(UnmapMemory2KHR) X(FlushMappedMemoryRanges) X(GetImageSubresourceLayout) X(GetImageSubresourceLayout2) \
     X(GetImageSubresourceLayout2KHR) X(GetImageSubresourceLayout2EXT) X(GetDeviceImageSubresourceLayout) \
-    X(GetDeviceImageSubresourceLayoutKHR) X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) X(MergePipelineCaches)
+    X(GetDeviceImageSubresourceLayoutKHR) X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) X(MergePipelineCaches) \
+    X(CreateRayTracingPipelinesKHR) X(GetShaderModuleCreateInfoIdentifierEXT)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
 #undef X

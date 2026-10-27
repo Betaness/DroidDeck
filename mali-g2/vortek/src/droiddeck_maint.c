@@ -422,6 +422,7 @@ static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
 
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
+#include "stage_inline_module.h"
 
 static bool clipStripOn(void) {
     static int on = -1;
@@ -532,27 +533,31 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
     if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memcpy(copy, infos, count * sizeof(*copy));
     /* Inline stage code (DXVK 3.x, pipeline libraries) gets the same rewrites as modules: the stage
-     * and its VkShaderModuleCreateInfo are copied when the latter heads the stage's pNext chain. */
+     * and its VkShaderModuleCreateInfo (anywhere in the stage's pNext chain, with the structures
+     * ahead of it: stage_inline_module.h) are copied. */
     uint32_t totalStages = 0;
     for (uint32_t i = 0; i < count; i++) totalStages += infos[i].stageCount;
     VkPipelineShaderStageCreateInfo* stageCopies = totalStages ? calloc(totalStages, sizeof(*stageCopies)) : NULL;
     VkShaderModuleCreateInfo* moduleCopies = totalStages ? calloc(totalStages, sizeof(*moduleCopies)) : NULL;
     uint32_t** codes = totalStages ? calloc(totalStages, sizeof(*codes)) : NULL;
+    DdStageChain* chains = totalStages ? calloc(totalStages, sizeof(*chains)) : NULL;
     uint32_t used = 0;
     for (uint32_t i = 0; i < count; i++) {
         const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
         if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
         dropIgnoredLibraryState(&copy[i]);
-        if (!stageCopies || !moduleCopies || !codes) continue;
+        if (!stageCopies || !moduleCopies || !codes || !chains) continue;
         bool rewritten = false;
         uint32_t base = used;
         for (uint32_t s = 0; s < infos[i].stageCount; s++, used++) {
             stageCopies[used] = infos[i].pStages[s];
-            const VkShaderModuleCreateInfo* inl = infos[i].pStages[s].pNext;
-            if (inl && inl->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO &&
-                rewriteShader(inl, &moduleCopies[used], &codes[used])) {
-                stageCopies[used].pNext = &moduleCopies[used];
-                rewritten = true;
+            const VkShaderModuleCreateInfo* inl = dd_inline_module(infos[i].pStages[s].pNext);
+            if (inl && rewriteShader(inl, &moduleCopies[used], &codes[used])) {
+                const void* head = dd_replace_inline_module(infos[i].pStages[s].pNext, inl, &moduleCopies[used], &chains[used]);
+                if (head) {
+                    stageCopies[used].pNext = head;
+                    rewritten = true;
+                }
             }
         }
         if (rewritten) copy[i].pStages = &stageCopies[base];
@@ -584,6 +589,7 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
     VkResult result = vt_call_vkCreateGraphicsPipelines(device, cache, count, copy, alloc, pipelines);
     for (uint32_t i = 0; codes && i < used; i++) free(codes[i]);
     free(codes);
+    free(chains);
     free(moduleCopies);
     free(stageCopies);
     free(copy);
@@ -596,17 +602,20 @@ static VkResult dd_vkCreateComputePipelines(VkDevice device, VkPipelineCache cac
     memcpy(copy, infos, count * sizeof(*copy));
     VkShaderModuleCreateInfo* moduleCopies = calloc(count, sizeof(*moduleCopies));
     uint32_t** codes = calloc(count, sizeof(*codes));
+    DdStageChain* chains = calloc(count, sizeof(*chains));
     for (uint32_t i = 0; i < count; i++) {
         const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
         if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
-        const VkShaderModuleCreateInfo* inl = infos[i].stage.pNext;
-        if (moduleCopies && codes && inl && inl->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO &&
-            rewriteShader(inl, &moduleCopies[i], &codes[i]))
-            copy[i].stage.pNext = &moduleCopies[i];
+        const VkShaderModuleCreateInfo* inl = dd_inline_module(infos[i].stage.pNext);
+        if (moduleCopies && codes && chains && inl && rewriteShader(inl, &moduleCopies[i], &codes[i])) {
+            const void* head = dd_replace_inline_module(infos[i].stage.pNext, inl, &moduleCopies[i], &chains[i]);
+            if (head) copy[i].stage.pNext = head;
+        }
     }
     VkResult result = vt_call_vkCreateComputePipelines(device, cache, count, copy, alloc, pipelines);
     for (uint32_t i = 0; codes && i < count; i++) free(codes[i]);
     free(codes);
+    free(chains);
     free(moduleCopies);
     free(copy);
     return result;

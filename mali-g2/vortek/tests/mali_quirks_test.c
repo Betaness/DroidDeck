@@ -17,7 +17,10 @@
  *           which Mali lacks and Vortek reports): counts the lit pixels, an INFO line (r56p0 fills it
  *           solid, as with VK_POLYGON_MODE_POINT; MQ_WIRE_MODE=1 point, 2 fill, which must pass)
  * MQ_PARTS (default all) picks parts, comma-separated; MQ_INLINE=1 hands the shaders to the pipelines
- * as VkShaderModuleCreateInfo in the stage's pNext (maintenance5) instead of modules; MQ_ENGINE sets
+ * as VkShaderModuleCreateInfo in the stage's pNext (maintenance5) instead of modules, MQ_INLINE=2
+ * the same behind a VkPipelineRobustnessCreateInfoEXT (device defaults) in the chain, which is valid
+ * in any order (needs VK_EXT_pipeline_robustness; through Vortek such a stage chain fails with -4,
+ * which it did before the client looked past the first structure); MQ_ENGINE sets
  * the engine name; MQ_FIX=1 applies ../src/spirv_spec_composite.h and ../src/linear_row_pitch.h
  * itself (to check them on the bare driver, as the in-process path uses them).
  * Prints "MQ <part> PASS|FAIL ..." per part and exits 1 when one failed.
@@ -41,6 +44,7 @@ static VkQueue queue;
 static uint32_t qfam;
 static VkCommandPool pool;
 static bool inlineStages, fixShaders; /* MQ_INLINE, MQ_FIX */
+static bool inlineSecond;             /* MQ_INLINE=2 */
 static int failures;
 
 static bool part(const char* name) {
@@ -108,8 +112,10 @@ static void submitWait(VkCommandBuffer cmd) {
     vkFreeCommandBuffers(dev, pool, 1, &cmd);
 }
 
-/* A stage of `code`: a module, or with MQ_INLINE=1 the create info chained to the stage. */
+/* A stage of `code`: a module, or with MQ_INLINE=1 the create info chained to the stage (=2: second
+ * in the chain). */
 static VkShaderModuleCreateInfo inlineInfos[4];
+static VkPipelineRobustnessCreateInfoEXT inlineAhead[4];
 static int inlineUsed;
 static VkPipelineShaderStageCreateInfo stage(VkShaderStageFlagBits s, const uint32_t* code, size_t size, const VkSpecializationInfo* spec) {
     VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, s, VK_NULL_HANDLE, "main", spec};
@@ -123,6 +129,11 @@ static VkPipelineShaderStageCreateInfo stage(VkShaderStageFlagBits s, const uint
     if (inlineStages) {
         inlineInfos[inlineUsed] = mi;
         st.pNext = &inlineInfos[inlineUsed];
+        if (inlineSecond) {
+            inlineAhead[inlineUsed] = (VkPipelineRobustnessCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT,
+                                                                         &inlineInfos[inlineUsed]};
+            st.pNext = &inlineAhead[inlineUsed];
+        }
     } else CK(vkCreateShaderModule(dev, &mi, NULL, &st.module));
     inlineUsed++;
     return st;
@@ -532,7 +543,8 @@ static void testDmabuf(void) {
 int main(void) {
     const char* engine = getenv("MQ_ENGINE");
     const char* inl = getenv("MQ_INLINE");
-    inlineStages = inl && *inl == '1';
+    inlineStages = inl && (*inl == '1' || *inl == '2');
+    inlineSecond = inl && *inl == '2';
     const char* fix = getenv("MQ_FIX");
     fixShaders = fix && *fix == '1';
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "mali_quirks_test", 1, engine ? engine : "DXVK",
@@ -546,7 +558,7 @@ int main(void) {
     VkPhysicalDeviceProperties2 props = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &drv};
     vkGetPhysicalDeviceProperties2(pd, &props);
     printf("MQ device %s, driver %u %s, engine %s%s%s\n", props.properties.deviceName, drv.driverID, drv.driverInfo, app.pEngineName,
-           inlineStages ? ", inline stages" : "", fixShaders ? ", fixes applied by the test" : "");
+           inlineSecond ? ", inline stages second in the chain" : inlineStages ? ", inline stages" : "", fixShaders ? ", fixes applied by the test" : "");
 
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, NULL);
@@ -556,9 +568,20 @@ int main(void) {
     for (qfam = 0; qfam < qn && (qp[qfam].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT); qfam++) {}
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, qfam, 1, &prio};
-    const char* exts[1];
+    const char* exts[2];
     uint32_t extCount = 0;
     if (inlineStages) exts[extCount++] = "VK_KHR_maintenance5";
+    if (inlineSecond) {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(pd, NULL, &count, NULL);
+        VkExtensionProperties* list = calloc(count, sizeof(*list));
+        vkEnumerateDeviceExtensionProperties(pd, NULL, &count, list);
+        bool found = false;
+        for (uint32_t i = 0; list && i < count; i++) found = found || !strcmp(list[i].extensionName, "VK_EXT_pipeline_robustness");
+        free(list);
+        if (!found) { printf("FAIL MQ_INLINE=2 needs VK_EXT_pipeline_robustness\n"); return 1; }
+        exts[extCount++] = "VK_EXT_pipeline_robustness";
+    }
     VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, NULL, VK_TRUE};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, inlineStages ? &m5 : NULL, 0, 1, &qci, 0, NULL, extCount, exts};
     CK(vkCreateDevice(pd, &dci, NULL, &dev));

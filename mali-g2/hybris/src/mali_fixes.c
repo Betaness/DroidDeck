@@ -6,8 +6,11 @@
  *     on them (spirv_clip_cull.h). VORTEK_KEEP_CLIP_DISTANCE=1 keeps them.
  *   - Constant composites built from specialization constants become spec-constant composites: the
  *     Mali compiler folds them at the constituents' defaults (spirv_spec_composite.h), which breaks
- *     DXVK's texture bound checks. Shader modules, inline stages of graphics and compute pipelines.
- *     DROIDDECK_HYBRIS_SPEC_COMPOSITE_FIX=0 (else VORTEK_SPEC_COMPOSITE_FIX=0) leaves them.
+ *     DXVK's texture bound checks. Shader modules, inline stages of graphics, compute and ray tracing
+ *     pipelines (the VkShaderModuleCreateInfo anywhere in the stage's pNext chain,
+ *     stage_inline_module.h), and vkGetShaderModuleCreateInfoIdentifierEXT, so the identifier is the
+ *     one of the module's code. DROIDDECK_HYBRIS_SPEC_COMPOSITE_FIX=0 (else
+ *     VORTEK_SPEC_COMPOSITE_FIX=0) leaves them.
  *   - vkd3d-proton is told storage texel buffers need single-texel alignment only
  *     (VORTEK_STRICT_TEXEL_ALIGNMENT=1 reports the driver's value).
  *   - vkGetImageSubresourceLayout and its 2/2KHR/2EXT and vkGetDeviceImageSubresourceLayout(KHR)
@@ -49,6 +52,7 @@
 
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
+#include "stage_inline_module.h"
 #include "linear_row_pitch.h"
 #include "pipeline_cache.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
@@ -190,9 +194,65 @@ static VkResult VKAPI_CALL CreateShaderModule(VkDevice handle, const VkShaderMod
     return result;
 }
 
-static const VkShaderModuleCreateInfo* inlineModule(const VkPipelineShaderStageCreateInfo* stage) {
-    const VkShaderModuleCreateInfo* next = stage->pNext;
-    return next && next->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO ? next : NULL;
+/* A stage's inline code (VkShaderModuleCreateInfo anywhere in its pNext chain) rewritten: the stage
+ * copy, the rewritten module, its code and the copied structures ahead of it in the chain. */
+typedef struct {
+    VkShaderModuleCreateInfo module;
+    uint32_t* code;
+    DdStageChain chain;
+} StageCopy;
+
+typedef struct {
+    VkPipelineShaderStageCreateInfo* stages; /* NULL: nothing rewritten, use the application's */
+    StageCopy* copies;
+    uint32_t count;
+} StagesRewrite;
+
+static bool anyInline(const VkPipelineShaderStageCreateInfo* stages, uint32_t count) {
+    for (uint32_t s = 0; s < count; s++)
+        if (dd_inline_module(stages[s].pNext)) return true;
+    return false;
+}
+
+/* Copies of `count` stages in *r with their inline code rewritten; false (r->stages NULL) when none
+ * changed. */
+static bool rewriteStages(const VkPipelineShaderStageCreateInfo* stages, uint32_t count, StagesRewrite* r) {
+    memset(r, 0, sizeof(*r));
+    if (!count || !rewritesOn() || !anyInline(stages, count)) return false;
+    r->stages = malloc(count * sizeof(*r->stages));
+    r->copies = calloc(count, sizeof(*r->copies));
+    r->count = count;
+    bool any = false;
+    for (uint32_t s = 0; r->stages && r->copies && s < count; s++) {
+        r->stages[s] = stages[s];
+        const VkShaderModuleCreateInfo* inl = dd_inline_module(stages[s].pNext);
+        StageCopy* c = &r->copies[s];
+        if (!inl || !rewriteShader(inl, &c->module, &c->code)) continue;
+        const void* head = dd_replace_inline_module(stages[s].pNext, inl, &c->module, &c->chain);
+        if (!head) {
+            free(c->code);
+            c->code = NULL;
+            static int logged;
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+                fprintf(stderr, "hybris-icd: inline shader code behind an unknown stage structure left as it is\n");
+            continue;
+        }
+        r->stages[s].pNext = head;
+        any = true;
+    }
+    if (!any) {
+        for (uint32_t s = 0; r->copies && s < count; s++) free(r->copies[s].code);
+        free(r->copies);
+        free(r->stages);
+        memset(r, 0, sizeof(*r));
+    }
+    return any;
+}
+
+static void freeStages(StagesRewrite* r) {
+    for (uint32_t s = 0; r->copies && s < r->count; s++) free(r->copies[s].code);
+    free(r->copies);
+    free(r->stages);
 }
 
 static uint64_t nowNs(void) {
@@ -201,9 +261,9 @@ static uint64_t nowNs(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* Inline stage code (DXVK 3.x, pipeline libraries): a stage whose pNext chain starts with its
- * VkShaderModuleCreateInfo is copied with the rewritten code. Without a cache of the application's,
- * pipelines go through the persistent one (pipeline_cache_hybris.c). */
+/* Inline stage code (DXVK 3.x, pipeline libraries): stages with a VkShaderModuleCreateInfo in their
+ * pNext chain are copied with the rewritten code. Without a cache of the application's, pipelines
+ * go through the persistent one (pipeline_cache_hybris.c). */
 static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCache cache, uint32_t count,
                                                    const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator,
                                                    VkPipeline* pipelines) {
@@ -211,49 +271,23 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCa
     if (!device) return VK_ERROR_DEVICE_LOST;
     VkPipelineCache use = PipelineCache_forGraphics(handle, cache, infos, count);
     uint64_t start = nowNs();
-    uint32_t totalStages = 0;
     bool inline_ = false;
-    for (uint32_t i = 0; i < count && rewritesOn(); i++) {
-        totalStages += infos[i].stageCount;
-        for (uint32_t s = 0; s < infos[i].stageCount; s++) inline_ = inline_ || inlineModule(&infos[i].pStages[s]);
-    }
-    VkGraphicsPipelineCreateInfo* copy = NULL;
-    VkPipelineShaderStageCreateInfo* stages = NULL;
-    VkShaderModuleCreateInfo* modules = NULL;
-    uint32_t** codes = NULL;
-    uint32_t used = 0;
+    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = anyInline(infos[i].pStages, infos[i].stageCount);
+    VkGraphicsPipelineCreateInfo* copy = inline_ ? malloc(count * sizeof(*copy)) : NULL;
+    StagesRewrite* rewrites = inline_ ? calloc(count, sizeof(*rewrites)) : NULL;
     bool any = false;
-    if (inline_) {
-        copy = malloc(count * sizeof(*copy));
-        stages = calloc(totalStages, sizeof(*stages));
-        modules = calloc(totalStages, sizeof(*modules));
-        codes = calloc(totalStages, sizeof(*codes));
-    }
-    if (copy && stages && modules && codes) {
+    if (copy && rewrites) {
         memcpy(copy, infos, count * sizeof(*copy));
         for (uint32_t i = 0; i < count; i++) {
-            bool rewritten = false;
-            uint32_t base = used;
-            for (uint32_t s = 0; s < infos[i].stageCount; s++, used++) {
-                stages[used] = infos[i].pStages[s];
-                const VkShaderModuleCreateInfo* inl = inlineModule(&infos[i].pStages[s]);
-                if (inl && rewriteShader(inl, &modules[used], &codes[used])) {
-                    stages[used].pNext = &modules[used];
-                    rewritten = true;
-                }
-            }
-            if (rewritten) {
-                copy[i].pStages = &stages[base];
-                any = true;
-            }
+            if (!rewriteStages(infos[i].pStages, infos[i].stageCount, &rewrites[i])) continue;
+            copy[i].pStages = rewrites[i].stages;
+            any = true;
         }
     }
     VkResult result = device->CreateGraphicsPipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
     if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
-    for (uint32_t i = 0; codes && i < used; i++) free(codes[i]);
-    free(codes);
-    free(modules);
-    free(stages);
+    for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
+    free(rewrites);
     free(copy);
     return result;
 }
@@ -266,28 +300,66 @@ static VkResult VKAPI_CALL CreateComputePipelines(VkDevice handle, VkPipelineCac
     VkPipelineCache use = PipelineCache_forCompute(handle, cache, infos, count);
     uint64_t start = nowNs();
     bool inline_ = false;
-    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = inlineModule(&infos[i].stage);
+    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = anyInline(&infos[i].stage, 1);
     VkComputePipelineCreateInfo* copy = inline_ ? malloc(count * sizeof(*copy)) : NULL;
-    VkShaderModuleCreateInfo* modules = inline_ ? calloc(count, sizeof(*modules)) : NULL;
-    uint32_t** codes = inline_ ? calloc(count, sizeof(*codes)) : NULL;
+    StagesRewrite* rewrites = inline_ ? calloc(count, sizeof(*rewrites)) : NULL;
     bool any = false;
-    if (copy && modules && codes) {
+    if (copy && rewrites) {
         memcpy(copy, infos, count * sizeof(*copy));
         for (uint32_t i = 0; i < count; i++) {
-            const VkShaderModuleCreateInfo* inl = inlineModule(&infos[i].stage);
-            if (inl && rewriteShader(inl, &modules[i], &codes[i])) {
-                copy[i].stage.pNext = &modules[i];
-                any = true;
-            }
+            if (!rewriteStages(&infos[i].stage, 1, &rewrites[i])) continue;
+            copy[i].stage = rewrites[i].stages[0];
+            any = true;
         }
     }
     VkResult result = device->CreateComputePipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
     if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
-    for (uint32_t i = 0; codes && i < count; i++) free(codes[i]);
-    free(codes);
-    free(modules);
+    for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
+    free(rewrites);
     free(copy);
     return result;
+}
+
+/* Ray tracing stages get the same rewrites (vkd3d-proton's DXR). The copies live until the call
+ * returns, so a call they changed runs without the deferred operation: the driver may read the
+ * create infos until a deferred operation completes. VK_OPERATION_NOT_DEFERRED_KHR says it is done. */
+static VkResult VKAPI_CALL CreateRayTracingPipelinesKHR(VkDevice handle, VkDeferredOperationKHR deferred, VkPipelineCache cache,
+                                                        uint32_t count, const VkRayTracingPipelineCreateInfoKHR* infos,
+                                                        const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    Device* device = icd_device(handle);
+    if (!device || !device->CreateRayTracingPipelinesKHR) return VK_ERROR_DEVICE_LOST;
+    bool inline_ = false;
+    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = anyInline(infos[i].pStages, infos[i].stageCount);
+    VkRayTracingPipelineCreateInfoKHR* copy = inline_ ? malloc(count * sizeof(*copy)) : NULL;
+    StagesRewrite* rewrites = inline_ ? calloc(count, sizeof(*rewrites)) : NULL;
+    bool any = false;
+    if (copy && rewrites) {
+        memcpy(copy, infos, count * sizeof(*copy));
+        for (uint32_t i = 0; i < count; i++) {
+            if (!rewriteStages(infos[i].pStages, infos[i].stageCount, &rewrites[i])) continue;
+            copy[i].pStages = rewrites[i].stages;
+            any = true;
+        }
+    }
+    VkResult result = device->CreateRayTracingPipelinesKHR(handle, any ? VK_NULL_HANDLE : deferred, cache, count, any ? copy : infos,
+                                                           allocator, pipelines);
+    if (any && deferred && result == VK_SUCCESS) result = VK_OPERATION_NOT_DEFERRED_KHR;
+    for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
+    free(rewrites);
+    free(copy);
+    return result;
+}
+
+/* The identifier of the code the module is made of (rewritten), as vkGetShaderModuleIdentifierEXT
+ * of that module gives: DXVK looks pipelines up by it. */
+static void VKAPI_CALL GetShaderModuleCreateInfoIdentifierEXT(VkDevice handle, const VkShaderModuleCreateInfo* info,
+                                                              VkShaderModuleIdentifierEXT* identifier) {
+    Device* device = icd_device(handle);
+    if (!device || !device->GetShaderModuleCreateInfoIdentifierEXT) return;
+    VkShaderModuleCreateInfo rewritten;
+    uint32_t* code = NULL;
+    device->GetShaderModuleCreateInfoIdentifierEXT(handle, rewriteShader(info, &rewritten, &code) ? &rewritten : info, identifier);
+    free(code);
 }
 
 static void fixRowPitch(VkSubresourceLayout* layout) {
@@ -330,6 +402,23 @@ static void VKAPI_CALL GetDeviceImageSubresourceLayout(VkDevice handle, const Vk
 }
 
 /* The wrapper of a layout command the device's driver has (any for VK_NULL_HANDLE), else NULL. */
+/* The wrappers of commands of extensions the driver may lack: handed out when it has them (always
+ * without a device, for vkGetInstanceProcAddr). */
+static PFN_vkVoidFunction driverProc(VkDevice handle, const char* name) {
+    static const struct { const char* name; size_t offset; PFN_vkVoidFunction wrapper; } procs[] = {
+        {"vkCreateRayTracingPipelinesKHR", offsetof(Device, CreateRayTracingPipelinesKHR), (PFN_vkVoidFunction)CreateRayTracingPipelinesKHR},
+        {"vkGetShaderModuleCreateInfoIdentifierEXT", offsetof(Device, GetShaderModuleCreateInfoIdentifierEXT),
+         (PFN_vkVoidFunction)GetShaderModuleCreateInfoIdentifierEXT},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(procs); i++) {
+        if (strcmp(name, procs[i].name)) continue;
+        if (!handle) return procs[i].wrapper;
+        Device* device = icd_device(handle);
+        return device && *(PFN_vkVoidFunction*)((char*)device + procs[i].offset) ? procs[i].wrapper : NULL;
+    }
+    return NULL;
+}
+
 static PFN_vkVoidFunction layoutProc(VkDevice handle, const char* name) {
     static const struct { const char* name; size_t offset; PFN_vkVoidFunction wrapper; } layouts[] = {
         {"vkGetImageSubresourceLayout2", offsetof(Device, GetImageSubresourceLayout2), (PFN_vkVoidFunction)GetImageSubresourceLayout2},
@@ -595,6 +684,8 @@ PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)CreateShaderModule;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
     if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)CreateComputePipelines;
+    if (!strcmp(name, "vkCreateRayTracingPipelinesKHR") || !strcmp(name, "vkGetShaderModuleCreateInfoIdentifierEXT"))
+        return driverProc(handle, name);
     if (!strcmp(name, "vkGetImageSubresourceLayout")) return (PFN_vkVoidFunction)GetImageSubresourceLayout;
     if (!strncmp(name, "vkGet", 5) && strstr(name, "SubresourceLayout")) return layoutProc(handle, name);
     if (!strcmp(name, "vkResetCommandPool")) return (PFN_vkVoidFunction)ResetCommandPool;

@@ -225,13 +225,15 @@ static VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice p
     uint32_t n;
     VkExtensionProperties* all = driverDeviceExtensions(instance, physical, 3, &n);
     if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    /* The Android loader's own business (its swapchain is built on it), not the application's. */
-    for (uint32_t i = 0; i < n; i++) {
-        if (!strcmp(all[i].extensionName, "VK_ANDROID_native_buffer")) {
+    /* VK_ANDROID_native_buffer: the Android loader's own business (its swapchain is built on it), not
+     * the application's. VK_KHR_pipeline_binary: vkCreatePipelineBinariesKHR and vkGetPipelineKeyKHR
+     * would compile and hash the application's SPIR-V unchanged, which mali_fixes.c rewrites
+     * everywhere else (clip distances crash the Mali compiler, spec composites are folded). */
+    for (uint32_t i = 0; i < n;) {
+        if (!strcmp(all[i].extensionName, "VK_ANDROID_native_buffer") || !strcmp(all[i].extensionName, "VK_KHR_pipeline_binary")) {
             memmove(&all[i], &all[i + 1], (n - i - 1) * sizeof(*all));
             n--;
-            break;
-        }
+        } else i++;
     }
     if (!listed(all, n, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
         snprintf(all[n].extensionName, sizeof(all[n].extensionName), "%s", VK_KHR_SWAPCHAIN_EXTENSION_NAME);

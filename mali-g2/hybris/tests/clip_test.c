@@ -2,7 +2,11 @@
  * Builds graphics pipelines whose vertex shader writes ClipDistance / CullDistance (clip.vert), once
  * from a VkShaderModule and once with the code inline in the stage (VK_KHR_maintenance5), through
  * the Vulkan loader (run it with tests/run.sh). Without the ICD's rewrite the Mali shader compiler
- * crashes the process (VORTEK_KEEP_CLIP_DISTANCE=1 shows it). Prints CLIP-PASS / CLIP-FAIL.
+ * crashes the process (VORTEK_KEEP_CLIP_DISTANCE=1 shows it). With VK_EXT_pipeline_robustness the
+ * inline code also comes behind a VkPipelineRobustnessCreateInfoEXT in the stage's chain (valid in
+ * any order; a rewrite that only looked at the first structure crashed there), and with
+ * VK_EXT_shader_module_identifier the identifier of the create info must be the module's (the ICD
+ * hashes the rewritten code for both). Prints CLIP-PASS / CLIP-FAIL.
  * Build: glslangValidator -V --vn clip_vert -o clip_vert.h clip.vert, then cc clip_test.c -lvulkan.
  *
  * This library is free software; you can redistribute it and/or modify it
@@ -11,6 +15,7 @@
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "clip_vert.h"
 
 #define CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { printf("CLIP-FAIL %s -> %d\n", #x, r_); return 1; } } while (0)
@@ -23,13 +28,28 @@ int main(void) {
     uint32_t n = 1;
     VkPhysicalDevice physical;
     CHECK(vkEnumeratePhysicalDevices(instance, &n, &physical));
+    uint32_t extCount = 0;
+    vkEnumerateDeviceExtensionProperties(physical, NULL, &extCount, NULL);
+    VkExtensionProperties* available = calloc(extCount, sizeof(*available));
+    vkEnumerateDeviceExtensionProperties(physical, NULL, &extCount, available);
+    int robustness = 0, identifier = 0;
+    for (uint32_t i = 0; i < extCount; i++) {
+        robustness |= !strcmp(available[i].extensionName, "VK_EXT_pipeline_robustness");
+        identifier |= !strcmp(available[i].extensionName, "VK_EXT_shader_module_identifier");
+    }
+    free(available);
     float priority = 1;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &priority};
     VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, NULL, VK_TRUE};
-    VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &m5};
+    VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT idf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT, &m5,
+                                                             VK_TRUE};
+    VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, identifier ? (void*)&idf : (void*)&m5};
     v13.dynamicRendering = VK_TRUE;
-    const char* extensions[] = {VK_KHR_MAINTENANCE_5_EXTENSION_NAME};
-    VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &v13, 0, 1, &qi, 0, NULL, 1, extensions};
+    const char* extensions[3] = {VK_KHR_MAINTENANCE_5_EXTENSION_NAME};
+    uint32_t enabled = 1;
+    if (robustness) extensions[enabled++] = "VK_EXT_pipeline_robustness";
+    if (identifier) extensions[enabled++] = "VK_EXT_shader_module_identifier";
+    VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &v13, 0, 1, &qi, 0, NULL, enabled, extensions};
     VkDevice device;
     CHECK(vkCreateDevice(physical, &di, NULL, &device));
 
@@ -63,7 +83,7 @@ int main(void) {
     pi.pRasterizationState = &raster;
     pi.pDynamicState = &dynamicState;
     pi.layout = layout;
-    VkPipeline pipelines[2];
+    VkPipeline pipelines[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pi, NULL, &pipelines[0]));
     printf("pipeline from a shader module: created\n");
 
@@ -73,8 +93,28 @@ int main(void) {
     CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pi, NULL, &pipelines[1]));
     printf("pipeline with inline code: created\n");
 
-    vkDestroyPipeline(device, pipelines[0], NULL);
-    vkDestroyPipeline(device, pipelines[1], NULL);
+    if (robustness) {
+        VkPipelineRobustnessCreateInfoEXT robust = {VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT, &inlineCode};
+        stage.pNext = &robust;
+        CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pi, NULL, &pipelines[2]));
+        printf("pipeline with inline code second in the stage's chain: created\n");
+    } else printf("no VK_EXT_pipeline_robustness: inline code second in the chain not tried\n");
+
+    if (identifier) {
+        PFN_vkGetShaderModuleIdentifierEXT moduleId = (PFN_vkGetShaderModuleIdentifierEXT)vkGetDeviceProcAddr(device, "vkGetShaderModuleIdentifierEXT");
+        PFN_vkGetShaderModuleCreateInfoIdentifierEXT infoId =
+            (PFN_vkGetShaderModuleCreateInfoIdentifierEXT)vkGetDeviceProcAddr(device, "vkGetShaderModuleCreateInfoIdentifierEXT");
+        VkShaderModuleIdentifierEXT a = {VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT}, b = {VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT};
+        moduleId(device, module, &a);
+        infoId(device, &code, &b);
+        if (a.identifierSize == 0 || a.identifierSize != b.identifierSize || memcmp(a.identifier, b.identifier, a.identifierSize)) {
+            printf("CLIP-FAIL the create info's identifier (%u bytes) is not the module's (%u bytes)\n", b.identifierSize, a.identifierSize);
+            return 1;
+        }
+        printf("shader module identifier of the create info is the module's (%u bytes)\n", a.identifierSize);
+    } else printf("no VK_EXT_shader_module_identifier: identifiers not compared\n");
+
+    for (int i = 0; i < 3; i++) vkDestroyPipeline(device, pipelines[i], NULL);
     vkDestroyShaderModule(device, module, NULL);
     vkDestroyPipelineLayout(device, layout, NULL);
     vkDestroyDevice(device, NULL);
