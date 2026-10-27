@@ -16,6 +16,8 @@ class ProcScanner(private val proc: File = File("/proc")) {
         val launch: LaunchCmdline.Launch?,
     )
 
+    class LaunchGroup(val appid: Long, val pids: Set<Int>, val startTicks: Long, val exe: String?)
+
     private val known = HashMap<Int, Entry>()
 
     /** The processes alive now. Pids gone since the last scan are forgotten. */
@@ -79,8 +81,6 @@ class ProcScanner(private val proc: File = File("/proc")) {
     }
 
     companion object {
-        class LaunchGroup(val appid: Long, val pids: Set<Int>, val startTicks: Long, val exe: String?)
-
         /** Launches by app id: the pids carrying it (wrapper and reaper), the earliest start and the exe. */
         fun launches(entries: Map<Int, Entry>): Map<Long, LaunchGroup> {
             val byApp = entries.values.filter { it.launch != null }.groupBy { it.launch!!.appid }

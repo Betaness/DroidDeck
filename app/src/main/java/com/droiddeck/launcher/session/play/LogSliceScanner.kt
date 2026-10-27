@@ -56,8 +56,10 @@ class LogSliceScanner(
 
     private class Pattern(val kind: String, val needle: String)
 
-    fun scan(sources: List<Source>, appid: Long? = null): Findings {
-        val f = Findings()
+    fun scan(sources: List<Source>, appid: Long? = null): Findings = Findings().also { scanInto(it, sources, appid) }
+
+    /** Adds [sources] to findings already made. */
+    fun scanInto(f: Findings, sources: List<Source>, appid: Long? = null) {
         for (s in sources) {
             if (!s.file.isFile) continue
             f.sources.add(s.label)
@@ -66,8 +68,10 @@ class LogSliceScanner(
             } catch (_: Exception) {
             }
         }
-        return f
     }
+
+    /** A finding that is not a log line (a crash report folder). */
+    fun note(f: Findings, kind: String, line: String, label: String) = keep(f, kind, line, label)
 
     private fun read(s: Source, each: (String) -> Unit) {
         RandomAccessFile(s.file, "r").use { raf ->

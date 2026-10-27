@@ -69,6 +69,8 @@ public final class WaylandCompositor {
             long interval = now - previous;
             long smoothed = frameIntervalNanos;
             frameIntervalNanos = smoothed == 0 ? interval : (smoothed * 3 + interval) / 4;
+            // [mali-g2] One histogram increment for the play journal's frame times.
+            com.droiddeck.launcher.session.play.FrameTimes.record(interval);
         }
         GameListener l = gameListener;
         if (l != null) l.onGameFrame();

@@ -84,6 +84,12 @@ object AgentGuest {
         }
         main.post { focusRevision++ }
         SessionEvents.record("focus.changed", fields + ("seq" to snapshot.optInt("seq")))
+        // [mali-g2] Time with Steam's menu over the game is left out of the play journal's fps.
+        val focusable = snapshot.optJSONArray("focusableApps")?.let { a -> (0 until a.length()).mapNotNull { a.optLong(it).takeIf { id -> id > 0 } } }
+        com.droiddeck.launcher.session.play.PlayJournal.focus(
+            snapshot.optLong("focusedApp").takeIf { snapshot.has("focusedApp") && !snapshot.isNull("focusedApp") && it > 0 },
+            focusable.orEmpty(),
+        )
     }
 
     fun hello(context: Context): JSONObject? {

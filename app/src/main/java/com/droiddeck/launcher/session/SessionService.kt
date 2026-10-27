@@ -365,6 +365,8 @@ class SessionService : Service() {
 
     private fun collectSessionArtifacts(dir: File, steamArch: String?) {
         try {
+            // [mali-g2] The play journal's last records and .keep markers land before the folder is scrubbed and mirrored.
+            com.droiddeck.launcher.session.play.PlayJournal.finishSession()
             SessionArtifacts.collect(this, dir, "session stopped", steamArch)
         } finally {
             SessionLogCapture.stopFor(dir)
@@ -415,6 +417,8 @@ class SessionService : Service() {
         SessionFiles.stage(this, root, startsSession = true)
         // Earlier sessions' reports still read the Steam logs and VAC marker this session replaces.
         SessionArtifacts.awaitCollections()
+        // [mali-g2] Plays a dead app left open: recorded, and their folders marked to keep, before those are finished.
+        runCatching { com.droiddeck.launcher.session.play.PlayJournal.recover(this) }.onFailure { Log.w(TAG, "play journal recovery", it) }
         SessionArtifacts.finishAbandoned(this)
         SessionArtifacts.mirrorRecent(this) // [mali-g2]
         VacDiagnostics.arm(this)
@@ -424,13 +428,16 @@ class SessionService : Service() {
 
         val sessionDir = openSessionFolder()
         val sessionLog = File(sessionDir, "session.log")
+        val journal = com.droiddeck.launcher.session.play.PlayJournal
+        SessionState.visible = true
+        journal.sessionStarted(this, sessionDir, SessionState.mode, SessionState.program)
 
-        Log.i(TAG, GpuClockPin.start(this))
-        Log.i(TAG, GameThreadHints.start(this))
-        Log.i(TAG, FrameSchedFeed.start(this))
-        Log.i(TAG, HyperOsGameMode.start(this))
-        Log.i(TAG, MiBridgeBoost.start(this))
-        Log.i(TAG, WineServerColocation.start(this))
+        Log.i(TAG, journal.fact("gpuclock", GpuClockPin.start(this)))
+        Log.i(TAG, journal.fact("threads", GameThreadHints.start(this)))
+        Log.i(TAG, journal.fact("schedfeed", FrameSchedFeed.start(this)))
+        Log.i(TAG, journal.fact("joyose", HyperOsGameMode.start(this)))
+        Log.i(TAG, journal.fact("mibridge", MiBridgeBoost.start(this)))
+        Log.i(TAG, journal.fact("colocation", WineServerColocation.start(this)))
 
         val size = SessionState.outputSize
         val guest = ArrayList<String>()
@@ -1480,6 +1487,7 @@ class SessionService : Service() {
     private fun updateSuspendPolicy() {
         if (!SessionState.running) return
         val hidden = !hasVisibleSurface
+        SessionState.visible = !hidden
         val downloadsBlockingSuspend = steamDownloadsInBackground && SessionState.mode == MODE_STEAM &&
             suspendPolicy != SessionPrefs.SUSPEND_NEVER && hidden && downloadActive && !suspendDownloadNow
         if (suspendPolicy == SessionPrefs.SUSPEND_MANUAL && hidden && !downloadsBlockingSuspend) {
@@ -1710,6 +1718,7 @@ class SessionService : Service() {
         val launcherEnded = SessionState.mode == MODE_STEAM || SessionState.mode == MODE_DESKTOP || SessionState.program == NoSteamLaunch.EPIC
         SessionState.stopRequested = false
         SessionEvents.record("guest.exited", mapOf("status" to status))
+        com.droiddeck.launcher.session.play.PlayJournal.sessionStopping(status, SessionState.failureCode)
         GpuClockPin.stop(this)
         GameThreadHints.stop()
         FrameSchedFeed.stop()

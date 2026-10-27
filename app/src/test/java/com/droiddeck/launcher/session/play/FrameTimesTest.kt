@@ -83,5 +83,12 @@ class FrameTimesTest {
         val d = FrameTimes.delta(FrameTimes.snapshot(), before)
         assertEquals(1, d.sum())
         assertEquals(1, d[FrameTimes.bin(16_600)])
+        // A new game: its first frame's gap is the time since the last game's last frame.
+        FrameTimes.forgetGap()
+        FrameTimes.record(90_000_000_000)
+        FrameTimes.record(16_600_000)
+        val e = FrameTimes.delta(FrameTimes.snapshot(), before)
+        assertEquals(2, e.sum())
+        assertEquals(0, e[FrameTimes.BINS - 1])
     }
 }

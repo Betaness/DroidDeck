@@ -25,11 +25,17 @@ object FrameTimes {
 
     private val counts = IntArray(BINS)
 
+    @Volatile private var skipNext = false
+
     @JvmStatic
     fun record(intervalNs: Long) {
+        if (skipNext) { skipNext = false; return }
         if (intervalNs <= 0) return
         counts[bin(intervalNs / 1000)]++
     }
+
+    /** A new game is starting: the gap from the last game's last frame to its first is not a frame time. */
+    fun forgetGap() { skipNext = true }
 
     fun snapshot(): IntArray = counts.copyOf()
 

@@ -39,6 +39,11 @@ object HyperOsGameMode {
 
     val launchCheck = MutableStateFlow(LaunchCheck.NOT_RUN)
 
+    /** [mali-g2] The session's Joyose watch, for the play journal: off, stopping, no-pairing or failed. */
+    @Volatile
+    var joyoseWatch = "off"
+        private set
+
     private var worker: Thread? = null
     private var launchChecked = false
 
@@ -48,6 +53,7 @@ object HyperOsGameMode {
     /** At a session's start. The line is for the log. */
     @Synchronized
     fun start(context: Context): String {
+        joyoseWatch = "off"
         if (!SessionPrefs.stopJoyose(context)) return "joyose: left running (setting off)"
         if (!onO3()) return "joyose: not on this SoC"
         val app = context.applicationContext
@@ -140,19 +146,24 @@ object HyperOsGameMode {
     private fun run(context: Context) {
         val adb = WirelessAdbFix.connectUsingSavedPairing(context)
         if (adb == null) {
+            joyoseWatch = "no-pairing"
             Log.i(TAG, "no wireless debugging pairing, or wireless debugging is off: Joyose keeps running")
             return
         }
         var stops = 0
+        joyoseWatch = "stopping"
         try {
             adb.use {
                 while (!Thread.currentThread().isInterrupted) {
                     if (it.shell(COMMAND).output.contains("stopped") && stops++ < 20) Log.i(TAG, "stopped Joyose")
+                    // [mali-g2] The play journal's temperatures ride on the same connection, every 30 s while a game runs.
+                    com.droiddeck.launcher.session.play.ShellProbe.tick(System.currentTimeMillis()) { cmd -> it.shell(cmd).output }
                     Thread.sleep(CHECK_MS)
                 }
             }
         } catch (_: InterruptedException) {
         } catch (t: Throwable) {
+            joyoseWatch = "failed"
             Log.w(TAG, "stopped watching", t)
         }
     }

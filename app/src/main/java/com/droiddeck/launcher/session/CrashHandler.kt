@@ -20,6 +20,8 @@ object CrashHandler {
                             StringWriter().also { error.printStackTrace(PrintWriter(it)) }.toString()
                     )
                 }
+                // [mali-g2] The open plays as they stand: recorded as killed at the next start.
+                runCatching { com.droiddeck.launcher.session.play.PlayJournal.flushOpen() }
                 val dir = SessionPaths.current()
                 if (dir != null && dir.isDirectory) {
                     val trace = StringWriter().also { error.printStackTrace(PrintWriter(it)) }.toString()

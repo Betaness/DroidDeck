@@ -1766,6 +1766,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        SessionState.freeform = isInMultiWindowMode
         if (refreshActivityDisplayId() && started) {
             SessionService.setActivityDisplay(this, sessionActivityDisplayId)
         }
@@ -1833,8 +1834,19 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun outputFpsLimit(): Int = GlassesRendering.fpsLimit(SessionState.fpsLimit, mirrorRefreshLimit())
 
+    /** [mali-g2] The rate the session asks the panel for: the requested mode (else the current one), after the caps. */
+    private fun wantedRefreshHz(): Float {
+        val display = if (Build.VERSION.SDK_INT >= 30) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
+        val wanted = window.attributes.preferredDisplayModeId
+        val hz = display?.supportedModes?.firstOrNull { wanted != 0 && it.modeId == wanted }?.refreshRate
+            ?: display?.mode?.refreshRate ?: return 0f
+        val mirrorCap = mirrorRefreshLimit().takeIf { it > 0 }?.toFloat() ?: Float.POSITIVE_INFINITY
+        return minOf(hz, PerfMode.peakRefreshCap(this), mirrorCap)
+    }
+
     private fun applyOutputPacing() {
         Log.i(TAG, "perf: " + PerfMode.apply(this, outputFpsLimit(), mirrorRefreshLimit()))
+        SessionState.wantedHz = runCatching { wantedRefreshHz() }.getOrDefault(0f)
         if (CompositorHost.isStarted) {
             val hz = refreshHz()
             val changed = kotlin.math.abs(SessionState.refreshHz - hz) > 0.1f
@@ -2989,6 +3001,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
+        SessionState.freeform = isInMultiWindowMode
         if (refreshActivityDisplayId() && started) {
             SessionService.setActivityDisplay(this, sessionActivityDisplayId)
         }

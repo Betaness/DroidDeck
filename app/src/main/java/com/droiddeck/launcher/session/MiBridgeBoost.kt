@@ -60,6 +60,11 @@ object MiBridgeBoost {
     @Volatile
     private var worker: Thread? = null
 
+    /** [mali-g2] The last answer per kind ("cpu" -> 0 granted, -1 refused...), for the play journal; empty when not holding. */
+    @Volatile
+    var lastResult: Map<String, Int> = emptyMap()
+        private set
+
     /** The setting as stored ([stored] null when unset) to what to hold; "" is off. */
     internal fun spec(stored: String?, onO3: Boolean): String {
         val value = stored?.trim() ?: return if (onO3) DEFAULT_SPEC else ""
@@ -205,7 +210,10 @@ object MiBridgeBoost {
                     val r = request.invoke(booster, uid, h.level, h.timeoutMs) as Int
                     // 0 granted; -1 refused by system_server (a hot board for the CPU, the grant gone, or uniperf);
                     // -2 refused by MiuiBooster itself (its permission flag unset, or another uid)
-                    if (r != last[i]) Log.i(TAG, "${h.kind} level ${h.level}: ${if (r == 0) "granted" else "refused ($r)"}")
+                    if (r != last[i]) {
+                        Log.i(TAG, "${h.kind} level ${h.level}: ${if (r == 0) "granted" else "refused ($r)"}")
+                        lastResult = lastResult + (h.kind to r)
+                    }
                     last[i] = r
                     renewAt[i] = now + if (r == 0) h.renewMs else REFUSED_RETRY_MS
                     if (r == NOT_PERMITTED || (r != 0 && h.kind != "cpu")) notPermitted = true
@@ -227,6 +235,7 @@ object MiBridgeBoost {
         } catch (_: InterruptedException) {
         } finally {
             cancels.forEach { runCatching { it.invoke(booster, uid) } }
+            lastResult = emptyMap()
         }
     }
 }

@@ -71,7 +71,9 @@ class ExitClassifierTest {
             f = findings("Scudo ERROR: out of memory", "hybris-x11: window 0x1 1704x1136 now hidden, frames paced (t=1)")))
         assertEquals("session_stopped", exit.reason)
         assertEquals(listOf("freeze", "low_fps", "oom", "hidden_paced", "at60_thermal", "marked"), exit.flags)
-        assertEquals(listOf("freeze"), ExitClassifier.classify(ev(stall = 12.0)).flags)
+        assertEquals(listOf("freeze"), ExitClassifier.classify(ev(stall = 40.0)).flags)
+        // A loading screen that presents nothing for a while is not one.
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(stall = 12.0)).flags)
         assertEquals(listOf("low_fps"), ExitClassifier.classify(ev(low1 = 5.0)).flags)
     }
 

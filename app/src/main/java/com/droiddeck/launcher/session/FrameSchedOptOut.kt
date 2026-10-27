@@ -21,10 +21,16 @@ object FrameSchedOptOut {
 
     @JvmStatic private external fun nativeDisable(process: String): Int
 
+    /** [mali-g2] What [apply] did in this process, for the play journal; null when it did not run (not the O3). */
+    @Volatile
+    var outcome: String? = null
+        private set
+
     /** At process start, before any window draws. */
     fun apply(context: Context, process: String) {
         if (Build.VERSION.SDK_INT < 31 || Build.SOC_MODEL != "O3") return
         if (!SessionPrefs.frameSchedOptOut(context)) {
+            outcome = "frame reports to SchedGenius left on (setting off)"
             Log.i(TAG, "frame reports to SchedGenius left on (setting off)")
             return
         }
@@ -32,13 +38,16 @@ object FrameSchedOptOut {
             System.loadLibrary("sdnative")
             nativeDisable(process)
         } catch (t: Throwable) {
+            outcome = "frame reports to SchedGenius left on (${t.javaClass.simpleName})"
             Log.w(TAG, "frame reports to SchedGenius left on", t)
             return
         }
-        Log.i(TAG, when (result) {
+        val line = when (result) {
             1 -> "frame reports to SchedGenius turned off"
             0 -> "libmigui not loaded: nothing to turn off"
             else -> "libmigui's FrameSchedPolicy does not look as expected ($result): left as it is"
-        })
+        }
+        outcome = line
+        Log.i(TAG, line)
     }
 }

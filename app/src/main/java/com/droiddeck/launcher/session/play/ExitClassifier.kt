@@ -90,7 +90,7 @@ object ExitClassifier {
         if (reason in setOf("crash", "device_lost", "vortek_exit", "app_killed", "launch_failed")) flags += reason
         if (reason != "crash" && crashLine != null) flags += "crash"
         if (reason != "device_lost" && f?.has("device_lost") == true) flags += "device_lost"
-        if (e.longestZeroRunS >= 30 || (e.longestStallS ?: 0.0) >= 10.0) flags += "freeze"
+        if (e.longestZeroRunS >= 30 || (e.longestStallS ?: 0.0) >= 30.0) flags += "freeze"
         if ((e.meanFpsAfterWarmup != null && e.meanFpsAfterWarmup < 20.0) || (e.low1 != null && e.low1 < 8.0)) flags += "low_fps"
         if (f?.has("oom") == true || e.appKilled?.reason == "LOW_MEMORY") flags += "oom"
         if (f?.has("hidden") == true) flags += "hidden_paced"

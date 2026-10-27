@@ -83,7 +83,9 @@ object SessionArtifacts {
 
     /**
      * [mali-g2] Copy a finished, scrubbed session folder to getExternalFilesDir()/logs, where
-     * `adb shell` can read it (the app is not debuggable, so run-as cannot). Keeps the newest 5.
+     * `adb shell` can read it (the app is not debuggable, so run-as cannot). Which mirrored folders stay,
+     * which are cut to their session's time window and which go is play.MirrorRetention's call: the newest
+     * ten, and older ones the play journal marked (.keep) while their time lasts, within 1 GiB.
      */
     fun mirrorToExternal(context: Context, dir: File) {
         try {
@@ -91,8 +93,15 @@ object SessionArtifacts {
             val dest = File(base, dir.name)
             dest.deleteRecursively()
             dir.copyRecursively(dest, overwrite = true)
-            base.listFiles { f -> f.isDirectory }?.sortedByDescending { it.name }?.drop(5)?.forEach { it.deleteRecursively() }
             Log.i(TAG, "session logs mirrored to $dest")
+            val protect = HashSet<String>()
+            SessionPaths.current()?.let { protect += it.name }
+            collectingLock.lock()
+            try { collecting.forEach { protect += it.name } } finally { collectingLock.unlock() }
+            protect -= dir.name
+            Log.i(TAG, com.droiddeck.launcher.session.play.MirrorRetention.apply(
+                base, System.currentTimeMillis(), base.usableSpace, protect, SessionPaths.chronological, SessionPaths::isSessionFolder,
+            ))
         } catch (e: Exception) {
             Log.w(TAG, "mirroring session logs", e)
         }
@@ -102,7 +111,7 @@ object SessionArtifacts {
     fun mirrorRecent(context: Context) {
         val base = context.getExternalFilesDir(null)?.let { File(it, "logs") }
         LinuxRuntime.logDir(context).listFiles { f -> SessionPaths.isSessionFolder(f) && File(f, COMPLETE_MARKER).exists() }
-            ?.sortedByDescending { it.name }?.take(3)
+            ?.sortedWith(SessionPaths.chronological)?.takeLast(3)
             ?.filter { base == null || !File(base, it.name).exists() }
             ?.forEach { mirrorToExternal(context, it) }
     }
