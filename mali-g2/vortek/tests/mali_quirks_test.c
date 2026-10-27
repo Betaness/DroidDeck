@@ -8,7 +8,9 @@
  *           (OpSelect on a composite of a spec constant, specialized to true), location 1 behind an
  *           ordinary runtime condition that is false (mq_bound.spvasm); with MQ_ENGINE=DXVK
  *           (default) Winlator's removeImageBoundCheck sees it too
- *   linear  vkGetImageSubresourceLayout of LINEAR images of one row (Mali reports rowPitch 0)
+ *   linear  vkGetImageSubresourceLayout of LINEAR images of one row (Mali reports rowPitch 0); with
+ *           MQ_INLINE=1 (maintenance5) also vkGetImageSubresourceLayout2KHR and
+ *           vkGetDeviceImageSubresourceLayoutKHR
  *   dmabuf  images created with VkExternalMemoryImageCreateInfo(DMA_BUF), which Mali refuses (-1000158000):
  *           passes when the format query refuses them too
  *   wire    a triangle covering a 16x16 target drawn with VK_POLYGON_MODE_LINE (fillModeNonSolid,
@@ -485,6 +487,18 @@ static void testLinear(void) {
             if (fixShaders) dd_fix_linear_row_pitch(&l2.subresourceLayout);
             snprintf(d, sizeof(d), "%s through vkGetImageSubresourceLayout2KHR: rowPitch %llu", c->name, (unsigned long long)l2.subresourceLayout.rowPitch);
             result("linear", l2.subresourceLayout.rowPitch == l.rowPitch && l.rowPitch, d);
+        }
+        PFN_vkGetDeviceImageSubresourceLayoutKHR deviceLayout =
+            inlineStages ? (PFN_vkGetDeviceImageSubresourceLayoutKHR)vkGetDeviceProcAddr(dev, "vkGetDeviceImageSubresourceLayoutKHR") : NULL;
+        if (deviceLayout) {
+            VkImageSubresource2KHR sub2 = {VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR, NULL, sub};
+            VkDeviceImageSubresourceInfoKHR info = {VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO_KHR, NULL, &ci, &sub2};
+            VkSubresourceLayout2KHR l3 = {VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_KHR};
+            deviceLayout(dev, &info, &l3);
+            if (fixShaders) dd_fix_linear_row_pitch(&l3.subresourceLayout);
+            snprintf(d, sizeof(d), "%s through vkGetDeviceImageSubresourceLayoutKHR: rowPitch %llu", c->name,
+                     (unsigned long long)l3.subresourceLayout.rowPitch);
+            result("linear", l3.subresourceLayout.rowPitch == l.rowPitch && l.rowPitch, d);
         }
         vkDestroyImage(dev, img, NULL);
     }

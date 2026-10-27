@@ -10,6 +10,9 @@
  *     DROIDDECK_HYBRIS_SPEC_COMPOSITE_FIX=0 (else VORTEK_SPEC_COMPOSITE_FIX=0) leaves them.
  *   - vkd3d-proton is told storage texel buffers need single-texel alignment only
  *     (VORTEK_STRICT_TEXEL_ALIGNMENT=1 reports the driver's value).
+ *   - vkGetImageSubresourceLayout and its 2/2KHR/2EXT and vkGetDeviceImageSubresourceLayout(KHR)
+ *     variants: the rowPitch 0 Mali reports for one-row LINEAR subresources is replaced by the
+ *     row's size (linear_row_pitch.h).
  *   - VK_EXT_vertex_attribute_divisor stands in for the driver's KHR extension (icd.c); its
  *     properties structure is filled from the KHR one here.
  *   - Core features DXVK requires that the Mali lacks are reported, as the Vortek server reports
@@ -37,11 +40,13 @@
  */
 #include "icd.h"
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
+#include "linear_row_pitch.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
 #include "cmd_memory.h"
 
@@ -263,6 +268,65 @@ static VkResult VKAPI_CALL CreateComputePipelines(VkDevice handle, VkPipelineCac
     free(modules);
     free(copy);
     return result;
+}
+
+static void fixRowPitch(VkSubresourceLayout* layout) {
+    if (!dd_fix_linear_row_pitch(layout)) return;
+    static int logged;
+    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "hybris-icd: rowPitch 0 of a one-row linear image reported as %llu (Mali)\n", (unsigned long long)layout->rowPitch);
+}
+
+static void VKAPI_CALL GetImageSubresourceLayout(VkDevice handle, VkImage image, const VkImageSubresource* subresource,
+                                                 VkSubresourceLayout* layout) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    device->GetImageSubresourceLayout(handle, image, subresource, layout);
+    fixRowPitch(layout);
+}
+
+/* vkGetImageSubresourceLayout2, ...2KHR and ...2EXT are one command under three names. */
+static void VKAPI_CALL GetImageSubresourceLayout2(VkDevice handle, VkImage image, const VkImageSubresource2KHR* subresource,
+                                                  VkSubresourceLayout2KHR* layout) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    PFN_vkGetImageSubresourceLayout2KHR next = device->GetImageSubresourceLayout2 ? device->GetImageSubresourceLayout2
+                                             : device->GetImageSubresourceLayout2KHR ? device->GetImageSubresourceLayout2KHR
+                                                                                     : device->GetImageSubresourceLayout2EXT;
+    if (next) next(handle, image, subresource, layout);
+    else device->GetImageSubresourceLayout(handle, image, &subresource->imageSubresource, &layout->subresourceLayout);
+    fixRowPitch(&layout->subresourceLayout);
+}
+
+static void VKAPI_CALL GetDeviceImageSubresourceLayout(VkDevice handle, const VkDeviceImageSubresourceInfoKHR* info,
+                                                       VkSubresourceLayout2KHR* layout) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    PFN_vkGetDeviceImageSubresourceLayoutKHR next =
+        device->GetDeviceImageSubresourceLayout ? device->GetDeviceImageSubresourceLayout : device->GetDeviceImageSubresourceLayoutKHR;
+    if (!next) return;
+    next(handle, info, layout);
+    fixRowPitch(&layout->subresourceLayout);
+}
+
+/* The wrapper of a layout command the device's driver has (any for VK_NULL_HANDLE), else NULL. */
+static PFN_vkVoidFunction layoutProc(VkDevice handle, const char* name) {
+    static const struct { const char* name; size_t offset; PFN_vkVoidFunction wrapper; } layouts[] = {
+        {"vkGetImageSubresourceLayout2", offsetof(Device, GetImageSubresourceLayout2), (PFN_vkVoidFunction)GetImageSubresourceLayout2},
+        {"vkGetImageSubresourceLayout2KHR", offsetof(Device, GetImageSubresourceLayout2KHR), (PFN_vkVoidFunction)GetImageSubresourceLayout2},
+        {"vkGetImageSubresourceLayout2EXT", offsetof(Device, GetImageSubresourceLayout2EXT), (PFN_vkVoidFunction)GetImageSubresourceLayout2},
+        {"vkGetDeviceImageSubresourceLayout", offsetof(Device, GetDeviceImageSubresourceLayout),
+         (PFN_vkVoidFunction)GetDeviceImageSubresourceLayout},
+        {"vkGetDeviceImageSubresourceLayoutKHR", offsetof(Device, GetDeviceImageSubresourceLayoutKHR),
+         (PFN_vkVoidFunction)GetDeviceImageSubresourceLayout},
+    };
+    for (size_t i = 0; i < ARRAY_LEN(layouts); i++) {
+        if (strcmp(name, layouts[i].name)) continue;
+        if (!handle) return layouts[i].wrapper;
+        Device* device = icd_device(handle);
+        return device && *(PFN_vkVoidFunction*)((char*)device + layouts[i].offset) ? layouts[i].wrapper : NULL;
+    }
+    return NULL;
 }
 
 /* *_CMD_RELEASE_*: the DROIDDECK_HYBRIS_ variable, else the VORTEK_ one (droiddeck-env sets those for
@@ -511,6 +575,8 @@ PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)CreateShaderModule;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
     if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)CreateComputePipelines;
+    if (!strcmp(name, "vkGetImageSubresourceLayout")) return (PFN_vkVoidFunction)GetImageSubresourceLayout;
+    if (!strncmp(name, "vkGet", 5) && strstr(name, "SubresourceLayout")) return layoutProc(handle, name);
     if (!strcmp(name, "vkResetCommandPool")) return (PFN_vkVoidFunction)ResetCommandPool;
     if (!strcmp(name, "vkResetCommandBuffer")) return (PFN_vkVoidFunction)ResetCommandBuffer;
     if (releaseEvery() < 0 && (!strncmp(name, "vkCmd", 5) || strstr(name, "Command"))) return trackedProc(handle, name);

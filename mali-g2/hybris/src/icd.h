@@ -84,6 +84,11 @@ typedef struct VkMemoryMapPlacedInfoEXT {
 } VkMemoryMapPlacedInfoEXT;
 #endif
 
+#ifndef VK_VERSION_1_4
+typedef PFN_vkGetImageSubresourceLayout2KHR PFN_vkGetImageSubresourceLayout2;
+typedef PFN_vkGetDeviceImageSubresourceLayoutKHR PFN_vkGetDeviceImageSubresourceLayout;
+#endif
+
 #define MAX_QUEUES 32
 #define PLACED_TABLE_BITS 8
 struct PlacedMemory;
@@ -125,7 +130,9 @@ typedef struct Device {
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) \
     X(ImportSemaphoreFdKHR) X(ImportFenceFdKHR) X(GetFenceFdKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
     X(CreateShaderModule) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
-    X(MapMemory2KHR) X(UnmapMemory2KHR) X(FlushMappedMemoryRanges)
+    X(MapMemory2KHR) X(UnmapMemory2KHR) X(FlushMappedMemoryRanges) X(GetImageSubresourceLayout) X(GetImageSubresourceLayout2) \
+    X(GetImageSubresourceLayout2KHR) X(GetImageSubresourceLayout2EXT) X(GetDeviceImageSubresourceLayout) \
+    X(GetDeviceImageSubresourceLayoutKHR)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
 #undef X
