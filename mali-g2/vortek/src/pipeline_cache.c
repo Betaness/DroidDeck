@@ -26,16 +26,19 @@
  * session that stored the pipeline.
  *
  * File: <dir>/<application>.<driver key>.vkpc. The application is VkApplicationInfo's
- * pApplicationName (DXVK and vkd3d-proton: the .exe name; zink: the process name), else the
- * engine name. The driver key hashes vendorID, deviceID, driverVersion, pipelineCacheUUID and the
- * driver info string (Mali: "v1.r56p0-...", the build), so a driver update starts new files. A
+ * pApplicationName (DXVK and vkd3d-proton: the .exe name; zink: the process name), else the engine
+ * name, followed by -<Steam game id> where the process has one (SteamGameId, else SteamAppId: the
+ * in-process path). The driver key hashes vendorID, deviceID, driverVersion, pipelineCacheUUID and
+ * the driver info string (Mali: "v1.r56p0-...", the build), so a driver update starts new files. A
  * 64-byte header carries the same identity, the data size and a hash of the data; a file that does
  * not match, or whose data does not start with this driver's VkPipelineCacheHeaderVersionOne, is
  * ignored and replaced. Data that passes those checks can still crash the driver (a bug of the
  * driver's own output): <file>.loading exists while the driver parses a file, flock()ed by the
  * parsing process, which removes it before it lets go. A marker nobody holds is what a process that
- * died there left behind: that file is deleted instead of being loaded again (and crashing every
- * start of that game). A marker a live process holds is waited for (up to 10 s, else no load).
+ * died there left behind; it counts the deaths in a row, and at the second the file is deleted
+ * instead of being loaded again (and crashing every start of that game). One death is read once
+ * more: game processes die in a parse for other reasons too. A marker a live process holds is
+ * waited for (up to 10 s, else no load). exit() waits up to 2 s for a parse of another thread.
  *
  * Environment:
  *   VORTEK_PIPELINE_CACHE_DIR       directory of the cache files (made with its parents); unset = no
@@ -80,6 +83,11 @@
 #define MIN_SAVE_INTERVAL_NS 10000000000ull
 #define STALE_TEMP_S 600
 #define MARKER_WAIT_MS 10000
+/* a parse holds parseLock for the marker wait plus the driver's parse of at most a 64 MB file */
+#define PARSE_LOCK_WAIT_MS (MARKER_WAIT_MS + 5000)
+#define EXIT_WAIT_MS 2000
+/* deaths during a parse of the same file before it is taken for one that crashes the driver */
+#define MARKER_DEATHS 2
 #define HIST_BUCKETS 5
 
 typedef struct {
@@ -94,7 +102,7 @@ typedef struct CacheEntry {
     VkPipelineCache cache;
     DriverIdentity identity;
     char path[PATH_MAX];
-    char name[80];
+    char name[104];
     /* what is on disk as far as this entry knows (written or read by it) */
     bool knownExists;
     struct timespec knownMtime;
@@ -117,9 +125,11 @@ static size_t maxFileBytes, maxTotalBytes;
 static uint64_t maxUnsavedNs;
 
 static pthread_mutex_t tableLock = PTHREAD_MUTEX_INITIALIZER;
-/* one driver parse of file data (load or merge) at a time, so the .loading marker is unambiguous */
+/* one driver parse of file data (load or merge) at a time, so the .loading marker is unambiguous;
+ * taken with a time limit (lockParse): its holder may be a thread that is gone */
 static pthread_mutex_t parseLock = PTHREAD_MUTEX_INITIALIZER;
-static bool exiting; /* under parseLock */
+static int exiting;          /* atomic: exit() has begun, no parse starts */
+static uintptr_t parseOwner; /* atomic: the thread holding parseLock, 0 for none */
 /* one save at a time: two writers of one file would each rename over the other's data */
 static pthread_mutex_t saveLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t idleCond = PTHREAD_COND_INITIALIZER;
@@ -257,13 +267,16 @@ static bool sameFile(const struct stat* a, const struct stat* b) {
 }
 
 /* <path>.loading for this process, created under a temporary name, locked and renamed into place,
- * so no other process sees it unlocked; -1 when it could not be made (the parse goes ahead). */
-static int publishMarker(const char* marker) {
+ * so no other process sees it unlocked; -1 when it could not be made (the parse goes ahead). It
+ * holds the number of parses of the file in a row that this one makes (`deaths` died before it). */
+static int publishMarker(const char* marker, int deaths) {
     char tmp[PATH_MAX + 48];
     snprintf(tmp, sizeof(tmp), "%s.tmp-%d", marker, getpid());
     int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX) != 0 || rename(tmp, marker) != 0) {
+    char text[16];
+    int length = snprintf(text, sizeof(text), "%d\n", deaths + 1);
+    if (write(fd, text, length) != length || flock(fd, LOCK_EX) != 0 || rename(tmp, marker) != 0) {
         unlink(tmp);
         close(fd);
         return -1;
@@ -274,52 +287,88 @@ static int publishMarker(const char* marker) {
 typedef enum { MARKER_NONE, MARKER_STALE, MARKER_BUSY } MarkerState;
 
 /* Whether <path>.loading is there and nobody holds it (left by a process that died while the driver
- * parsed the file), or a live process parses it now (waited for up to MARKER_WAIT_MS first). The
- * parser removes the marker before it unlocks, so a marker that is still in place once its lock is
- * free is stale. */
-static MarkerState checkMarker(const char* marker) {
+ * parsed the file: *deaths gets how many parses in a row did), or a live process parses it now
+ * (waited for up to MARKER_WAIT_MS first, less once exit() has begun). The parser removes the
+ * marker before it unlocks, so a marker that is still in place once its lock is free is stale. */
+static MarkerState checkMarker(const char* marker, int* deaths) {
     for (int waited = 0;; waited += 20) {
         int fd = open(marker, O_RDONLY | O_CLOEXEC);
         if (fd < 0) return MARKER_NONE;
         if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
             struct stat held, now;
             bool stale = fstat(fd, &held) == 0 && stat(marker, &now) == 0 && sameFile(&held, &now);
+            char text[16] = {0};
+            if (stale && pread(fd, text, sizeof(text) - 1, 0) < 0) text[0] = 0;
             close(fd);
-            if (stale) return MARKER_STALE;
+            if (stale) {
+                *deaths = atoi(text); /* a marker of an older build is empty: one death */
+                if (*deaths < 1) *deaths = 1;
+                return MARKER_STALE;
+            }
             continue;
         }
         close(fd);
-        if (waited >= MARKER_WAIT_MS) return MARKER_BUSY;
+        if (waited >= MARKER_WAIT_MS || __atomic_load_n(&exiting, __ATOMIC_ACQUIRE)) return MARKER_BUSY;
         usleep(20000);
     }
 }
 
+/* parseLock, waiting at most `ms`: false when its holder takes longer (or is a thread that was
+ * killed in a parse, Wine's way of ending threads) */
+static bool lockParse(int ms) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += ms / 1000;
+    until.tv_nsec += (long)(ms % 1000) * 1000000;
+    if (until.tv_nsec >= 1000000000) {
+        until.tv_sec++;
+        until.tv_nsec -= 1000000000;
+    }
+    if (pthread_mutex_timedlock(&parseLock, &until) != 0) return false;
+    __atomic_store_n(&parseOwner, (uintptr_t)pthread_self(), __ATOMIC_RELEASE);
+    return true;
+}
+
+static void unlockParse(void) {
+    __atomic_store_n(&parseOwner, 0, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&parseLock);
+}
+
 /* vkCreatePipelineCache from file data with <path>.loading present while the driver parses it.
- * False (and the file deleted) when a previous process died there; also false, without parsing,
- * when another one has been parsing it for too long or this process is exiting. */
+ * False (and the file deleted) when processes died there MARKER_DEATHS times in a row: a process
+ * also dies in a parse for other reasons (killed at the end of a session, another thread crashed,
+ * the game quit), so the first death only makes this parse count the second. Also false, without
+ * parsing, when another one has been parsing it for too long or this process is exiting. */
 static bool createFromFileData(VkDevice device, const char* path, const char* name, const void* data, size_t size, VkPipelineCache* cache,
                                VkResult* result) {
     char marker[PATH_MAX + 16];
     snprintf(marker, sizeof(marker), "%s.loading", path);
-    pthread_mutex_lock(&parseLock);
-    if (exiting) {
-        pthread_mutex_unlock(&parseLock);
+    if (__atomic_load_n(&exiting, __ATOMIC_ACQUIRE)) return false;
+    if (!lockParse(PARSE_LOCK_WAIT_MS)) {
+        PCACHE_LOG("pipeline cache %s: another thread has been reading a cache file for %d s, not read", name, PARSE_LOCK_WAIT_MS / 1000);
         return false;
     }
-    MarkerState state = checkMarker(marker);
-    if (state != MARKER_NONE) {
+    if (__atomic_load_n(&exiting, __ATOMIC_ACQUIRE)) {
+        unlockParse();
+        return false;
+    }
+    int deaths = 0;
+    MarkerState state = checkMarker(marker, &deaths);
+    if (state == MARKER_BUSY || (state == MARKER_STALE && deaths >= MARKER_DEATHS)) {
         if (state == MARKER_STALE) {
             unlink(path);
             unlink(marker);
         }
-        pthread_mutex_unlock(&parseLock);
+        unlockParse();
         if (state == MARKER_STALE)
-            PCACHE_LOG("pipeline cache %s: a process died while the driver read this file last time, deleted it", name);
-        else
+            PCACHE_LOG("pipeline cache %s: processes died while the driver read this file the last %d times, deleted it", name, deaths);
+        else if (!__atomic_load_n(&exiting, __ATOMIC_ACQUIRE))
             PCACHE_LOG("pipeline cache %s: another process has been reading this file for %d s, not loaded", name, MARKER_WAIT_MS / 1000);
         return false;
     }
-    int fd = publishMarker(marker);
+    if (state == MARKER_STALE)
+        PCACHE_LOG("pipeline cache %s: a process died while the driver read this file last time, reading it once more", name);
+    int fd = publishMarker(marker, deaths);
     VkPipelineCacheCreateInfo info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, size, data};
     *result = PCACHE_VK(device, CreatePipelineCache)(device, &info, NULL, cache);
     if (fd >= 0) {
@@ -327,17 +376,19 @@ static bool createFromFileData(VkDevice device, const char* path, const char* na
         if (fstat(fd, &mine) == 0 && stat(marker, &now) == 0 && sameFile(&mine, &now)) unlink(marker);
         close(fd);
     }
-    pthread_mutex_unlock(&parseLock);
+    unlockParse();
     return true;
 }
 
-/* exit() while another thread has the driver parse a file would leave a marker nobody holds, and
- * the next start would take the file for one that crashed the driver: exit waits for a parse under
- * way, and none starts after it. */
+/* exit() while another thread has the driver parse a file would leave a marker nobody holds, which
+ * the next start counts as a death in the driver: exit waits for a parse under way (a marker wait
+ * gives up), and none starts after it. Not for long, and not at all from inside the parse: the
+ * holder may be a thread that will never let go (Wine kills a thread by unwinding it to its start,
+ * a crash in the driver ends in exit() on the parsing thread). */
 static void waitForParsesAtExit(void) {
-    pthread_mutex_lock(&parseLock);
-    exiting = true;
-    pthread_mutex_unlock(&parseLock);
+    __atomic_store_n(&exiting, 1, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&parseOwner, __ATOMIC_ACQUIRE) == (uintptr_t)pthread_self()) return;
+    if (lockParse(EXIT_WAIT_MS)) unlockParse();
 }
 
 /* The pipeline cache data of a valid file (malloc'd, *size bytes), or NULL; *st gets its stat. */
@@ -379,6 +430,20 @@ static void sanitize(char* out, size_t outSize, const char* in) {
     }
     out[n] = 0;
     if (n == 0 || out[0] == '.') snprintf(out, outSize, "unknown");
+}
+
+/* The Steam game this process belongs to (Steam sets SteamGameId and SteamAppId for what it starts,
+ * Proton reads them), or NULL: games whose .exe has the same name (game.exe, Launcher.exe) would
+ * share a file, which keeps growing as the union of both until the size limit stops all saves.
+ * Only seen in the game's process (the in-process path), not by the Vortek server. */
+static const char* steamGameId(void) {
+    static const char* const names[] = {"SteamGameId", "SteamAppId"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char* id = getenv(names[i]);
+        if (!id || !*id || strlen(id) > 20 || strspn(id, "0123456789") != strlen(id) || strspn(id, "0") == strlen(id)) continue;
+        return id;
+    }
+    return NULL;
 }
 
 typedef struct { time_t t; long ns; off_t size; char name[256]; } DirItem;
@@ -604,6 +669,11 @@ void PipelineCache_deviceCreated(VkPhysicalDevice physicalDevice, VkDevice devic
     e->device = device;
     driverIdentity(physicalDevice, &e->identity);
     sanitize(e->name, sizeof(e->name), appName && *appName ? appName : engineName);
+    const char* game = steamGameId();
+    if (game) {
+        size_t length = strlen(e->name);
+        snprintf(e->name + length, sizeof(e->name) - length, "-%s", game);
+    }
     if (snprintf(e->path, sizeof(e->path), "%s/%s.%016llx.vkpc", cacheDir, e->name, (unsigned long long)e->identity.driverKey) >=
         (int)sizeof(e->path)) {
         free(e);

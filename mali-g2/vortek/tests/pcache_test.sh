@@ -19,7 +19,9 @@
 #  8 ident     vertex libraries asked for by shader module identifier (DXVK's recompiles) do not
 #              come from the cache (PC_IDENT: none of them may be created without compiling)
 #  9 marker    a <file>.loading left behind (the server died while the driver parsed the file):
-#              the file is deleted instead of loaded, the run is cold, the next one warm again
+#              one death (an empty marker of an older build, too) is read once more: warm, the
+#              marker gone; two in a row ("2"): the file is deleted instead of loaded, the run is
+#              cold, the next one warm again
 # 10 no-merge  device X only takes pipelines from the file while device Y adds new ones and
 #              saves: X's save finds nothing of its own missing and writes nothing
 # 11 own       the application passes its own cache (PC_CACHE_FILE), over 1 MB, and saves it:
@@ -186,10 +188,19 @@ grep -q '^PC ident: 0/20 ' $tmp/ident.out || fail "ident: $(grep '^PC ident' $tm
 f=$(ls $c1/*.vkpc | head -1)
 : >"$f.loading"
 start_server $c1
+run $tmp/marker1.out
+sleep 1
+kill_server
+grep -q 'died while the driver read this file last time, reading it once more' $log || fail "marker: one death was not read once more"
+grep -q 'deleted it' $log && fail "marker: the file was deleted after one death"
+[ -e "$f.loading" ] && fail "marker: the .loading marker stayed after a good load"
+check_warm $tmp/cold.out $tmp/marker1.out
+echo 2 >"$f.loading"
+start_server $c1
 run $tmp/marker.out
 sleep 1
 kill_server
-grep -q 'died while the driver read' $log || fail "marker: the file was loaded despite its .loading marker"
+grep -q 'died while the driver read this file the last 2 times, deleted it' $log || fail "marker: the file was loaded despite two deaths"
 [ -e "$f.loading" ] && fail "marker: the .loading marker stayed"
 check_cold $tmp/cold.out $tmp/marker.out
 start_server $c1
