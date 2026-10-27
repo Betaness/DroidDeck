@@ -24,7 +24,7 @@ GUEST_DIR=${GUEST_DIR:-/usr/local/lib/droiddeck-hybris}
 CC=${CC:-cc}
 
 LIBHYBRIS_URL=https://github.com/taowen/libhybris.git
-LIBHYBRIS_COMMIT=2375acd0b5d278a0a2f745c645680545e8f80539   # arlinux branch, 2026-10
+LIBHYBRIS_COMMIT=7076971ba6a2fe8834cb0f3aaf4ee721cc1b678d   # arlinux branch, 2026-10-27
 HEADERS_URL=https://github.com/Halium/android-headers.git
 HEADERS_COMMIT=2c6ac3dcc4f8db593dd69906b0ec22822abfed91     # Android 11 headers
 
