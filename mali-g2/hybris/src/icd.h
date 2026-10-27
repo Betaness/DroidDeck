@@ -58,7 +58,35 @@ typedef struct Instance {
 #undef X
 } Instance;
 
+#ifndef VK_EXT_map_memory_placed
+#define VK_EXT_map_memory_placed 1
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT ((VkStructureType)1000272000)
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT ((VkStructureType)1000272001)
+#define VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT ((VkStructureType)1000272002)
+#define VK_MEMORY_MAP_PLACED_BIT_EXT 0x00000001
+#define VK_MEMORY_UNMAP_RESERVE_BIT_EXT 0x00000001
+typedef struct VkPhysicalDeviceMapMemoryPlacedFeaturesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 memoryMapPlaced;
+    VkBool32 memoryMapRangePlaced;
+    VkBool32 memoryUnmapReserve;
+} VkPhysicalDeviceMapMemoryPlacedFeaturesEXT;
+typedef struct VkPhysicalDeviceMapMemoryPlacedPropertiesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkDeviceSize minPlacedMemoryMapAlignment;
+} VkPhysicalDeviceMapMemoryPlacedPropertiesEXT;
+typedef struct VkMemoryMapPlacedInfoEXT {
+    VkStructureType sType;
+    const void* pNext;
+    void* pPlacedAddress;
+} VkMemoryMapPlacedInfoEXT;
+#endif
+
 #define MAX_QUEUES 32
+#define PLACED_TABLE_BITS 8
+struct PlacedMemory;
 
 typedef struct Device {
     VkDevice handle;
@@ -79,6 +107,12 @@ typedef struct Device {
     uint32_t internalFamily;
     bool lockQueue;
     pthread_mutex_t queueLock;
+    /* VK_EXT_map_memory_placed enabled (placed.c): host-visible memory by VkDeviceMemory. */
+    bool placed;
+    pthread_mutex_t placedLock;
+    struct PlacedMemory* placedTable[1u << PLACED_TABLE_BITS];
+    PFN_vkMapMemory2KHR MapMemory2;
+    PFN_vkUnmapMemory2KHR UnmapMemory2;
 #define DEVICE_FUNCS(X) \
     X(DestroyDevice) X(GetDeviceQueue) X(GetDeviceQueue2) X(QueueSubmit) X(QueueSubmit2) X(QueueSubmit2KHR) X(QueueWaitIdle) \
     X(QueueBindSparse) X(DeviceWaitIdle) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(AllocateMemory) \
@@ -87,7 +121,8 @@ typedef struct Device {
     X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) \
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) \
     X(ImportSemaphoreFdKHR) X(ImportFenceFdKHR) X(GetFenceFdKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
-    X(CreateShaderModule) X(CreateGraphicsPipelines) X(ResetCommandPool) X(ResetCommandBuffer)
+    X(CreateShaderModule) X(CreateGraphicsPipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(MapMemory2KHR) X(UnmapMemory2KHR) \
+    X(FlushMappedMemoryRanges)
 #define X(name) PFN_vk##name name;
     DEVICE_FUNCS(X)
 #undef X
@@ -118,5 +153,17 @@ PFN_vkVoidFunction mali_device_proc(const char* name);
  * but missing in the driver are turned off in `enabled`. */
 void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled);
 void mali_device_created(Device* device);
+
+/* placed.c */
+extern const char* const placed_extension;
+extern const char* const placed_needs[];
+extern const uint32_t placed_need_count;
+bool placed_wanted(void);
+bool icd_placed_available(Instance* instance, VkPhysicalDevice physical);
+void placed_fill_features(void* chain);
+void placed_fill_properties(void* chain);
+void placed_device_created(Device* device);
+void placed_device_destroyed(Device* device);
+PFN_vkVoidFunction placed_device_proc(Device* device, const char* name);
 
 #endif

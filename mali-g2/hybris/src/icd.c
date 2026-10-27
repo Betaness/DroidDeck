@@ -162,6 +162,21 @@ static VkExtensionProperties* driverDeviceExtensions(Instance* instance, VkPhysi
     return list;
 }
 
+static bool placedAvailable(const VkExtensionProperties* list, uint32_t count) {
+    if (!placed_wanted() || listed(list, count, placed_extension)) return false;
+    for (uint32_t i = 0; i < placed_need_count; i++)
+        if (!listed(list, count, placed_needs[i])) return false;
+    return true;
+}
+
+bool icd_placed_available(Instance* instance, VkPhysicalDevice physical) {
+    uint32_t n;
+    VkExtensionProperties* all = driverDeviceExtensions(instance, physical, 0, &n);
+    bool available = all && placedAvailable(all, n);
+    free(all);
+    return available;
+}
+
 static const char* const DIVISOR_EXT = "VK_EXT_vertex_attribute_divisor";
 static const char* const DIVISOR_KHR = "VK_KHR_vertex_attribute_divisor";
 
@@ -192,7 +207,7 @@ static VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice p
     if (!instance) return VK_ERROR_INITIALIZATION_FAILED;
     if (layer) return instance->EnumerateDeviceExtensionProperties(physical, layer, count, properties);
     uint32_t n;
-    VkExtensionProperties* all = driverDeviceExtensions(instance, physical, 2, &n);
+    VkExtensionProperties* all = driverDeviceExtensions(instance, physical, 3, &n);
     if (!all) return VK_ERROR_OUT_OF_HOST_MEMORY;
     /* The Android loader's own business (its swapchain is built on it), not the application's. */
     for (uint32_t i = 0; i < n; i++) {
@@ -211,6 +226,10 @@ static VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice p
     if (listed(all, n, DIVISOR_KHR) && !listed(all, n, DIVISOR_EXT)) {
         snprintf(all[n].extensionName, sizeof(all[n].extensionName), "%s", DIVISOR_EXT);
         all[n++].specVersion = 3;
+    }
+    if (placedAvailable(all, n)) {
+        snprintf(all[n].extensionName, sizeof(all[n].extensionName), "%s", placed_extension);
+        all[n++].specVersion = 1;
     }
     VkResult result = copyOut(all, n, count, properties);
     free(all);
@@ -334,7 +353,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
     if (!instance) return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t driverCount;
     VkExtensionProperties* driverList = driverDeviceExtensions(instance, physical, 0, &driverCount);
-    const char** names = calloc(info->enabledExtensionCount + ARRAY_LEN(swapchainSupport) + 1, sizeof(*names));
+    const char** names = calloc(info->enabledExtensionCount + ARRAY_LEN(swapchainSupport) + placed_need_count + 1, sizeof(*names));
     Device* device = calloc(1, sizeof(*device));
     uint32_t familyCount = 0;
     instance->GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, NULL);
@@ -348,10 +367,15 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
     instance->GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, families);
 
     uint32_t appCount = 0;
+    bool placed = false, ownPlaced = !listed(driverList, driverCount, placed_extension);
     for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {
         const char* name = info->ppEnabledExtensionNames[i];
         if (!strcmp(name, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
             device->swapchainEnabled = true;
+            continue;
+        }
+        if (ownPlaced && !strcmp(name, placed_extension)) {
+            placed = true;
             continue;
         }
         if (!strcmp(name, DIVISOR_EXT)) name = DIVISOR_KHR;
@@ -362,6 +386,9 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
         for (uint32_t i = 0; i < ARRAY_LEN(swapchainSupport); i++)
             if (listed(driverList, driverCount, swapchainSupport[i]) && !named(names, count, swapchainSupport[i]))
                 names[count++] = swapchainSupport[i];
+    if (placed)
+        for (uint32_t i = 0; i < placed_need_count; i++)
+            if (!named(names, count, placed_needs[i])) names[count++] = placed_needs[i];
 
     /* A queue of our own in the first graphics family, when the application leaves one free. */
     uint32_t graphics = UINT32_MAX;
@@ -403,6 +430,17 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
         mali_drop_emulated_features(instance, physical, &chained->features);
     }
 
+    /* The driver does not have the placed-map features: unlinked for the call, put back after it. */
+    VkBaseOutStructure* placedPrev = NULL;
+    for (VkBaseOutStructure* s = (VkBaseOutStructure*)info; ownPlaced && s->pNext; s = s->pNext) {
+        if (s->pNext->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) {
+            placedPrev = s;
+            break;
+        }
+    }
+    VkBaseOutStructure* placedFeatures = placedPrev ? placedPrev->pNext : NULL;
+    if (placedFeatures) placedPrev->pNext = placedFeatures->pNext;
+
     VkDeviceCreateInfo copy = *info;
     if (info->pEnabledFeatures) copy.pEnabledFeatures = &enabled;
     copy.enabledExtensionCount = count;
@@ -421,6 +459,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
         result = instance->CreateDevice(physical, &copy, allocator, out);
     }
     if (chained && !info->pEnabledFeatures) chained->features = chainedSaved;
+    if (placedFeatures) placedPrev->pNext = placedFeatures;
     if (result != VK_SUCCESS) {
         free(driverList); free(names); free(device); free(families); free(queueInfos); free(priorities);
         return result;
@@ -429,6 +468,8 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
     device->handle = *out;
     device->physical = physical;
     device->instance = instance;
+    device->placed = placed;
+    for (uint32_t i = 0; i < placed_need_count; i++) device->placed = device->placed && named(names, count, placed_needs[i]);
 #define X(name) device->name = (PFN_vk##name)instance->GetDeviceProcAddr(*out, "vk" #name);
     DEVICE_FUNCS(X)
 #undef X
@@ -439,6 +480,9 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDevic
     instance->GetPhysicalDeviceMemoryProperties(physical, &device->memory);
     pthread_mutex_init(&device->queueLock, NULL);
     mali_device_created(device);
+    placed_device_created(device);
+    if (placed && !device->placed)
+        fprintf(stderr, "hybris-icd: VK_EXT_map_memory_placed asked for, but the device was created without dma-buf import\n");
 
     for (uint32_t i = 0; i < info->queueCreateInfoCount; i++) {
         const VkDeviceQueueCreateInfo* q = &info->pQueueCreateInfos[i];
@@ -495,6 +539,7 @@ static void VKAPI_CALL DestroyDevice(VkDevice handle, const VkAllocationCallback
     if (*link) *link = device->next;
     pthread_mutex_unlock(&registryLock);
     device->DestroyDevice(handle, allocator);
+    placed_device_destroyed(device);
     pthread_mutex_destroy(&device->queueLock);
     free(device);
 }
@@ -582,6 +627,7 @@ static PFN_vkVoidFunction ownDeviceProc(VkDevice handle, const char* name) {
     if (!f) f = mali_device_proc(name);
     if (f) return f;
     Device* device = handle ? icd_device(handle) : NULL;
+    if ((f = placed_device_proc(device, name))) return f;
     if (device && device->lockQueue) {
         if (!strcmp(name, "vkQueueSubmit")) return (PFN_vkVoidFunction)LockedQueueSubmit;
         if (!strcmp(name, "vkQueueSubmit2")) return device->QueueSubmit2 ? (PFN_vkVoidFunction)LockedQueueSubmit2 : NULL;

@@ -81,6 +81,7 @@ static void* low(size_t size) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
     VkInstance inst;
@@ -332,6 +333,73 @@ int main(void) {
                 if (mmap(at[i], size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != at[i]) failures++;
             }
         }
+        /* An optimal image (a D3D9 backbuffer) in the host-visible memory images get on the Mali,
+         * cleared by the GPU and copied into a buffer mapped below 4 GB. */
+        VkImageCreateInfo oi = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_B8G8R8A8_UNORM, .extent = {1024, 768, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        VkImage img;
+        CHECK("optimal image: vkCreateImage 1024x768", vkCreateImage(dev, &oi, NULL, &img));
+        VkMemoryRequirements ir;
+        vkGetImageMemoryRequirements(dev, img, &ir);
+        uint32_t it = 0, bt = 0;
+        while (it < mp.memoryTypeCount && !((ir.memoryTypeBits >> it) & 1)) it++;
+        VkBuffer out;
+        plain.size = 1024 * 768 * 4;
+        vkCreateBuffer(dev, &plain, NULL, &out);
+        vkGetBufferMemoryRequirements(dev, out, &req);
+        while (bt < mp.memoryTypeCount && !(((req.memoryTypeBits >> bt) & 1) &&
+                                            (mp.memoryTypes[bt].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))) bt++;
+        printf("  image memory type %u (0x%x), readback buffer type %u\n", it, mp.memoryTypes[it].propertyFlags, bt);
+        VkMemoryAllocateInfo iai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = ir.size, .memoryTypeIndex = it};
+        VkMemoryAllocateInfo bai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = bt};
+        VkDeviceMemory imem, bmem;
+        CHECK("  allocate image memory", vkAllocateMemory(dev, &iai, NULL, &imem));
+        CHECK("  vkBindImageMemory", vkBindImageMemory(dev, img, imem, 0));
+        CHECK("  allocate readback memory", vkAllocateMemory(dev, &bai, NULL, &bmem));
+        CHECK("  vkBindBufferMemory", vkBindBufferMemory(dev, out, bmem, 0));
+        VkMemoryMapPlacedInfoEXT pi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = lowMem};
+        VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pi, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
+                                 .memory = bmem, .size = VK_WHOLE_SIZE};
+        uint32_t* px = NULL;
+        CHECK("  map the readback buffer below 4 GB", map2KHR(dev, &mi, (void**)&px));
+        VkCommandBufferBeginInfo bi3 = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkBeginCommandBuffer(cmd, &bi3);
+        VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .image = img, .subresourceRange = range};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+        VkClearColorValue color = {.float32 = {1.0f, 0.0f, 1.0f, 1.0f}};
+        vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+        ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+        VkBufferImageCopy region = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {1024, 768, 1}};
+        vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out, 1, &region);
+        VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+        CHECK("  GPU clear and copy", vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+        vkQueueWaitIdle(queue);
+        VkMappedMemoryRange br = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = bmem, .size = VK_WHOLE_SIZE};
+        vkInvalidateMappedMemoryRanges(dev, 1, &br);
+        size_t wrong = 0;
+        for (size_t i = 0; px && i < 1024 * 768; i++) wrong += px[i] != 0xffff00ffu;
+        printf("  cleared image read back below 4 GB: %s (pixel 0 %08x)\n", wrong ? "NO  <-- FAIL" : "yes", px ? px[0] : 0);
+        if (wrong) failures++;
+        VkMemoryUnmapInfoKHR ui = {.sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, .memory = bmem, .flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT};
+        unmap2KHR(dev, &ui);
+        vkDestroyBuffer(dev, out, NULL);
+        vkDestroyImage(dev, img, NULL);
+        vkFreeMemory(dev, bmem, NULL);
+        vkFreeMemory(dev, imem, NULL);
         vkDestroyCommandPool(dev, pool, NULL);
     }
 

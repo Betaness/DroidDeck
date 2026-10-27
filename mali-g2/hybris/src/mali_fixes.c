@@ -67,6 +67,9 @@ static void VKAPI_CALL GetPhysicalDeviceProperties2(VkPhysicalDevice physical, V
             findInChain(properties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES);
         if (tba) tba->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
     }
+    if (findInChain(properties->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT) &&
+        icd_placed_available(instance, physical))
+        placed_fill_properties(properties->pNext);
 }
 
 static bool clipStripOn(void) {
@@ -95,6 +98,9 @@ static void VKAPI_CALL GetPhysicalDeviceFeatures2(VkPhysicalDevice physical, VkP
     if (!instance) return;
     instance->GetPhysicalDeviceFeatures2(physical, features);
     emulateFeatures(&features->features);
+    if (findInChain(features->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) &&
+        icd_placed_available(instance, physical))
+        placed_fill_features(features->pNext);
 }
 
 void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled) {

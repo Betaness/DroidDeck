@@ -8,8 +8,10 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 
 默认关闭。会话设置 `gpuPath` 为 `hybris` 时只有**游戏**走这条路，Steam 客户端（网页界面）仍走 Vortek。
 玄戒 O3 上能跑的游戏更快（半屏鸭科夫标题 88.2±0.8 对 Vortek 78.5±1.0 fps，主线程 10.32 对 10.99 ms/帧，13 个会话没有崩溃），
-但 32 位游戏起不来：A.V.A.（D3D9，WoW64）建交换链图像失败（`Failed to create image: -1000158000`），DXVK 映射内存报
-`VK_ERROR_OUT_OF_HOST_MEMORY`，游戏约一分钟后退出；同一会话走 Vortek 时交换链正常建好。所以还不默认打开。
+9451a6f3 时 32 位游戏起不来：A.V.A.（D3D9，WoW64）建交换链图像失败（`Failed to create image: -1000158000`），DXVK 映射内存报
+`VK_ERROR_OUT_OF_HOST_MEMORY`，游戏约一分钟后退出；同一会话走 Vortek 时交换链正常建好。原因是 Mali 没有
+`VK_EXT_map_memory_placed`，WoW64 的 winevulkan 退到 `VK_EXT_external_memory_host`，而这条路在 Mali 上两处都不通
+（`tests/wow64_memory_test.c`）；`src/placed.c` 补上了这个扩展，还没在设备上测，所以还不默认打开。
 
 ## 组成
 
@@ -21,6 +23,7 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 | `src/icd.c`, `src/icd.h` | guest 加载器看到的 ICD。dlopen 同目录 `lib/libhybris-vulkan-icd.so.0`（libhybris 的 glibc ICD：实例由安卓的 libvulkan 创建，设备和命令直接进 HAL），只拦截需要的入口，其余原样交给它；不包装句柄。有交换链的设备在图形队列族里多要一个队列给 acquire 用，没有空余时用应用的队列并加锁 |
 | `src/wsi.c` | X11 WSI：`VK_KHR_surface`、`VK_KHR_xcb_surface`、`VK_KHR_xlib_surface`、`VK_KHR_get_surface_capabilities2`、`VK_KHR_swapchain`。交换链图像是 AHardwareBuffer（`VK_ANDROID_external_memory_android_hardware_buffer` 导入），经 `$VORTEK_PRESENT_SOCKET` 用 Vortek 的零拷贝协议（`../vortek/src/zero_copy.c`，原样编译）交给合成器显示；acquire 把合成器的释放栅栏导入应用的信号量/栅栏（`headless_swapchain.c` 的做法）。是否能走合成器图层由 X 窗口树决定（`client_x11_present.c` 的逻辑：被别的窗口挡住、被父窗口裁剪、带 alpha 时拷贝进窗口，完全被挡时按 10 fps 节流），两份代码合在一个进程里 |
 | `src/mali_fixes.c` | Vortek 客户端里属于驱动问题的补丁：去掉 ClipDistance/CullDistance 写入（`../vortek/src/spirv_clip_cull.h`，和 Vortek 共用；不去掉 Mali 编译器在本进程里段错误，见测试）、vkd3d-proton 的 storage texel buffer 对齐、`VK_EXT_vertex_attribute_divisor` 别名；驱动没有、DXVK 又要求的核心特性 fillModeNonSolid、shaderClipDistance、shaderCullDistance 照 Vortek 服务端的做法报成支持，建设备时再关掉（没有它们 DXVK 找不到设备：`Skipping: Device does not support required feature 'fillModeNonSolid'`）。maintenance5/6、GPL、扩展过滤表（`ext_commands.h`）都是 Vortek 协议的需要，原生驱动不用。另外照 Vortek 服务端（`winlator-0018`）拦截 `vkResetCommandPool`/`vkResetCommandBuffer`：同一个池或命令缓冲每第 N 次重置加上 `RELEASE_RESOURCES`（N 取 `DROIDDECK_HYBRIS_CMD_RELEASE_EVERY`，没有时取 `VORTEK_CMD_RELEASE_EVERY`，默认 32；1 每次都释放，0 不释放；256 格的表加锁，多线程重置安全）。Mali 在同时录了查询的命令缓冲里每次 `vkCmdBeginRendering` 留约 420 字节主机堆，不带这个标志的重置不还，DXVK 用 0 重置池，不这样做游戏进程每分钟涨几十 MB 直到崩溃 |
+| `src/placed.c` | Mali 没有的 `VK_EXT_map_memory_placed`，给 WoW64 的 Wine（32 位游戏的映射要在 4 GB 以下）。Wine 在设备有它时用 `vkMapMemory2KHR` 把内存映射到自己预留的低地址，没有时退到 `VK_EXT_external_memory_host`：给每个 `vkCreateImage` 加 `HOST_ALLOCATION_BIT_EXT`（Mali 返回 -1000158000），主机可见内存导入低地址的匿名内存（Mali 只有缓存、非一致的类型能导入，0x7 类型找不到替代，驱动映射在 4 GB 以上，Wine 报 `VK_ERROR_OUT_OF_HOST_MEMORY`）。照 Vortek 客户端和服务端的做法：开了这个扩展的设备上，主机可见内存是 system-uncached 堆的 dma-buf，按应用要的类型导入，placed 映射就是把 dma-buf mmap 到调用者给的地址，解除映射时按 `VK_MEMORY_UNMAP_RESERVE_BIT_EXT` 保留地址范围；这种内存的 flush/invalidate 不进驱动（驱动按自己的映射做，没有映射时空指针崩溃），改成 dma-buf 同步。别的内存、没开扩展的设备（64 位游戏）不经过这里。`DROIDDECK_HYBRIS_MAP_PLACED=0` 隐藏扩展 |
 | `src/ahb.c`, `src/compat/android/hardware_buffer.h` | AHardwareBuffer 调用经 libhybris 转到设备的 `libnativewindow.so`（分配走 gralloc 的 binder 服务，和普通 App 一样） |
 | `tests/` | 见下 |
 
@@ -72,6 +75,9 @@ glslangValidator -V --vn clip_vert -o out/tests/clip_vert.h tests/clip.vert && c
 sh tests/run.sh out/tests/clip_test           # 写 ClipDistance 的管线；VORTEK_KEEP_CLIP_DISTANCE=1 时驱动段错误
 sh tests/frame_leak_test.sh        # ../vortek/tests/frame_leak_test.c 在本进程里（离屏，每帧 16 个渲染过程 + 时间戳查询），
                                    # 量进程自己的堆：分别用 vkResetCommandPool 和 vkResetCommandBuffer，释放关掉时每帧约涨 6.7 KB，默认 0
+cc -o out/tests/wow64_memory_test tests/wow64_memory_test.c -lvulkan && sh tests/run.sh out/tests/wow64_memory_test
+                                   # WoW64 winevulkan 对驱动的调用：设备有 placed 映射时把每种主机可见类型映射到 4 GB 以下，
+                                   # GPU 拷贝和填充后核对两边的数据；DROIDDECK_HYBRIS_MAP_PLACED=0 时复现 -1000158000 和 4 GB 以上的映射
 ```
 
 ## 只能在设备上测的

@@ -1,0 +1,308 @@
+/*
+ * VK_EXT_map_memory_placed, which the Mali lacks, for WoW64 Wine: 32-bit games need their mappings
+ * below 4 GB. Without it winevulkan falls back to VK_EXT_external_memory_host, which fails on the
+ * Mali (vkCreateImage -1000158000 with HOST_ALLOCATION_BIT_EXT, and mappings of the 0x7 types above
+ * 4 GB; tests/wow64_memory_test.c). As the Vortek client and server do it: on a device that enables
+ * the extension, host-visible memory is a dma-buf from the system-uncached heap imported into the
+ * requested type, and a placed map is an mmap of that dma-buf at the caller's address. Other memory
+ * and other devices go to the driver untouched. DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
+ *
+ * This library is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 2.1 or later.
+ */
+#define _GNU_SOURCE
+#include "icd.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+const char* const placed_extension = "VK_EXT_map_memory_placed";
+const char* const placed_needs[] = {
+    "VK_KHR_map_memory2",
+    "VK_KHR_external_memory",
+    "VK_KHR_external_memory_fd",
+    "VK_EXT_external_memory_dma_buf",
+};
+const uint32_t placed_need_count = ARRAY_LEN(placed_needs);
+
+typedef struct PlacedMemory {
+    VkDeviceMemory memory;
+    int fd;
+    VkDeviceSize size;
+    void* at;
+    struct PlacedMemory* next;
+} PlacedMemory;
+
+bool placed_wanted(void) {
+    return icd_env_int("DROIDDECK_HYBRIS_MAP_PLACED", 1) != 0;
+}
+
+void placed_fill_features(void* chain) {
+    for (VkBaseOutStructure* s = chain; s; s = s->pNext) {
+        if (s->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT) continue;
+        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT* f = (VkPhysicalDeviceMapMemoryPlacedFeaturesEXT*)s;
+        f->memoryMapPlaced = VK_TRUE;
+        f->memoryMapRangePlaced = VK_FALSE;
+        f->memoryUnmapReserve = VK_TRUE;
+    }
+}
+
+void placed_fill_properties(void* chain) {
+    for (VkBaseOutStructure* s = chain; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT)
+            ((VkPhysicalDeviceMapMemoryPlacedPropertiesEXT*)s)->minPlacedMemoryMapAlignment = (VkDeviceSize)sysconf(_SC_PAGESIZE);
+}
+
+static int dmabufAlloc(VkDeviceSize size) {
+    static const char* const heaps[] = {"/dev/dma_heap/system-uncached", "/dev/dma_heap/system"};
+    for (size_t i = 0; i < ARRAY_LEN(heaps); i++) {
+        int heap = open(heaps[i], O_RDONLY | O_CLOEXEC);
+        if (heap < 0) continue;
+        struct dma_heap_allocation_data data = {.len = size, .fd_flags = O_RDWR | O_CLOEXEC};
+        int result;
+        do result = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &data);
+        while (result < 0 && (errno == EINTR || errno == EAGAIN));
+        close(heap);
+        if (result == 0) return (int)data.fd;
+    }
+    return -1;
+}
+
+static PlacedMemory** slot(Device* device, VkDeviceMemory memory) {
+    uint64_t key = (uint64_t)memory;
+    PlacedMemory** link = &device->placedTable[(key * 0x9E3779B97F4A7C15ull) >> (64 - PLACED_TABLE_BITS)];
+    while (*link && (*link)->memory != memory) link = &(*link)->next;
+    return link;
+}
+
+static PlacedMemory* find(Device* device, VkDeviceMemory memory) {
+    pthread_mutex_lock(&device->placedLock);
+    PlacedMemory* found = *slot(device, memory);
+    pthread_mutex_unlock(&device->placedLock);
+    return found;
+}
+
+static bool importsOrExports(const void* chain) {
+    for (const VkBaseInStructure* s = chain; s; s = s->pNext) {
+        switch ((int)s->sType) {
+        case VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR:
+        case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
+        case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID:
+        case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+static void logOnce(int* flag, const char* message, int value) {
+    if (!__atomic_exchange_n(flag, 1, __ATOMIC_RELAXED)) fprintf(stderr, "hybris-icd: %s (%d)\n", message, value);
+}
+
+static VkResult VKAPI_CALL AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator,
+                                          VkDeviceMemory* memory) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    if (!device->placed || info->memoryTypeIndex >= device->memory.memoryTypeCount ||
+        !(device->memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+        importsOrExports(info->pNext))
+        return device->AllocateMemory(handle, info, allocator, memory);
+
+    static int okLogged, failLogged;
+    long page = sysconf(_SC_PAGESIZE);
+    VkDeviceSize size = (info->allocationSize + page - 1) & ~(VkDeviceSize)(page - 1);
+    PlacedMemory* record = calloc(1, sizeof(*record));
+    int fd = record ? dmabufAlloc(size) : -1;
+    int driverFd = fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (driverFd < 0) {
+        logOnce(&failLogged, "no dma-buf for host-visible memory, placed maps of it will fail", errno);
+        if (fd >= 0) close(fd);
+        free(record);
+        return device->AllocateMemory(handle, info, allocator, memory);
+    }
+    VkImportMemoryFdInfoKHR import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .pNext = info->pNext,
+                                      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = driverFd};
+    VkMemoryAllocateInfo copy = *info;
+    copy.pNext = &import;
+    VkResult result = device->AllocateMemory(handle, &copy, allocator, memory);
+    if (result != VK_SUCCESS) {
+        logOnce(&failLogged, "importing a dma-buf as host-visible memory failed, placed maps of it will fail", result);
+        close(driverFd);
+        close(fd);
+        free(record);
+        return device->AllocateMemory(handle, info, allocator, memory);
+    }
+    logOnce(&okLogged, "host-visible memory is dma-buf backed for placed maps, first type", (int)info->memoryTypeIndex);
+    record->memory = *memory;
+    record->fd = fd;
+    record->size = size;
+    pthread_mutex_lock(&device->placedLock);
+    PlacedMemory** link = slot(device, *memory);
+    record->next = *link;
+    *link = record;
+    pthread_mutex_unlock(&device->placedLock);
+    return VK_SUCCESS;
+}
+
+static void unmapPlaced(PlacedMemory* record, bool reserve) {
+    if (!record->at) return;
+    if (!reserve || mmap(record->at, record->size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) == MAP_FAILED)
+        munmap(record->at, record->size);
+    record->at = NULL;
+}
+
+static void VKAPI_CALL FreeMemory(VkDevice handle, VkDeviceMemory memory, const VkAllocationCallbacks* allocator) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    if (memory) {
+        pthread_mutex_lock(&device->placedLock);
+        PlacedMemory** link = slot(device, memory);
+        PlacedMemory* record = *link;
+        if (record) *link = record->next;
+        pthread_mutex_unlock(&device->placedLock);
+        if (record) {
+            unmapPlaced(record, false);
+            close(record->fd);
+            free(record);
+        }
+    }
+    device->FreeMemory(handle, memory, allocator);
+}
+
+static VkResult mapMemory2(VkDevice handle, const VkMemoryMapInfoKHR* info, void** data, bool core) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    PFN_vkMapMemory2KHR next = core && device->MapMemory2 ? device->MapMemory2 : device->MapMemory2KHR;
+    if (!next) next = device->MapMemory2;
+    if (!(info->flags & VK_MEMORY_MAP_PLACED_BIT_EXT)) return next ? next(handle, info, data) : VK_ERROR_MEMORY_MAP_FAILED;
+
+    const VkMemoryMapPlacedInfoEXT* where = NULL;
+    for (const VkBaseInStructure* s = info->pNext; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT) where = (const VkMemoryMapPlacedInfoEXT*)s;
+    PlacedMemory* record = find(device, info->memory);
+    static int notBacked;
+    if (!record) logOnce(&notBacked, "placed map of memory without a dma-buf", 0);
+    if (!record || !where || !where->pPlacedAddress || info->offset || record->at) return VK_ERROR_MEMORY_MAP_FAILED;
+    void* at = mmap(where->pPlacedAddress, record->size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, record->fd, 0);
+    if (at == MAP_FAILED) return VK_ERROR_MEMORY_MAP_FAILED;
+    record->at = at;
+    *data = at;
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL MapMemory2KHR(VkDevice handle, const VkMemoryMapInfoKHR* info, void** data) {
+    return mapMemory2(handle, info, data, false);
+}
+
+static VkResult VKAPI_CALL MapMemory2(VkDevice handle, const VkMemoryMapInfoKHR* info, void** data) {
+    return mapMemory2(handle, info, data, true);
+}
+
+static VkResult unmapMemory2(VkDevice handle, const VkMemoryUnmapInfoKHR* info, bool core) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    PlacedMemory* record = find(device, info->memory);
+    if (record && record->at) {
+        unmapPlaced(record, info->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT);
+        return VK_SUCCESS;
+    }
+    PFN_vkUnmapMemory2KHR next = core && device->UnmapMemory2 ? device->UnmapMemory2 : device->UnmapMemory2KHR;
+    if (!next) next = device->UnmapMemory2;
+    if (next) return next(handle, info);
+    device->UnmapMemory(handle, info->memory);
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL UnmapMemory2KHR(VkDevice handle, const VkMemoryUnmapInfoKHR* info) {
+    return unmapMemory2(handle, info, false);
+}
+
+static VkResult VKAPI_CALL UnmapMemory2(VkDevice handle, const VkMemoryUnmapInfoKHR* info) {
+    return unmapMemory2(handle, info, true);
+}
+
+static void VKAPI_CALL UnmapMemory(VkDevice handle, VkDeviceMemory memory) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    PlacedMemory* record = find(device, memory);
+    if (record && record->at) unmapPlaced(record, false);
+    else device->UnmapMemory(handle, memory);
+}
+
+/* The driver flushes and invalidates through its own mapping, which placed memory does not have (it
+ * dereferences a null one); the dma-buf is synced instead. */
+static VkResult syncRanges(VkDevice handle, uint32_t count, const VkMappedMemoryRange* ranges, bool flush) {
+    Device* device = icd_device(handle);
+    if (!device) return VK_ERROR_DEVICE_LOST;
+    VkMappedMemoryRange* rest = NULL;
+    uint32_t restCount = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        PlacedMemory* record = find(device, ranges[i].memory);
+        if (record && record->at) {
+            uint64_t direction = flush ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ;
+            struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | direction};
+            ioctl(record->fd, DMA_BUF_IOCTL_SYNC, &sync);
+            sync.flags = DMA_BUF_SYNC_END | direction;
+            ioctl(record->fd, DMA_BUF_IOCTL_SYNC, &sync);
+            continue;
+        }
+        if (!rest && !(rest = malloc(count * sizeof(*rest)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        rest[restCount++] = ranges[i];
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    VkResult result = VK_SUCCESS;
+    if (restCount)
+        result = flush ? device->FlushMappedMemoryRanges(handle, restCount, rest) : device->InvalidateMappedMemoryRanges(handle, restCount, rest);
+    free(rest);
+    return result;
+}
+
+static VkResult VKAPI_CALL FlushMappedMemoryRanges(VkDevice handle, uint32_t count, const VkMappedMemoryRange* ranges) {
+    return syncRanges(handle, count, ranges, true);
+}
+
+static VkResult VKAPI_CALL InvalidateMappedMemoryRanges(VkDevice handle, uint32_t count, const VkMappedMemoryRange* ranges) {
+    return syncRanges(handle, count, ranges, false);
+}
+
+void placed_device_created(Device* device) {
+    pthread_mutex_init(&device->placedLock, NULL);
+    device->MapMemory2 = (PFN_vkMapMemory2KHR)device->instance->GetDeviceProcAddr(device->handle, "vkMapMemory2");
+    device->UnmapMemory2 = (PFN_vkUnmapMemory2KHR)device->instance->GetDeviceProcAddr(device->handle, "vkUnmapMemory2");
+}
+
+void placed_device_destroyed(Device* device) {
+    for (uint32_t i = 0; i < ARRAY_LEN(device->placedTable); i++) {
+        while (device->placedTable[i]) {
+            PlacedMemory* record = device->placedTable[i];
+            device->placedTable[i] = record->next;
+            unmapPlaced(record, false);
+            close(record->fd);
+            free(record);
+        }
+    }
+    pthread_mutex_destroy(&device->placedLock);
+}
+
+PFN_vkVoidFunction placed_device_proc(Device* device, const char* name) {
+    if (!device || !device->placed) return NULL;
+    if (!strcmp(name, "vkAllocateMemory")) return (PFN_vkVoidFunction)AllocateMemory;
+    if (!strcmp(name, "vkFreeMemory")) return (PFN_vkVoidFunction)FreeMemory;
+    if (!strcmp(name, "vkMapMemory2KHR")) return (PFN_vkVoidFunction)MapMemory2KHR;
+    if (!strcmp(name, "vkMapMemory2")) return (PFN_vkVoidFunction)MapMemory2;
+    if (!strcmp(name, "vkUnmapMemory2KHR")) return (PFN_vkVoidFunction)UnmapMemory2KHR;
+    if (!strcmp(name, "vkUnmapMemory2")) return (PFN_vkVoidFunction)UnmapMemory2;
+    if (!strcmp(name, "vkUnmapMemory")) return (PFN_vkVoidFunction)UnmapMemory;
+    if (!strcmp(name, "vkFlushMappedMemoryRanges")) return (PFN_vkVoidFunction)FlushMappedMemoryRanges;
+    if (!strcmp(name, "vkInvalidateMappedMemoryRanges")) return (PFN_vkVoidFunction)InvalidateMappedMemoryRanges;
+    return NULL;
+}
