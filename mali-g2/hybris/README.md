@@ -20,6 +20,7 @@ Vortek（`../vortek`）把游戏的每个 Vulkan 调用经 socket 转发给 App 
 | `build.sh` | 按固定提交拉取 libhybris 和 Halium android-headers，打 `patches/`，编出 libhybris（common、hardware、Vulkan ICD、q 链接器）和 `libdroiddeck_hybris_vk.so`，生成 guest 的目录树和 ICD 清单。在 aarch64 glibc 环境里跑（PalmCode 的 Ubuntu 24.04、CI 的 ubuntu-24.04-arm），glibc 不高于 guest（Arch Linux ARM）即可 |
 | `patches/libhybris-0001-static-tls-4096.patch` | `BIONIC_STATIC_TLS_SIZE` 1024 → 4096：`libGLES_mali.so` 的 TLS 段 832 字节、偏移 400，放不进原来的静态 TLS |
 | `patches/libhybris-0002-common-exports.patch` | libhybris-common 用版本脚本只导出 `hybris_*`、`android_*` 等自己的入口（和 `my_property_*`）：它被预加载进游戏的每个进程，自带的 `strlcpy`/`strlcat`、`native_handle_*` 等通用符号不能顶替 glibc 的（`nm -D` 可查） |
+| `patches/libhybris-0003-tls-thunk-fast-path.patch` | 驱动里每条 `mrs xN, tpidr_el0`（`libGLES_mali.so` 有 80861 处，96.5% 是读栈保护值）跳到的 TLS 跳板：原来每次都把 x16/x17/x30 存到栈上再检查本线程的 bionic TLS 有没有建好（2 次写、3 次读）；改为在目标寄存器里检查（mrs、add、add、ldr、cbz，再算一次地址返回：1 次读，不碰栈，不改标志位），只有线程第一次进驱动时才保存寄存器、调用初始化。跳板大小（80 字节）和初始化函数不变 |
 | `src/icd.c`, `src/icd.h` | guest 加载器看到的 ICD。dlopen 同目录 `lib/libhybris-vulkan-icd.so.0`（libhybris 的 glibc ICD：实例由安卓的 libvulkan 创建，设备和命令直接进 HAL），只拦截需要的入口，其余原样交给它；不包装句柄。有交换链的设备在图形队列族里多要一个队列给 acquire 用，没有空余时用应用的队列并加锁 |
 | `src/wsi.c` | X11 WSI：`VK_KHR_surface`、`VK_KHR_xcb_surface`、`VK_KHR_xlib_surface`、`VK_KHR_get_surface_capabilities2`、`VK_KHR_swapchain`。交换链图像是 AHardwareBuffer（`VK_ANDROID_external_memory_android_hardware_buffer` 导入），经 `$VORTEK_PRESENT_SOCKET` 用 Vortek 的零拷贝协议（`../vortek/src/zero_copy.c`，原样编译）交给合成器显示；acquire 把合成器的释放栅栏导入应用的信号量/栅栏（`headless_swapchain.c` 的做法）。是否能走合成器图层由 X 窗口树决定（`client_x11_present.c` 的逻辑：被别的窗口挡住、被父窗口裁剪、带 alpha 时拷贝进窗口，完全被挡时按 10 fps 节流），两份代码合在一个进程里 |
 | `src/mali_fixes.c` | Vortek 客户端里属于驱动问题的补丁：去掉 ClipDistance/CullDistance 写入（`../vortek/src/spirv_clip_cull.h`，和 Vortek 共用；不去掉 Mali 编译器在本进程里段错误，见测试）、vkd3d-proton 的 storage texel buffer 对齐、`VK_EXT_vertex_attribute_divisor` 别名；驱动没有、DXVK 又要求的核心特性 fillModeNonSolid、shaderClipDistance、shaderCullDistance 照 Vortek 服务端的做法报成支持，建设备时再关掉（没有它们 DXVK 找不到设备：`Skipping: Device does not support required feature 'fillModeNonSolid'`）。maintenance5/6、GPL、扩展过滤表（`ext_commands.h`）都是 Vortek 协议的需要，原生驱动不用。另外照 Vortek 服务端（`winlator-0018`）拦截 `vkResetCommandPool`/`vkResetCommandBuffer`：同一个池或命令缓冲每第 N 次重置加上 `RELEASE_RESOURCES`（N 取 `DROIDDECK_HYBRIS_CMD_RELEASE_EVERY`，没有时取 `VORTEK_CMD_RELEASE_EVERY`，默认 32；1 每次都释放，0 不释放；256 格的表加锁，多线程重置安全）。Mali 在同时录了查询的命令缓冲里每次 `vkCmdBeginRendering` 留约 420 字节主机堆，不带这个标志的重置不还，DXVK 用 0 重置池，不这样做游戏进程每分钟涨几十 MB 直到崩溃 |
@@ -73,6 +74,9 @@ sh tests/compositor_test.sh        # 合成器自己的 vortek_present.c（Surfa
                                    # 再用 presenter_probe 测同进程重连和放不进链 key 的 id
 glslangValidator -V --vn clip_vert -o out/tests/clip_vert.h tests/clip.vert && cc -Iout/tests -o out/tests/clip_test tests/clip_test.c -lvulkan
 sh tests/run.sh out/tests/clip_test           # 写 ClipDistance 的管线；VORTEK_KEEP_CLIP_DISTANCE=1 时驱动段错误
+cc -O2 -o out/tests/thread_tls_test tests/thread_tls_test.c -lvulkan -lpthread && sh tests/run.sh out/tests/thread_tls_test
+                                   # 3 轮各 16 个新 glibc 线程直接进驱动（TLS 跳板第一次走初始化、之后走快路径），录制、提交、核对 GPU 写的数据；
+                                   # TT_BENCH=1 另测主线程录制每条命令的耗时
 sh tests/frame_leak_test.sh        # ../vortek/tests/frame_leak_test.c 在本进程里（离屏，每帧 16 个渲染过程 + 时间戳查询），
                                    # 量进程自己的堆：分别用 vkResetCommandPool 和 vkResetCommandBuffer，释放关掉时每帧约涨 6.7 KB，默认 0
 cc -o out/tests/wow64_memory_test tests/wow64_memory_test.c -lvulkan && sh tests/run.sh out/tests/wow64_memory_test

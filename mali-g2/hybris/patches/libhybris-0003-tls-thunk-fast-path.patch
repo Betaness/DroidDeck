@@ -1,0 +1,80 @@
+The TLS thunk for every `mrs xN, tpidr_el0` in vendor code (80861 sites in Mali-G2's libGLES_mali.so,
+96.5% of them stack-guard reads) checks that the thread's bionic TLS is set up before it returns the
+address. It did so through x16/x17 saved on the stack: two stores, three loads and a stack pointer
+round trip on every execution. Do the check in the target register, which the MRS writes anyway:
+mrs, add, add, ldr [xT, #8], cbz, then mrs, add, add, b back on initialized threads (one load, no
+stack, flags untouched as CBZ sets none); only first touch saves x16, x17, x30, calls the helper and
+rejoins. Same 80-byte thunk size and the same first-touch helper.
+
+--- a/hybris/common/tls_patcher_aarch64.c
++++ b/hybris/common/tls_patcher_aarch64.c
+@@ -55,11 +55,17 @@ static size_t hybris_count_tls_arch(void* segment_addr, size_t segment_size) {
+ /* Preserve MRS semantics, including registers and flags. A new glibc thread
+  * can enter vendor code without passing any libc hook or TLSDESC resolver.
+  * Check the bionic pthread shadow on every read; only first touch calls the
+- * register-preserving slow helper. No helper runs on initialized threads. */
++ * register-preserving slow helper. No helper runs on initialized threads.
++ *
++ * The check runs in the target register itself, which the MRS writes anyway:
++ * the fast path is one load and no stack traffic (CBZ leaves the flags alone).
++ * Only first touch saves x16, x17 and x30, calls the helper and joins the
++ * fast path to compute the address again. */
+ static void generate_tls_thunk(int tls_offset_words, uint32_t target_register,
+                                void* mrs_location, void* thunk) {
+     uint32_t* code = (uint32_t*)thunk;
+     int64_t tls_offset_bytes = (int64_t)tls_offset_words * 8;
++    uint32_t rt = target_register;
+ 
+     if (tls_offset_bytes < 0 || tls_offset_bytes > 0xFFFFFF) {
+         fprintf(stderr, "HYBRIS: fatal: TLS offset %lld bytes exceeds 24-bit range (max %d)\n",
+@@ -72,7 +78,7 @@ static void generate_tls_thunk(int tls_offset_words, uint32_t target_register,
+ 
+     /* Calculate branch offset back to the instruction after the original MRS */
+     void* return_addr = (char*)mrs_location + 4;
+-    intptr_t return_diff = (intptr_t)return_addr - (intptr_t)((char*)thunk + 60);
++    intptr_t return_diff = (intptr_t)return_addr - (intptr_t)((char*)thunk + 32);
+     if (return_diff % 4 != 0 || return_diff / 4 < -(1 << 25) || return_diff / 4 >= (1 << 25)) {
+         fprintf(stderr, "HYBRIS: fatal: return branch from thunk %p to %p out of range\n",
+                 thunk, return_addr);
+@@ -80,25 +86,24 @@ static void generate_tls_thunk(int tls_offset_words, uint32_t target_register,
+     }
+     int32_t return_offset = return_diff / 4;
+ 
+-    code[0] = 0xa9be47f0; /* stp x16, x17, [sp, #-32]! */
+-    code[1] = 0xf9000bfe; /* str x30, [sp, #16] */
+-    code[2] = 0xd53bd050; /* mrs x16, tpidr_el0 */
+-    code[3] = 0x91000210 | (imm_lo << 10);
+-    code[4] = 0x91400210 | (imm_hi << 10);
+-    code[5] = 0xf9400611; /* ldr x17, [x16, #8]: bionic pthread shadow */
+-    code[6] = 0xb5000091; /* cbnz x17, +16 (restore) */
+-    code[7] = 0x58000131; /* ldr x17, +36 (helper pointer) */
+-    code[8] = 0xd63f0220; /* blr x17 */
+-    code[9] = 0xd503201f; /* nop */
+-    code[10] = 0xf9400bfe; /* ldr x30, [sp, #16] */
+-    code[11] = 0xa8c247f0; /* ldp x16, x17, [sp], #32 */
+-    code[12] = 0xd53bd040 | target_register;
+-    code[13] = 0x91000000 | (target_register << 5) | target_register | (imm_lo << 10);
+-    code[14] = 0x91400000 | (target_register << 5) | target_register | (imm_hi << 10);
+-    code[15] = 0x14000000 | (return_offset & 0x3ffffff);
++    code[0] = 0xd53bd040 | rt;                                 /* mrs xT, tpidr_el0 */
++    code[1] = 0x91000000 | (rt << 5) | rt | (imm_lo << 10);    /* add xT, xT, #lo */
++    code[2] = 0x91400000 | (rt << 5) | rt | (imm_hi << 10);    /* add xT, xT, #hi, lsl #12 */
++    code[3] = 0xf9400400 | (rt << 5) | rt;                     /* ldr xT, [xT, #8]: bionic pthread shadow */
++    code[4] = 0xb4000000 | (5 << 5) | rt;                      /* cbz xT, first touch (code[9]) */
++    code[5] = 0xd53bd040 | rt;                                 /* mrs xT, tpidr_el0 */
++    code[6] = 0x91000000 | (rt << 5) | rt | (imm_lo << 10);
++    code[7] = 0x91400000 | (rt << 5) | rt | (imm_hi << 10);
++    code[8] = 0x14000000 | (return_offset & 0x3ffffff);        /* b after the MRS */
++    code[9] = 0xa9be47f0;  /* stp x16, x17, [sp, #-32]! */
++    code[10] = 0xf9000bfe; /* str x30, [sp, #16] */
++    code[11] = 0x580000b1; /* ldr x17, +20 (helper pointer, code[16]) */
++    code[12] = 0xd63f0220; /* blr x17 */
++    code[13] = 0xf9400bfe; /* ldr x30, [sp, #16] */
++    code[14] = 0xa8c247f0; /* ldp x16, x17, [sp], #32 */
++    code[15] = 0x17fffff6; /* b code[5] */
+     uintptr_t helper = (uintptr_t)hybris_tls_first_touch;
+     memcpy(&code[16], &helper, sizeof(helper));
+-
+ }
+ 
+ /* Replace MRS instruction with branch to thunk */
