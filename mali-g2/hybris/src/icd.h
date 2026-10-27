@@ -113,6 +113,7 @@ typedef struct Device {
     pthread_mutex_t placedLock;
     struct PlacedMemory* placedTable[1u << PLACED_TABLE_BITS];
     struct PlacedImage* placedLinear; /* images that are not VK_IMAGE_TILING_OPTIMAL */
+    bool placedOptimal;               /* DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES=1: optimal images' memory too */
     PFN_vkMapMemory2KHR MapMemory2;
     PFN_vkUnmapMemory2KHR UnmapMemory2;
 #define DEVICE_FUNCS(X) \

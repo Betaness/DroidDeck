@@ -10,9 +10,10 @@
  *             range must arrive (outside it: reported, may be stale on cached memory)
  *   to CPU    the CPU reads the memory, the GPU fills it, the CPU invalidates only a range and
  *             must read the GPU's values there
- *   images    a dedicated allocation for an optimal image is the driver's (no dma-buf): the GPU
- *             clears the image and copies it into placed memory; one for a linear image is a
- *             dma-buf and can be placed-mapped
+ *   images    a dedicated allocation for an optimal image is the driver's (no dma-buf) and a placed
+ *             map of it fails (with DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES=1: a dma-buf, and the
+ *             map succeeds); the GPU clears the image and copies it into placed memory; one for a
+ *             linear image is a dma-buf and can be placed-mapped
  *   fds       300 rounds of allocate, place, unmap, free leave no descriptor behind
  *   no dma-buf  with no descriptors left (RLIMIT_NOFILE) the allocation fails with
  *             VK_ERROR_OUT_OF_DEVICE_MEMORY, which applications handle, rather than succeeding
@@ -60,6 +61,7 @@ typedef struct VkMemoryMapPlacedInfoEXT {
 #endif
 
 #define SIZE (4u << 20)
+#define IMG_SIZE (16u << 20)
 static int failures;
 static VkDevice dev;
 static VkQueue queue;
@@ -246,6 +248,7 @@ int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     bool doBench = getenv("PM_BENCH") && atoi(getenv("PM_BENCH"));
     bool cachedHeap = !getenv("DROIDDECK_HYBRIS_PLACED_CACHED") || atoi(getenv("DROIDDECK_HYBRIS_PLACED_CACHED"));
+    bool optimalPlaced = getenv("DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES") && atoi(getenv("DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES"));
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
     VkInstance inst;
@@ -274,6 +277,8 @@ int main(void) {
     vkAllocateCommandBuffers(dev, &cai, &cmd);
     void* lowA = low(SIZE);
     void* lowB = low(SIZE);
+    /* For the 1920x1080 image (8 MB) and the buffer it is copied into. */
+    void* lowImg = low(IMG_SIZE);
     /* A coherent type to check the GPU's copies through. */
     uint32_t coherentType = UINT32_MAX;
     for (uint32_t t = 0; t < mp.memoryTypeCount && coherentType == UINT32_MAX; t++)
@@ -369,11 +374,13 @@ int main(void) {
         int added = dmabufs(NULL, NULL) - before;
         vkBindImageMemory(dev, image, memory, 0);
         if (optimal) {
-            if (added) FAIL("dedicated optimal image (type %u): %d dma-bufs, want the driver's memory", t, added);
-            else printf("dedicated optimal image (type %u): the driver's memory, no dma-buf\n", t);
+            if (added != (optimalPlaced ? 1 : 0))
+                FAIL("dedicated optimal image (type %u): %d dma-bufs, want %s", t, added, optimalPlaced ? "one" : "the driver's memory");
+            else printf("dedicated optimal image (type %u): %s\n", t, optimalPlaced ? "a dma-buf" : "the driver's memory, no dma-buf");
             if (doBench) printf("bench dedicated 1920x1080 image memory, %llu KB: %.2f ms\n", (unsigned long long)(ir.size >> 10), took);
             Placed out;
-            if (place(&out, coherentType, lowA, (VkDeviceSize)1920 * 1080 * 4)) {
+            if (!lowImg) FAIL("no low reservation for the image");
+            else if (place(&out, coherentType, lowImg, (VkDeviceSize)1920 * 1080 * 4)) {
                 begin();
                 VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -397,7 +404,18 @@ int main(void) {
                 if (wrong) FAIL("  cleared image read back through placed memory: %zu wrong pixels", wrong);
                 else printf("  cleared it on the GPU and read it back through placed memory: ok\n");
                 release(&out);
-                if (mmap(lowA, SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != lowA) FAIL("re-reserve");
+                /* winevulkan places every map; what an application that maps this memory gets. */
+                VkMemoryMapPlacedInfoEXT pi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = lowImg};
+                VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pi, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
+                                         .memory = memory, .size = VK_WHOLE_SIZE};
+                void* data = NULL;
+                r = map2(dev, &mi, &data);
+                if (optimalPlaced ? (r || data != lowImg) : r != VK_ERROR_MEMORY_MAP_FAILED)
+                    FAIL("  placed map of its memory: %d at %p", r, data);
+                else printf("  placed map of its memory: %s\n", r ? "VK_ERROR_MEMORY_MAP_FAILED (the documented limit)" : "ok");
+                VkMemoryUnmapInfoKHR ui = {.sType = VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR, .memory = memory};
+                if (!r) unmap2(dev, &ui);
+                if (mmap(lowImg, IMG_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != lowImg) FAIL("re-reserve");
             }
         } else {
             VkMemoryMapPlacedInfoEXT pi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = lowA};

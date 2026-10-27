@@ -6,8 +6,9 @@
  * the extension, host-visible memory is a dma-buf imported into the requested type, and a placed map
  * is an mmap of that dma-buf at the caller's address. Other memory and other devices go to the
  * driver untouched, and so does the memory of a dedicated allocation for an optimal image, which
- * cannot be mapped meaningfully (DXVK never does; this is what the Vortek client does too).
- * DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
+ * cannot be mapped meaningfully (DXVK never does; this is what the Vortek client does too). A placed
+ * map of such memory fails; DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES=1 backs it with a dma-buf as well,
+ * for a 32-bit program that maps it anyway. DROIDDECK_HYBRIS_MAP_PLACED=0 hides the extension.
  *
  * The GPU does not snoop the CPU's caches (tests/placed_memory_test.c), so HOST_COHERENT types get
  * the system-uncached heap and nothing else. The HOST_CACHED, non-coherent types get the CPU-cached
@@ -198,10 +199,17 @@ static VkResult VKAPI_CALL AllocateMemory(VkDevice handle, const VkMemoryAllocat
     if (!device) return VK_ERROR_DEVICE_LOST;
     if (!device->placed || info->memoryTypeIndex >= device->memory.memoryTypeCount ||
         !(device->memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
-        importsOrExports(info->pNext) || optimalImageMemory(device, info->pNext))
+        importsOrExports(info->pNext))
         return device->AllocateMemory(handle, info, allocator, memory);
+    static int okLogged, failLogged, importLogged, optimalLogged;
+    if (!device->placedOptimal && optimalImageMemory(device, info->pNext)) {
+        logOnce(&optimalLogged,
+                "dedicated memory of an optimal image stays the driver's, a placed map of it fails "
+                "(DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES=1 backs it with a dma-buf), first type",
+                (int)info->memoryTypeIndex);
+        return device->AllocateMemory(handle, info, allocator, memory);
+    }
 
-    static int okLogged, failLogged, importLogged;
     long page = sysconf(_SC_PAGESIZE);
     VkMemoryPropertyFlags flags = device->memory.memoryTypes[info->memoryTypeIndex].propertyFlags;
     VkDeviceSize size = (info->allocationSize + page - 1) & ~(VkDeviceSize)(page - 1);
@@ -280,7 +288,8 @@ static VkResult mapMemory2(VkDevice handle, const VkMemoryMapInfoKHR* info, void
         if (s->sType == VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT) where = (const VkMemoryMapPlacedInfoEXT*)s;
     PlacedMemory* record = find(device, info->memory);
     static int notBacked;
-    if (!record) logOnce(&notBacked, "placed map of memory without a dma-buf", 0);
+    if (!record)
+        logOnce(&notBacked, "placed map of memory without a dma-buf (imported, exportable or an optimal image's), fails", 0);
     if (!record || !where || !where->pPlacedAddress || info->offset || record->at) return VK_ERROR_MEMORY_MAP_FAILED;
     void* at = mmap(where->pPlacedAddress, record->size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, record->fd, 0);
     if (at == MAP_FAILED) return VK_ERROR_MEMORY_MAP_FAILED;
@@ -396,6 +405,7 @@ static VkResult VKAPI_CALL InvalidateMappedMemoryRanges(VkDevice handle, uint32_
 
 void placed_device_created(Device* device) {
     pthread_mutex_init(&device->placedLock, NULL);
+    device->placedOptimal = icd_env_int("DROIDDECK_HYBRIS_PLACED_OPTIMAL_IMAGES", 0) != 0;
     device->MapMemory2 = (PFN_vkMapMemory2KHR)device->instance->GetDeviceProcAddr(device->handle, "vkMapMemory2");
     device->UnmapMemory2 = (PFN_vkUnmapMemory2KHR)device->instance->GetDeviceProcAddr(device->handle, "vkUnmapMemory2");
 }
