@@ -83,8 +83,11 @@ NDK=/path/to/ndk ./build-server.sh out/libvortekserver.so
   `DROIDDECK_DXVK_DESCRIPTOR_BUFFER=1/0` 往 `DXVK_CONFIG` 加 `dxvk.enableDescriptorBuffer = True/False`
   （DXVK 默认不对 Mali 打开；Vortek 不转发 VK_EXT_descriptor_buffer，所以只在 libhybris 路径上起作用）；
   `DROIDDECK_DXVK_UPDATE_TEMPLATES=1/0/32` 加 `dxvk.enableDescriptorUpdateTemplates`，`32` 只对 32 位游戏 exe。
-  `WINE_OFFSCREEN_CHECK_MS=100` 让带 winex11 补丁（droiddeck-esync 包 rev 3 起）的 Proton 在呈现路径上
-  复用窗口离屏检查，每帧少几次 wineserver 往返。
+  `WINE_OFFSCREEN_CHECK_MS=100` 让带 winex11 补丁的 Proton 在呈现路径上复用窗口离屏检查，每帧少几次
+  wineserver 往返；带这个补丁的 droiddeck-esync 包 rev 3 在分支 perf-r8 上，g2-060 不带，这里设了也不起作用。
+  2026-10-29 实测（O3，libhybris，鸭科夫 960x640，每组 6 场）：descriptor buffer 102.3±1.1 对 103.3±2.3 fps，
+  离屏检查缓存 102.2±0.8 fps（wineserver 0.106→0.024 ms/帧，但帧率和主线程不变），都在 2 倍标准误内，
+  所以两个都默认不开。
 
 ## 限制
 
