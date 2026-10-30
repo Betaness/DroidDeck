@@ -58,6 +58,15 @@ A Unity game under FEX (`UnityPlayer.dll` for Windows builds under Proton,
 turns it off: without TSO such games can deadlock or crash (seen with Megabonk
 and Crab Game). A FEX preset chosen for the game itself still applies.
 
+Escape from Duckov (`Duckov.exe` beside `UnityPlayer.dll`) also gets FEX's L2
+lookup cache with a fixed-size L1 (`FEX_DISABLEL2CACHE=0`,
+`FEX_DYNAMICL1CACHE=0`). Its main thread limits it at low resolution, and FEX's
+default caches sent about 17,000 block lookups a second from that thread down
+the slow path; with the L2 cache there were none. On a Xring O3 this measured
++2.2 ± 0.9 fps at matched clocks (99 against 95 fps at about 2.5 GHz) for about
+80 MiB more memory. The settings do not change generated code. Set either
+variable to `1` in the game's own environment to turn it back.
+
 ## Defaults and available suggestions
 
 The initial configuration enables Mesa shader caching with

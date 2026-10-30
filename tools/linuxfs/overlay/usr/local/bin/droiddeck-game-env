@@ -97,6 +97,18 @@ def unity_memory_ordering(game):
 
 
 @fix
+def duckov_lookup_cache(game):
+    """Escape from Duckov (Unity, Mono) is bound by its main thread at low resolution. FEX's default dynamic
+    L1 block cache without the L2 cache sends about 17,000 lookups a second from that thread down the slow
+    C++ path (about 2% of its time); with the L2 cache on and a fixed L1 there are none. On a Xring O3 that
+    was +2.2 +- 0.9 fps at matched clocks (+3.7 at about 2.5 GHz, 99 against 95 fps) and 25.4 -> 24.9 million
+    main-thread cycles a frame, for about 80 MiB more memory. The settings do not change generated code.
+    A per-game FEX_DISABLEL2CACHE=1 or FEX_DYNAMICL1CACHE=1 turns it back."""
+    if game.stem == "duckov" and "unityplayer.dll" in game.files:
+        return {"FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0"}, [], "Escape from Duckov: FEX L2 lookup cache on, fixed L1"
+
+
+@fix
 def godot_vulkan(game):
     if is_godot(game) and not game.has_arg("--rendering-driver"):
         return {}, ["--rendering-driver", "vulkan"], "Godot: Vulkan renderer"
