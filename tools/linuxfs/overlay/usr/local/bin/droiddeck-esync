@@ -29,6 +29,9 @@ STORE_LOCK = "store.lock"
 BUILTIN_MARKER = b"esync: up and running"
 FSYNC_MARKER = b"fsync: up and running"
 NTSYNC_MARKER = b"/dev/ntsync"
+# Printed by ntdll.so of the packs with the semaphore pool (patch 0002, rev 2 here); upstream's rev 1 packs lack it.
+SEMPOOL_MARKER = b"droiddeck-sempool: up and running"
+SEMPOOL_KEY = "BL_SYNC_SEMPOOL"
 WINESERVER_ONLY = ("PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "PROTON_NO_NTSYNC")
 NOSYNC_APPS = frozenset(("2630", "1060210", "414740", "201510", "1233880"))
 SOURCES = ("Proton Experimental (ARM64)", "Proton 11.0 (ARM64)")
@@ -41,7 +44,8 @@ MIN_NOFILE = 8192
 LOG_LINES = 200
 LIVE_FILE = "prefixes.json"
 LIVE_ROWS = 200
-LIVE_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "BL_SYNC", "BL_FSYNC", "WINEFSYNC")
+LIVE_KEYS = ("WINESERVER", "BL_SYNC_PACK", "WINEESYNC", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC", "BL_SYNC", "BL_FSYNC", "WINEFSYNC",
+             SEMPOOL_KEY)
 CACHE_ROWS = 512
 TEMP_AGE = 3600
 GC_GRACE = 600
@@ -395,6 +399,38 @@ def match_kind(pack, measured):
             and pack.get("exports") == measured["exports"]):
         return "source"
     return None
+
+
+def has_marker(path, marker):
+    tail = b""
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(CHUNK), b""):
+            window = tail + chunk
+            if marker in window:
+                return True
+            tail = window[-(len(marker) - 1):]
+    return False
+
+
+def pack_pool(root, pack):
+    try:
+        return has_marker(os.path.join(root, "packs", pack["id"], NTDLL), SEMPOOL_MARKER)
+    except OSError:
+        return False
+
+
+def pool_state(root, pack, env):
+    if not pack_pool(root, pack):
+        return "none"
+    # ntdll reads WINE_SEM_POOL with atoi(): unset means on, anything that parses as 0 means off.
+    value = env.get("WINE_SEM_POOL")
+    number = re.match(r"\s*([+-]?\d+)", value) if value is not None else None
+    return "on" if value is None or (number is not None and int(number.group(1)) != 0) else "off"
+
+
+def describe_pool(state):
+    return {"on": "semaphore pool on", "off": "semaphore pool off (WINE_SEM_POOL)",
+            "none": "no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip)"}[state]
 
 
 def find_pack(packs, measured):
@@ -958,10 +994,11 @@ def choose(root, command, env, tool, stock):
         env["PROTON_NO_FSYNC"] = "1"
     env["WINESERVER"] = os.path.join(dist, WINESERVER)
     env["BL_SYNC_PACK"] = pack["id"]
+    env[SEMPOOL_KEY] = pool_state(root, pack, env)
     command[0] = os.path.join(dist, os.path.basename(command[0]))
-    say("droiddeck-esync: pack %s for %s (%s, %s match); droiddeck-ntsync %s, droiddeck-esync %s, fds %s/%s"
+    say("droiddeck-esync: pack %s for %s (%s, %s match); droiddeck-ntsync %s, droiddeck-esync %s, fds %s/%s, %s"
         % (pack["id"], name, measured["version_line"], match_kind(pack, measured), "on" if env.get("BL_SYNC") == "1" else "off",
-           "on" if truthy(env["WINEESYNC"]) else "off", limit(soft), limit(hard)))
+           "on" if truthy(env["WINEESYNC"]) else "off", limit(soft), limit(hard), describe_pool(env[SEMPOOL_KEY])))
     log_launch(root, command, env, tool, pack["id"])
     return command, env
 
@@ -1025,6 +1062,7 @@ def reconcile_store(root, steam_root, env):
     fresh = {}
     scanned = set()
     used = 0
+    poolless = []
     for tool in find_tools(os.fspath(steam_root)):
         try:
             measured = measure(tool, cache)
@@ -1034,6 +1072,8 @@ def reconcile_store(root, steam_root, env):
             elif pack is not None:
                 state = "pack"
                 used += 1
+                if not pack_pool(root, pack):
+                    poolless.append("%s (%s)" % (os.path.basename(tool.rstrip("/")) or tool, pack["id"]))
             else:
                 state = "wanted"
                 fresh.setdefault((measured["ntdll"], measured["wineserver"]), wanted_row(measured))
@@ -1053,7 +1093,10 @@ def reconcile_store(root, steam_root, env):
     update_file(root, "tools.tsv", lambda text: tsv(sorted(rows)))
     cache.save(True)
     gc(root)
-    return "droiddeck-esync: %d pack(s) in use, %d wanted" % (used, wanted)
+    summary = "droiddeck-esync: %d pack(s) in use, %d wanted" % (used, wanted)
+    if poolless:
+        summary += "; without the semaphore pool: %s" % ", ".join(sorted(poolless))
+    return summary
 
 
 def reconcile(steam_root, env):
@@ -1176,7 +1219,8 @@ def status(root):
     tools = parse_tsv(read_text(os.path.join(root, "tools.tsv")), 6)
     wanted = parse_tsv(read_text(os.path.join(root, "wanted.tsv")), 6)
     lines = ["droiddeck-esync store %s" % root, "packs: %d installed" % len(packs)]
-    lines += ["  %s (%s, rev %d)" % (pack["id"], pack["flavor"], pack["rev"]) for pack in packs]
+    lines += ["  %s (%s, rev %d%s)" % (pack["id"], pack["flavor"], pack["rev"], ", semaphore pool" if pack_pool(root, pack) else "")
+              for pack in packs]
     lines.append("dists: %d" % len(dists))
     lines += ["  %s" % name for name in dists]
     lines.append("tools: %d" % len(tools))

@@ -86,12 +86,13 @@ def make_tool(parent, name, line=VALVE_LINE, salt=b"", builtin=False, ge=False, 
     return tool
 
 
-def make_pack(root, tool, pack_id, rev=1, source_match=False, stock=None, version=None, exports=None, complete=True, **extra):
+def make_pack(root, tool, pack_id, rev=1, source_match=False, stock=None, version=None, exports=None, complete=True, pool=True,
+              **extra):
     tool = Path(tool)
     pack_dir = Path(root) / "packs" / pack_id
     (pack_dir / "files/lib/wine/aarch64-unix").mkdir(parents=True)
     (pack_dir / "files/bin-arm64").mkdir(parents=True)
-    (pack_dir / NTDLL).write_bytes(b"patched ntdll " + pack_id.encode())
+    (pack_dir / NTDLL).write_bytes(b"patched ntdll " + pack_id.encode() + (b" droiddeck-sempool: up and running.\n" if pool else b""))
     (pack_dir / WINESERVER).write_bytes(b"patched wineserver " + pack_id.encode())
     line = (tool / "version").read_text().strip()
     data = {
@@ -907,6 +908,76 @@ class MatchingTest(SyncTestCase):
         (root / "packs/broken/.complete").write_text("")
         (root / "packs/broken/pack.json").write_text("{")
         self.assertEqual([pack["id"] for pack in SYNC["load_packs"](root)], ["good"])
+
+
+class SemaphorePoolTest(SyncTestCase):
+    def test_the_launch_says_whether_the_pack_pools_semaphores(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        pack = make_pack(root, tool, "valve-experimental-r1", pool=False)
+        command, env, said = self.select(tool, self.env())
+        self.assertEqual((env["BL_SYNC_PACK"], env["BL_SYNC_SEMPOOL"]), (pack["id"], "none"))
+        self.assertIn("droiddeck-esync on, fds ", said)
+        self.assertTrue(said.endswith(", no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip)\n"), said)
+        self.assertEqual(said.count("\n"), 1)
+        pooled = make_pack(root, tool, "valve-experimental-r2", rev=2)
+        for value, state in ((None, "on"), ("1", "on"), (" 2x", "on"), ("-1", "on"), ("0", "off"), ("", "off"), ("no", "off"),
+                             (" +0", "off")):
+            command, env, said = self.select(tool, self.env(WINE_SEM_POOL=value))
+            self.assertEqual((env["BL_SYNC_PACK"], env["BL_SYNC_SEMPOOL"]), (pooled["id"], state), value)
+            self.assertTrue(said.rstrip("\n").endswith("semaphore pool on" if state == "on" else "semaphore pool off (WINE_SEM_POOL)"),
+                            said)
+
+    def test_a_pooled_pack_beats_upstream_r1_for_a_new_proton_build(self):
+        root = self.store()
+        line = "1793301884 experimental-11.0-20261027b-arm64"
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)", line, salt=b"27b")
+        older = make_tool(self.tools, "Proton Experimental old", "1791989191 experimental-11.0-20261014-arm64", salt=b"14")
+        make_pack(root, older, "valve-experimental-11.0-20261014-arm64-r2", rev=2)
+        make_pack(root, tool, "valve-experimental-11.0-20261027b-arm64-r1", pool=False, source_match=True)
+        command, env, said = self.select(tool, self.env())
+        self.assertEqual((env["BL_SYNC_PACK"], env["BL_SYNC_SEMPOOL"]), ("valve-experimental-11.0-20261027b-arm64-r1", "none"))
+        make_pack(root, tool, "valve-experimental-11.0-20261027b-arm64-r2", rev=2, source_match=True)
+        command, env, said = self.select(tool, self.env())
+        self.assertEqual((env["BL_SYNC_PACK"], env["BL_SYNC_SEMPOOL"]), ("valve-experimental-11.0-20261027b-arm64-r2", "on"))
+        self.assertIn("(%s, exact match)" % line, said)
+
+    def test_the_marker_is_found_across_read_chunks(self):
+        path = self.tmp / "ntdll.so"
+        marker = SYNC["SEMPOOL_MARKER"]
+        for at in (0, 5, 4096 - len(marker) + 3, 4096 - 1, 8192 - len(marker)):
+            path.write_bytes(b"x" * at + marker + b"y" * 100)
+            with mock.patch.dict(GLOBALS, {"CHUNK": 4096}):
+                self.assertTrue(SYNC["has_marker"](str(path), marker), at)
+        path.write_bytes(b"x" * 5000 + marker[:-1] + b"y" * 5000)
+        with mock.patch.dict(GLOBALS, {"CHUNK": 4096}):
+            self.assertFalse(SYNC["has_marker"](str(path), marker))
+        self.assertFalse(SYNC["pack_pool"](str(self.tmp), {"id": "missing-r2"}))
+
+    def test_a_running_prefix_keeps_the_pool_state(self):
+        root = self.store()
+        tool = make_tool(self.tools, "Proton Experimental (ARM64)")
+        make_pack(root, tool, "valve-experimental-r1", pool=False)
+        self.assertEqual(self.select(tool, self.env())[1]["BL_SYNC_SEMPOOL"], "none")
+        with mock.patch.dict(GLOBALS, {"server_running": lambda path: True}):
+            command, env, said = self.select(tool, self.env(), verb="run")
+        self.assertIn("keeping its sync choice", said)
+        self.assertEqual(env["BL_SYNC_SEMPOOL"], "none")
+
+    def test_reconcile_and_status_name_the_packs_without_a_pool(self):
+        root = self.store()
+        steam = self.tmp / "steam"
+        valve = make_tool(steam / "steamapps/common", "Proton Experimental (ARM64)")
+        ge = make_tool(steam / "compatibilitytools.d", "GE-Proton11-7", GE_LINE, salt=b"ge", ge=True, decorated=True)
+        make_pack(root, valve, "valve-experimental-r1", pool=False)
+        make_pack(root, ge, "ge-GE-Proton11-7-r2", rev=2, flavor="ge")
+        with mock.patch.dict(GLOBALS, {"SD_LIBRARY": str(self.tmp / "sd")}):
+            summary = self.quiet(SYNC["reconcile"], str(steam), {"HOME": str(self.home)})
+        self.assertEqual(summary, "droiddeck-esync: 2 pack(s) in use, 0 wanted; "
+                                  "without the semaphore pool: Proton Experimental (ARM64) (valve-experimental-r1)")
+        status = SYNC["status"](root).splitlines()
+        self.assertIn("  ge-GE-Proton11-7-r2 (ge, rev 2, semaphore pool)", status)
+        self.assertIn("  valve-experimental-r1 (valve, rev 1)", status)
 
 
 class ReconcileTest(SyncTestCase):
