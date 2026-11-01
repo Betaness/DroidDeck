@@ -32,7 +32,7 @@ SPARK = " .:-=+*#%@"
 FLAG_SHORT = {
     "crash": "CRASH", "device_lost": "DEVLOST", "vortek_exit": "VORTEK", "app_killed": "KILLED", "launch_failed": "NOLAUNCH",
     "freeze": "freeze", "low_fps": "lowfps", "oom": "oom", "hidden_paced": "hidden", "compiler": "compiler",
-    "at60_thermal": "60Hz-hot", "marked": "MARKED", "x11_copy": "x11", "software": "CPU-DRAWN",
+    "at60_thermal": "60Hz-hot", "marked": "MARKED", "x11_copy": "x11", "software": "CPU-DRAWN", "no_sempool": "nopool",
 }
 SOURCE_TAG = {"game-layer": "", "screen": "s", "x11-stats": "x", "stats": "t", "x11": "x"}
 
@@ -355,6 +355,8 @@ def cmd_show(args, records):
         f"  flags: {', '.join(r.get('flags') or []) or '-'}",
         f"  logs: files/logs/{r.get('logs')}   app {get(r, 'app', 'version')} {get(r, 'app', 'commit')}",
         "gpu:", kv(r.get("gpu")),
+        "sync:", kv({k: v for k, v in (r.get("env") or {}).items()
+                     if k in ("BL_SYNC", "BL_SYNC_PACK", "BL_SYNC_SEMPOOL", "WINEESYNC", "BL_FSYNC", "WINE_SEM_POOL")}),
         "display:", kv(r.get("display")),
         "fps:", kv({k: v for k, v in (r.get("fps") or {}).items() if k != "perMin"}),
         "refresh:", kv({k: v for k, v in (r.get("hz") or {}).items() if k != "perMin"}),

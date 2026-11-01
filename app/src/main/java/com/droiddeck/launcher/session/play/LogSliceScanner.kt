@@ -254,6 +254,7 @@ class LogSliceScanner(
             Pattern("oom", "OUT_OF_DEVICE_MEMORY"),
             Pattern("oom", "bad_alloc"),
             Pattern("compiler", "cmpbe_v2_compile"),
+            Pattern("no_sempool", "no semaphore pool in this pack"),
             Pattern("vulkan", "err:vulkan"),
             Pattern("vulkan", "DxvkError"),
             Pattern("vulkan", "err:   "),

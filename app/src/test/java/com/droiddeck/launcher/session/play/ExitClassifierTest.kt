@@ -25,11 +25,12 @@ class ExitClassifierTest {
         appKilled: ExitClassifier.AppExit? = null, stopped: Boolean = false, vortek: Int? = null, vortekToEnd: Long? = null,
         usedVortek: Boolean = false, zeroRun: Long = 0, stall: Double? = null, mean: Double? = 60.0, low1: Double? = 30.0,
         at60Thermal: Double? = 0.0, marked: Boolean = false, runMode: Boolean = false, status: Int? = null, fpsLimit: Int? = null,
+        semPool: String? = null,
     ) = ExitClassifier.Evidence(
         durS = durS, appKilled = appKilled, sessionStopped = stopped, sessionStatus = status ?: if (stopped) 0 else null,
         vortekExit = vortek, vortekToEndS = vortekToEnd, usedVortek = usedVortek, findings = f, steamExitCode = f?.steamExitCode,
         gameFrames = frames, longestZeroRunS = zeroRun, longestStallS = stall, meanFpsAfterWarmup = mean, low1 = low1,
-        at60Thermal = at60Thermal, marked = marked, runMode = runMode, fpsLimit = fpsLimit,
+        at60Thermal = at60Thermal, marked = marked, runMode = runMode, fpsLimit = fpsLimit, semPool = semPool,
     )
 
     @Test fun reasonsInOrder() {
@@ -108,6 +109,24 @@ class ExitClassifierTest {
         // Long frames in a game that draws on demand (a card table) are not stutter.
         assertEquals(emptyList<String>(), ExitClassifier.classify(ev(low1 = 5.0, mean = 12.0, fpsLimit = 15)).flags)
         assertEquals(listOf("low_fps"), ExitClassifier.classify(ev(mean = 12.0)).flags)
+    }
+
+    @Test fun aPackWithoutTheSemaphorePoolIsFlagged() {
+        val said = "droiddeck-esync: pack valve-experimental-11.0-20261027b-arm64-1793301631-406ecaaf88ce-r1 for Proton Experimental " +
+            "(ARM64) (1793301884 experimental-11.0-20261027b-arm64, exact match); droiddeck-ntsync off, droiddeck-esync on, " +
+            "fds 33368/524288, no semaphore pool in this pack (every anonymous semaphore is a wineserver round trip)"
+        val pooled = "droiddeck-esync: pack valve-r2 for Proton Experimental (ARM64) (1 v, exact match); droiddeck-ntsync off, " +
+            "droiddeck-esync on, fds 33368/524288, semaphore pool on"
+        assertEquals(listOf("no_sempool"), ExitClassifier.classify(ev(semPool = "none")).flags)
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(semPool = "on")).flags)
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(semPool = "off")).flags)
+        // Without the game's environment the session's launch line decides.
+        val f = findings(session = listOf(said))
+        assertEquals(listOf("no_sempool"), ExitClassifier.classify(ev(f = f)).flags)
+        assertTrue(f.firstLine("no_sempool")!!.startsWith("session.log: droiddeck-esync: pack valve-experimental-11.0-20261027b"))
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(f = f, semPool = "on")).flags)
+        assertEquals(emptyList<String>(), ExitClassifier.classify(ev(f = findings(session = listOf(pooled)))).flags)
+        assertEquals(null, ExitClassifier.keepFor(listOf("no_sempool")))
     }
 
     @Test fun halfAMinuteWithoutFramesWhileLoadingIsNotAFreeze() {

@@ -244,7 +244,11 @@ object DeviceReport {
         k("FEX preset", SessionPrefs.fexPreset(context).ifEmpty { "FEX defaults" })
         k("Skip xalia", SessionPrefs.noXalia(context))
         k("Wine sync", SessionPrefs.syncBackend(context))
-        EsyncPacks.status(LinuxRuntime.rootDir(context)).let { k("droiddeck-esync packs", "${it.installed} installed, ${it.wanted} wanted") }
+        EsyncPacks.status(LinuxRuntime.rootDir(context)).let { status ->
+            val poolless = status.poolless.joinToString(", ") { "${it.versionLine} (${it.packId})" }
+            k("droiddeck-esync packs", "${status.installed} installed, ${status.wanted} wanted" +
+                if (poolless.isEmpty()) "" else "; without the semaphore pool: $poolless")
+        }
         k("Linux x86 (FEX)", if (com.droiddeck.launcher.runtime.LinuxFex.ready(context)) "ready" else "not set up")
         k("gamescope realtime", SessionPrefs.gamescopeRealtime(context))
         k("proot without seccomp", SessionPrefs.prootNoSeccomp(context))

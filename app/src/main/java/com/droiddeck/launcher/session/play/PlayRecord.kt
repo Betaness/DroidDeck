@@ -196,6 +196,7 @@ object PlayRecord {
             "vortekToEndS" to s.vortekExitAtMs?.let { (endMs - it) / 1000 },
             "uptimeToWallMs" to s.uptimeToWallMs,
             "runMode" to (s.launch != "steam"),
+            "semPool" to s.env?.get("BL_SYNC_SEMPOOL"),
         )
     }
 
@@ -228,6 +229,7 @@ object PlayRecord {
         marked = m["marked"] == true,
         runMode = m["runMode"] == true,
         fpsLimit = m.long("fpsLimit")?.toInt(),
+        semPool = m["semPool"] as? String,
     )
 
     /** Kinds whose first time in the game's logs goes on the timeline. */

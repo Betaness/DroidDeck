@@ -822,6 +822,59 @@ class EsyncPacksTest {
         assertEquals("wanted", status.tool("/t")?.state)
     }
 
+    @Test fun theSemaphorePoolMarkerIsFoundAcrossReadsInInstalledPacksOnly() {
+        val root = temp.newFolder("rootfs")
+        val store = EsyncPacks.store(root)
+        val marker = "droiddeck-sempool: up and running.\n".toByteArray()
+        fun install(id: String, ntdll: ByteArray, complete: Boolean = true) {
+            val dir = File(store, "packs/$id").apply { mkdirs() }
+            File(dir, EsyncPacks.NTDLL).apply { parentFile!!.mkdirs() }.writeBytes(ntdll)
+            if (complete) File(dir, ".complete").writeText("")
+        }
+        for (at in listOf(0, 7, (1 shl 16) - 10, (1 shl 16) - 1, 1 shl 16, 3 * (1 shl 16) - 20)) {
+            install("valve-at$at-r2", ByteArray(at) { 'x'.code.toByte() } + marker + ByteArray(100))
+            assertEquals("at $at", true, EsyncPacks.hasPool(store, "valve-at$at-r2"))
+        }
+        install("valve-cut-r1", ByteArray((1 shl 16) - 5) + marker.copyOf(marker.size - 3) + ByteArray(1 shl 16))
+        install("valve-none-r1", ByteArray(200_000) { (it % 251).toByte() })
+        install("valve-partial-r2", marker, complete = false)
+        assertEquals(false, EsyncPacks.hasPool(store, "valve-cut-r1"))
+        assertEquals(false, EsyncPacks.hasPool(store, "valve-none-r1"))
+        assertNull(EsyncPacks.hasPool(store, "valve-partial-r2"))
+        assertNull(EsyncPacks.hasPool(store, "valve-missing-r2"))
+        assertNull(EsyncPacks.hasPool(store, "../packs/valve-at0-r2"))
+        // A pack directory replaced under the same id is looked at again.
+        File(store, "packs/valve-none-r1/${EsyncPacks.NTDLL}").apply { writeBytes(marker); setLastModified(lastModified() + 5_000) }
+        assertEquals(true, EsyncPacks.hasPool(store, "valve-none-r1"))
+    }
+
+    @Test fun statusAndTheLogNameTheToolsWhosePackHasNoPool() {
+        val root = temp.newFolder("rootfs")
+        val store = EsyncPacks.store(root)
+        fun install(id: String, ntdll: String) {
+            val dir = File(store, "packs/$id").apply { mkdirs() }
+            File(dir, EsyncPacks.NTDLL).apply { parentFile!!.mkdirs() }.writeText(ntdll)
+            File(dir, ".complete").writeText("")
+        }
+        val valve = "valve-experimental-11.0-20261027b-arm64"
+        val line = "1793301884 experimental-11.0-20261027b-arm64"
+        install("$valve-r1", "ntdll")
+        install("ge-GE-Proton11-11-r2", "ntdll droiddeck-sempool: up and running.")
+        File(store, "tools.tsv").writeText(
+            "/x\t$line\t${"1".repeat(64)}\t${"2".repeat(64)}\tpack\t$valve-r1\n" +
+                "/g\t1792433767 GE-Proton11-11\t${"3".repeat(64)}\t${"4".repeat(64)}\tpack\tge-GE-Proton11-11-r2\n" +
+                "/w\t1 other\t${"5".repeat(64)}\t${"6".repeat(64)}\twanted\t-\n" +
+                "/gone\t1 gone\t${"7".repeat(64)}\t${"8".repeat(64)}\tpack\tvalve-removed-r1\n",
+        )
+        val status = EsyncPacks.status(root)
+        assertEquals(listOf("/x"), status.poolless.map { it.toolDir })
+        assertEquals(listOf("/x"), EsyncPacks.reportPoolless(store, status.tools).map { it.toolDir })
+        assertEquals(emptyList<EsyncPacks.ToolState>(), EsyncPacks.reportPoolless(store, status.tools))
+        install("$valve-r2", "droiddeck-sempool: up and running.")
+        File(store, "tools.tsv").writeText("/x\t$line\t${"1".repeat(64)}\t${"2".repeat(64)}\tpack\t$valve-r2\n")
+        assertEquals(emptyList<EsyncPacks.ToolState>(), EsyncPacks.status(root).poolless)
+    }
+
     @Test fun statusCountsAnInstalledMatchingPackBeforeTheNextReconcile() {
         val root = temp.newFolder("rootfs")
         val store = EsyncPacks.store(root)

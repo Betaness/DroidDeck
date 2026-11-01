@@ -28,6 +28,7 @@ import java.security.SecureRandom
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -43,6 +44,8 @@ object EsyncPacks {
     const val WINEX11 = "files/lib/wine/aarch64-unix/winex11.so"
     const val GUEST_STORE = "/root/.local/share/droiddeck-esync"
     const val EXTRA_ASSETS = "droiddeck-esync-extra"
+    // Printed by ntdll.so of the packs with the semaphore pool (rev 2 here); upstream's rev 1 packs lack it.
+    private val SEMPOOL_MARKER = "droiddeck-sempool: up and running".toByteArray(Charsets.US_ASCII)
     private const val STORE = "root/.local/share/droiddeck-esync"
     private const val PACK_JSON = "pack.json"
     private const val COMPLETE = ".complete"
@@ -121,7 +124,8 @@ object EsyncPacks {
         val packId: String?,
     )
 
-    data class Status(val installed: Int, val wanted: Int, val tools: List<ToolState>) {
+    /** [poolless]: the tools whose pack has no semaphore pool. */
+    data class Status(val installed: Int, val wanted: Int, val tools: List<ToolState>, val poolless: List<ToolState> = emptyList()) {
         fun tool(guestPath: String): ToolState? {
             val path = guestPath.trimEnd('/')
             return tools.firstOrNull { it.toolDir.trimEnd('/') == path }
@@ -132,6 +136,8 @@ object EsyncPacks {
     private val cacheLock = Any()
     private val installLock = Any()
     private val pending = AtomicBoolean(false)
+    private val pools = ConcurrentHashMap<String, Triple<Long, Long, Boolean>>()
+    private val poolsReported: MutableSet<String> = ConcurrentHashMap.newKeySet<String>()
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "droiddeck-esync-fetch").apply { isDaemon = true }
     }
@@ -343,12 +349,62 @@ object EsyncPacks {
         if (!store.isDirectory) Status(0, 0, emptyList())
         else {
             val wanted = readText(File(store, WANTED))?.let { parseWanted(it) }.orEmpty()
-            val tools = readText(File(store, TOOLS))?.let { parseTools(it) }.orEmpty()
-            Status(installedIds(store).size, wanted.size, settled(store, tools, wanted))
+            val tools = settled(store, readText(File(store, TOOLS))?.let { parseTools(it) }.orEmpty(), wanted)
+            Status(installedIds(store).size, wanted.size, tools, poolless(store, tools))
         }
     } catch (t: Throwable) {
         Log.w(TAG, "sync status", t)
         Status(0, 0, emptyList())
+    }
+
+    /** Whether installed pack [id] has the semaphore pool; null when it is not installed. */
+    internal fun hasPool(store: File, id: String): Boolean? {
+        if (!ID.matches(id) || !File(store, "packs/$id/$COMPLETE").isFile) return null
+        val ntdll = File(store, "packs/$id/$NTDLL")
+        val modified = ntdll.lastModified()
+        val size = ntdll.length()
+        pools[ntdll.path]?.takeIf { it.first == modified && it.second == size }?.let { return it.third }
+        val found = try {
+            contains(ntdll, SEMPOOL_MARKER)
+        } catch (e: IOException) {
+            return null
+        }
+        pools[ntdll.path] = Triple(modified, size, found)
+        return found
+    }
+
+    internal fun contains(file: File, marker: ByteArray): Boolean {
+        val input = FileInputStream(file)
+        try {
+            val buffer = ByteArray(maxOf(1 shl 16, marker.size * 2))
+            var kept = 0
+            while (true) {
+                val n = input.read(buffer, kept, buffer.size - kept)
+                if (n < 0) return false
+                val end = kept + n
+                for (i in 0..end - marker.size) {
+                    var j = 0
+                    while (j < marker.size && buffer[i + j] == marker[j]) j++
+                    if (j == marker.size) return true
+                }
+                kept = minOf(marker.size - 1, end)
+                System.arraycopy(buffer, end - kept, buffer, 0, kept)
+            }
+        } finally {
+            input.close()
+        }
+    }
+
+    internal fun poolless(store: File, tools: List<ToolState>): List<ToolState> =
+        tools.filter { it.state == "pack" && it.packId?.let { id -> hasPool(store, id) } == false }
+
+    /** Says once per tool and pack that the pack in use has no semaphore pool. */
+    internal fun reportPoolless(store: File, tools: List<ToolState>): List<ToolState> = poolless(store, tools).filter { tool ->
+        if (!poolsReported.add("${tool.toolDir}\t${tool.packId}")) return@filter false
+        Log.w(TAG, "sync pack ${tool.packId} for ${tool.versionLine.ifEmpty { tool.toolDir }} has no semaphore pool: no pack with the " +
+            "pool matches this Proton build yet, so every anonymous semaphore is a wineserver round trip")
+        SessionEvents.record("sync.pool", mapOf("id" to tool.packId, "proton" to tool.versionLine, "result" to "missing"))
+        true
     }
 
     internal fun settled(store: File, tools: List<ToolState>, wanted: List<Wanted>): List<ToolState> {
@@ -528,6 +584,7 @@ object EsyncPacks {
             sweep(context, store)
             val toolsText = readText(File(store, TOOLS))
             val tools = toolsText?.let { parseTools(it) }.orEmpty()
+            reportPoolless(store, tools)
             val wanted = withEpochs(readText(File(store, WANTED))?.let { parseWanted(it) }.orEmpty(), tools)
             val index = refreshIndex(context, wanted) ?: return 0
             removeRevoked(store, index, extras)

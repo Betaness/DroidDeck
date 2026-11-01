@@ -169,5 +169,11 @@ class PlayRecordTest {
         assertEquals(a.at60Thermal, b.at60Thermal)
         assertTrue(b.marked)
         assertNull(b.vortekExit)
+        assertNull(b.semPool)
+        s.env = s.env!! + ("BL_SYNC_SEMPOOL" to "none")
+        val pool = Json.parse(Json.write(PlayRecord.evidence(s, t0 + 1_830_000))) as Map<*, *>
+        val c = PlayRecord.evidenceFrom(pool, null, false)
+        assertEquals("none", c.semPool)
+        assertEquals(listOf("no_sempool"), ExitClassifier.classify(c).flags.filter { it == "no_sempool" })
     }
 }

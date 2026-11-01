@@ -41,6 +41,8 @@ object ExitClassifier {
         val runMode: Boolean = false,
         /** The session's fps cap; a game held to 20 fps on purpose is not slow. */
         val fpsLimit: Int? = null,
+        /** BL_SYNC_SEMPOOL from the game's environment: on, off or none (a droiddeck-esync pack without the pool); null when unknown. */
+        val semPool: String? = null,
     )
 
     class Exit(
@@ -117,6 +119,8 @@ object ExitClassifier {
         if (f?.has("compiler") == true) flags += "compiler"
         if ((e.at60Thermal ?: 0.0) > 0.30) flags += "at60_thermal"
         if (e.marked) flags += "marked"
+        // Upstream's rev 1 packs have no pool: Escape from Duckov went from about 98 to 72 fps on one.
+        if (e.semPool == "none" || e.semPool == null && f?.has("no_sempool") == true) flags += "no_sempool"
         return Exit(
             reason, e.steamExitCode, signal ?: vortekSignal.takeIf { reason == "vortek_exit" }, e.vortekExit,
             e.appKilled, detail, flags.distinct(),

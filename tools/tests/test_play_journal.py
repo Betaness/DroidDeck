@@ -103,6 +103,18 @@ class JournalTest(unittest.TestCase):
         self.assertIn("A.V.A Global", last)
         self.assertIn("errors: -", last)
 
+    def test_a_pack_without_the_semaphore_pool_shows(self):
+        play = json.loads(PLAY)
+        play["flags"] = ["no_sempool"]
+        play["env"].update(BL_SYNC="0", BL_SYNC_PACK="valve-experimental-11.0-20261027b-r1", BL_SYNC_SEMPOOL="none", WINEESYNC="1")
+        self.path.write_text(json.dumps(play) + "\n", encoding="utf-8")
+        out, _ = self.run_cli("show", "1")
+        sync = out[out.index("sync:"):out.index("display:")]
+        self.assertIn("BL_SYNC_SEMPOOL  none", sync)
+        self.assertIn("BL_SYNC_PACK     valve-experimental-11.0-20261027b-r1", sync)
+        self.assertNotIn("VK_ICD_FILENAMES", sync)
+        self.assertIn("nopool", self.run_cli("problems")[0])
+
     def test_show_unknown_play_fails(self):
         with self.assertRaises(SystemExit):
             self.run_cli("show", "9")
