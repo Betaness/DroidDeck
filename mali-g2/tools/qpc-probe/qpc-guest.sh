@@ -87,7 +87,9 @@ case ${1:-} in
 import os, subprocess, sys, time
 pid, q, n, r = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 env = dict(kv.split("=", 1) for kv in open("/proc/%s/environ" % pid).read().split("\0") if "=" in kv)
-env = {k: v for k, v in env.items() if not k.startswith("QPCPROBE_")}
+# The game inherits a wineserver socket fd and WINELOADERNOEXEC from its parent; a fresh wine with
+# those fails with "Bad server socket" and exits, so the bench starts its own connection.
+env = {k: v for k, v in env.items() if not k.startswith("QPCPROBE_") and k not in ("WINESERVERSOCKET", "WINELOADERNOEXEC")}
 env["LD_PRELOAD"] = ":".join(x for x in env.get("LD_PRELOAD", "").split(":") if x and "libqpcprobe" not in x)
 env["WINEDEBUG"] = "-all"
 exe = os.path.realpath("/proc/%s/exe" % pid)

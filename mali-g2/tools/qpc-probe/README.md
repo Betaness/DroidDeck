@@ -23,7 +23,7 @@
 | `qpcprobe.c` | 预加载库。不设 `QPCPROBE_DIR` 时只是直通。设了就计数：按 `pthread_self()` 的无锁表（不用线程局部存储：预加载了 libhybris-common 时静态 TLS 余量很紧），每线程最多 16 个调用点；每 `QPCPROBE_INTERVAL_MS`（默认 5000）由读 `CLOCK_MONOTONIC_RAW` 的线程顺手把快照追加到 `$QPCPROBE_DIR/qpc-<pid>.log`（命令行含 `QPCPROBE_MATCH` 的进程才写），格式见文件头。只用 `write(2)`，不调加载器。每次调用多几 ns（本机 proot 里 203 → 221 ns，proot 的 `clock_gettime` 不走 vDSO） |
 | `qpcbench.c` | 测速程序，见上；`qpcbench.exe [N] [重复次数]`，各种调用交错测，输出每种的最快和中位 ns/次 |
 | `build.sh` | 编出 `libqpcprobe.so`（只用 GLIBC_2.17 的符号，guest 是 Debian bullseye）和 `qpcbench.exe` |
-| `qpc-guest.sh` | 在 guest 里跑（`droiddeckctl guest`，或测试工具的 g.sh）：`install`（从 App 的 agent-inbox 拷文件，写进 `game-environment.json` 的 `games[appid]`：`LD_PRELOAD` 会替换继承的值，所以写成 G2 会话里鸭科夫继承的那串（libblsession、libfakeinput、Steam 的三项叠加层）再加探针，droiddeck-game-env 仍把 libhybris-common 放第一；App 每次开会话都重写这个文件）、`check`、`bench`（复制游戏进程的环境，去掉探针、`WINEDEBUG=-all`，用游戏的 Wine 跑 qpcbench.exe，绑到主线程同簇的另一个核上，记下那个核测前测后的频率）、`report`、`dump`、`restore` |
+| `qpc-guest.sh` | 在 guest 里跑（`droiddeckctl guest`，或测试工具的 g.sh）：`install`（从 App 的 agent-inbox 拷文件，写进 `game-environment.json` 的 `games[appid]`：`LD_PRELOAD` 会替换继承的值，所以写成 G2 会话里鸭科夫继承的那串（libblsession、libfakeinput、Steam 的三项叠加层）再加探针，droiddeck-game-env 仍把 libhybris-common 放第一；App 每次开会话都重写这个文件）、`check`、`bench`（复制游戏进程的环境，去掉探针和继承的 `WINESERVERSOCKET`、`WINELOADERNOEXEC`（否则 wine 报 Bad server socket 直接退出）、`WINEDEBUG=-all`，用游戏的 Wine 跑 qpcbench.exe，绑到主线程同簇的另一个核上，记下那个核测前测后的频率）、`report`、`dump`、`restore` |
 | `qpc-report.py` | 分析：选进程（`--pid`，或命令行含 `--match` 的调用最多的那个）、按最后 `--last` 秒的快照算每秒次数，列出主线程的调用点（在 guest 里跑时从映射的文件读 ELF 符号）、各线程的 QPC 次数；给了 `--bench` 就算主线程占比 N×t、可省的占比和门槛结论；`--fps` 换算成每帧次数，`--bench-ghz`/`--main-ghz` 把测速核的耗时换算到主线程的频率 |
 
 ## 设备上怎么做
