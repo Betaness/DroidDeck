@@ -469,7 +469,7 @@ class GameEnvironmentTest(unittest.TestCase):
             performance["games"] = {"3405340": {"FEX_TSOENABLED": "0"}}
             self.assertEqual(MODULE["apply_config"]({}, performance, "3405340", env)["FEX_TSOENABLED"], "0")
 
-    def test_duckov_alone_gets_the_fex_lookup_caches(self):
+    def test_duckov_alone_gets_the_fex_lookup_caches_and_monohacks_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             def game(*names):
                 for name in names:
@@ -480,14 +480,16 @@ class GameEnvironmentTest(unittest.TestCase):
             duckov = game("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll",
                           "Escape from Duckov/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
             env, extra, notes = MODULE["engine_fixes"](duckov, [])
-            self.assertEqual(env, {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0"})
-            self.assertEqual((extra, notes), ([], ["Unity: FEX with TSO", "Escape from Duckov: FEX L2 lookup cache on, fixed L1"]))
-            preset = {"version": 1, "shared": {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "1"}}
+            self.assertEqual(env, {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0",
+                                   "FEX_MONOHACKS": "0"})
+            self.assertEqual((extra, notes), ([], ["Unity: FEX with TSO", "Escape from Duckov: FEX L2 lookup cache on, fixed L1",
+                                                   "Escape from Duckov: FEX MonoHacks off"]))
+            preset = {"version": 1, "shared": {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "1", "FEX_MONOHACKS": "1"}}
             result = MODULE["apply_config"]({"FEX_DYNAMICL1CACHE": "1"}, preset, "3167020", env)
-            self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"]), ("0", "0"))
-            preset["games"] = {"3167020": {"FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1"}}
+            self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"], result["FEX_MONOHACKS"]), ("0", "0", "0"))
+            preset["games"] = {"3167020": {"FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1", "FEX_MONOHACKS": "1"}}
             result = MODULE["apply_config"]({}, preset, "3167020", env)
-            self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"]), ("1", "1"))
+            self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"], result["FEX_MONOHACKS"]), ("1", "1", "1"))
             other_unity = game("Other/Other.exe", "Other/UnityPlayer.dll")
             other_duckov = game("Not Unity/Duckov.exe")
             ava = game("AVA/AVA.exe", "AVA/AVA.ini")

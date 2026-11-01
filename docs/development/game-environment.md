@@ -67,6 +67,12 @@ the slow path; with the L2 cache there were none. On a Xring O3 this measured
 80 MiB more memory. The settings do not change generated code. Set either
 variable to `1` in the game's own environment to turn it back.
 
+It also runs with FEX's MonoHacks off (`FEX_MONOHACKS=0`; by default FEX
+special-cases the code Mono's JIT writes). That took about 2.2 million cycles a
+frame off the main thread: +8.6 ± 0.7 fps at matched clocks at low resolution
+(105.5 against 96.8 fps), with no crash or hang in a 25-minute run. Set
+`FEX_MONOHACKS=1` in the game's own environment to turn it back.
+
 ## Defaults and available suggestions
 
 The initial configuration enables Mesa shader caching with

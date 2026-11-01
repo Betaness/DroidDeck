@@ -109,6 +109,16 @@ def duckov_lookup_cache(game):
 
 
 @fix
+def duckov_mono_hacks(game):
+    """FEX's MonoHacks (on by default) special-case the code Mono's JIT writes. Without them Escape from
+    Duckov's main thread needs about 2.2 million fewer cycles a frame: on a Xring O3 at low resolution under
+    Proton Experimental 11.0-20261027b that was +8.6 +- 0.7 fps at matched clocks (105.5 against 96.8 fps,
+    n=4 each), with no crash or hang in a 25-minute run at 105 fps. A per-game FEX_MONOHACKS=1 turns it back."""
+    if game.stem == "duckov" and "unityplayer.dll" in game.files:
+        return {"FEX_MONOHACKS": "0"}, [], "Escape from Duckov: FEX MonoHacks off"
+
+
+@fix
 def godot_vulkan(game):
     if is_godot(game) and not game.has_arg("--rendering-driver"):
         return {}, ["--rendering-driver", "vulkan"], "Godot: Vulkan renderer"
