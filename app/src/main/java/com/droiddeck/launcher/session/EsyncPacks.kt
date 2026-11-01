@@ -395,8 +395,31 @@ object EsyncPacks {
         }
     }
 
-    internal fun poolless(store: File, tools: List<ToolState>): List<ToolState> =
-        tools.filter { it.state == "pack" && it.packId?.let { id -> hasPool(store, id) } == false }
+    /**
+     * The tools whose pack has no semaphore pool. A tool is left out when an installed pack with the pool now
+     * outranks its pack by the guest's rule: the app installed it (an APK's extra pack) after the guest last
+     * chose, and the guest takes it at the next launch.
+     */
+    internal fun poolless(store: File, tools: List<ToolState>): List<ToolState> = tools.filter { tool ->
+        tool.state == "pack" && tool.packId?.let { id -> hasPool(store, id) } == false &&
+            nextPack(store, tool)?.let { hasPool(store, it) } != true
+    }
+
+    /** The installed pack the guest would choose for [tool] now, by the same rule as [settled]; null if none ranks. */
+    internal fun nextPack(store: File, tool: ToolState): String? {
+        val ntdll = tool.ntdll.trim().lowercase()
+        val wineserver = tool.wineserver.trim().lowercase()
+        if (!SHA256.matches(ntdll) || !SHA256.matches(wineserver)) return null
+        val token = tool.versionLine.trim().split(Regex("\\s+")).getOrNull(1).orEmpty()
+        val current = tool.packId?.takeIf { ID.matches(it) }?.let { installedPack(store, it) }
+        val exports = if (current != null && current.opt("source_match") == true && token.isNotEmpty() && current.opt("version") == token)
+            (current.opt("exports") as? String).orEmpty() else ""
+        val epoch = epochOf(tool.versionLine)
+        return installedIds(store).filter { !File(store, "packs/$it/$IGNORED").exists() }
+            .mapNotNull { id -> installedPack(store, id)?.let { id to packRank(it, ntdll, wineserver, token, exports, epoch) } }
+            .filter { it.second.kind > 0 }
+            .maxWithOrNull(compareBy({ it.second }, { it.first }))?.first
+    }
 
     /** Says once per tool and pack that the pack in use has no semaphore pool. */
     internal fun reportPoolless(store: File, tools: List<ToolState>): List<ToolState> = poolless(store, tools).filter { tool ->

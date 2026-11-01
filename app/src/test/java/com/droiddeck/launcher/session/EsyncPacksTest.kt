@@ -875,6 +875,36 @@ class EsyncPacksTest {
         assertEquals(emptyList<EsyncPacks.ToolState>(), EsyncPacks.status(root).poolless)
     }
 
+    @Test fun aPooledPackInstalledSinceTheGuestChoseIsNotReportedAsMissing() {
+        val root = temp.newFolder("rootfs")
+        val store = EsyncPacks.store(root)
+        val ntdll = "1".repeat(64)
+        val wineserver = "2".repeat(64)
+        val version = "experimental-11.0-20261027b-arm64"
+        val line = "1793301884 $version"
+        fun install(id: String, rev: Int, pool: Boolean, stockNtdll: String = ntdll, ignored: Boolean = false) {
+            val dir = File(store, "packs/$id").apply { mkdirs() }
+            File(dir, "pack.json").writeText(packJson(id, rev = rev, ntdll = stockNtdll, wineserver = wineserver, version = version)
+                .put("version_line", line).toString())
+            File(dir, EsyncPacks.NTDLL).apply { parentFile!!.mkdirs() }
+                .writeText(if (pool) "ntdll droiddeck-sempool: up and running." else "ntdll")
+            File(dir, ".complete").writeText("")
+            if (ignored) File(dir, ".ignored").writeText("")
+        }
+        val valve = "valve-experimental-11.0-20261027b-arm64-1793301631-406ecaaf88ce"
+        install("$valve-r1", 1, pool = false)
+        File(store, "tools.tsv").writeText("/x\t$line\t$ntdll\t$wineserver\tpack\t$valve-r1\n")
+        // A pooled pack for another build, or one the guest ignores, changes nothing.
+        install("valve-other-r2", 2, pool = true, stockNtdll = "3".repeat(64))
+        install("valve-ignored-r3", 3, pool = true, ignored = true)
+        assertEquals(listOf("/x"), EsyncPacks.status(root).poolless.map { it.toolDir })
+        // The APK's extra r2 for the same build is installed before the guest reconciles: the guest takes it next.
+        install("$valve-r2", 2, pool = true)
+        assertEquals("$valve-r2", EsyncPacks.nextPack(store, EsyncPacks.status(root).tools.single()))
+        assertEquals(emptyList<EsyncPacks.ToolState>(), EsyncPacks.status(root).poolless)
+        assertEquals(emptyList<EsyncPacks.ToolState>(), EsyncPacks.reportPoolless(store, EsyncPacks.status(root).tools))
+    }
+
     @Test fun statusCountsAnInstalledMatchingPackBeforeTheNextReconcile() {
         val root = temp.newFolder("rootfs")
         val store = EsyncPacks.store(root)
