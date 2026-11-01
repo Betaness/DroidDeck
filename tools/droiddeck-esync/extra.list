@@ -3,6 +3,8 @@
 # asset against the sha256 below and writes app/src/main/assets/droiddeck-esync-extra/.
 # Each pack needs both <id>.tzst and <id>.json (the index entry built with it).
 # repo	tag	asset	sha256
+Betaness/DroidDeck-Components	droiddeck-sempool-valve3-r2	valve-experimental-11.0-20261027b-arm64-1793301631-406ecaaf88ce-r2.tzst	8831d7c2a8a34468ece7a747d82b519ea0a39b10bc9355caf5d9e0eb188732fe
+Betaness/DroidDeck-Components	droiddeck-sempool-valve3-r2	valve-experimental-11.0-20261027b-arm64-1793301631-406ecaaf88ce-r2.json	eaa8be19e7bb34cf35c2297461345474ccaa206501eb25e7cf9bb40d69346757
 Betaness/DroidDeck-Components	droiddeck-sempool-valve-r2	valve-experimental-11.0-20261014-arm64-1791970419-ccf9fc588e30-r2.tzst	f079da9fd6e01412f4717aa1e13527f6d709c9651b20bc74a90d91c07024a396
 Betaness/DroidDeck-Components	droiddeck-sempool-valve-r2	valve-experimental-11.0-20261014-arm64-1791970419-ccf9fc588e30-r2.json	296d974f3bf086e68bca6b7ffa006c8bd617df414bcc3bcb93a731632c70c7a1
 Betaness/DroidDeck-Components	droiddeck-sempool-valve2-r2	valve-experimental-11.0-20261008-arm64-1791462211-cc503f620c4a-r2.tzst	88b6e5efca4202fae782894f1de0fcef5385e094bbca0d7079871be27851e09f
