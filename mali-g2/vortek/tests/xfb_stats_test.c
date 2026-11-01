@@ -5,7 +5,9 @@
  *   2 the counters through the header: modules that declare Xfb are remembered until destroyed,
  *     pipelines are classified by inline code and by module, failed (null) pipelines are not counted,
  *     the first pipeline logs at once, later lines wait for the interval and come only from every
- *     256th command or 64th present, a flush logs once and never repeats an unchanged line;
+ *     256th command or 64th present, a flush logs once and never repeats an unchanged line, and once
+ *     something was counted a line comes after the interval even with the same counts when the seconds
+ *     moved on (so the last line's seconds follow the process's run time);
  *   3 the client: its overrides for vkCreateShaderModule / vkDestroyShaderModule /
  *     vkCreateGraphicsPipelines / vkCmdBeginTransformFeedbackEXT / vkCmdDrawIndirectByteCountEXT
  *     count and forward every argument, vkDestroyDevice logs "vortek-client: xfb stats: ...".
@@ -203,7 +205,10 @@ static void counters(void) {
     CHECK(lastLine(text, "t", v) && v[0] == 3 && v[1] == 1 && v[2] == 512 && v[3] == 0);
     free(text);
 
-    /* presents: nothing while nothing changed; the 64th present after the interval logs a change */
+    /* presents: nothing while nothing changed (the same counts in the same second: the clock of the
+     * seconds starts again here, so a slow machine does not see a second go by); the 64th present after
+     * the interval logs a change */
+    __atomic_store_n(&xfbStats.startNs, xfb_now_ns(), __ATOMIC_RELAXED);
     sleepMs(250);
     for (int i = 0; i < 200; i++) xfb_stats_present("t");
     text = captureRead();
@@ -223,6 +228,17 @@ static void counters(void) {
     text = captureRead();
     CHECK(countOf(text, "xfb stats:") == 1);
     CHECK(lastLine(text, "t", v) && v[2] == 513);
+    free(text);
+
+    /* the same counts, seconds later: the 64th present after the interval logs them again with the new
+     * seconds, once; a flush in the same second adds nothing */
+    __atomic_store_n(&xfbStats.startNs, xfb_now_ns() - 5000000000ull, __ATOMIC_RELAXED);
+    sleepMs(250);
+    for (int i = 0; i < 128; i++) xfb_stats_present("t");
+    xfb_stats_flush("t");
+    text = captureRead();
+    CHECK(countOf(text, "xfb stats:") == 1);
+    CHECK(lastLine(text, "t", v) && v[0] == 3 && v[2] == 513 && v[3] == 1 && v[4] >= 5);
     free(text);
 }
 

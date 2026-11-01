@@ -19,9 +19,12 @@
  * Nothing is logged until something is counted. Then a line on stderr (the game's log),
  *   "<tag>: xfb stats: pid P, pipelines N, gs G, begins B, drawauto A, seconds S"
  * with S the seconds since the process's first device: right away for the first pipeline counted,
- * afterwards at most once a minute while the counts change (looked at when pipelines are created, every
- * 256th counted command and every 64th present), and when a device is destroyed. The play journal keeps
- * the last line of each process (LogSliceScanner, the record's gpu.xfb).
+ * afterwards at most once a minute (looked at when pipelines are created, every 256th counted command and
+ * every 64th present), and when a device is destroyed. Once something was counted, a line comes once a
+ * minute even when the counts stay the same, so S of the last line stays within a minute of the time
+ * the process has run: a game that uses stream output only while loading must not get its loading rate
+ * as its rate per minute. A line never repeats the line before it. The play journal keeps the last line
+ * of each process (LogSliceScanner, the record's gpu.xfb).
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -77,12 +80,12 @@ static inline bool xfb_spirv_declares(const uint32_t* code, size_t words) {
 typedef struct {
     uint64_t pipelines, gs, begins, drawAuto; /* atomics */
     uint64_t startNs;                         /* the first device (atomic) */
-    uint32_t dirty;                           /* counted since the last line (atomic) */
+    uint32_t counted;                         /* counted anything ever (atomic) */
     uint32_t presents;                        /* atomic */
     pthread_mutex_t lock;                     /* modules, and the fields below */
     uint64_t* modules;                        /* handles of shader modules that declare Xfb */
     uint32_t moduleCount, moduleCap;          /* moduleCount is read without the lock (atomic) */
-    uint64_t lastLogNs, logged[4];
+    uint64_t lastLogNs, logged[5];
 } XfbStats;
 
 static XfbStats xfbStats = {.lock = PTHREAD_MUTEX_INITIALIZER};
@@ -100,26 +103,29 @@ static inline void xfb_stats_device_created(void) {
         __atomic_compare_exchange_n(&xfbStats.startNs, &zero, xfb_now_ns(), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
-/* The line, if the counts changed since the last one and (unless `force`) a minute has passed. `wait`:
- * take the lock (pipeline creation, device destruction); commands and presents only try it. */
+/* The line, once something was counted, if (unless `force`) a minute has passed since the last one and
+ * the counts or the seconds differ from it. `wait`: take the lock (pipeline creation, device destruction);
+ * commands and presents only try it. */
 static inline void xfb_stats_maybe_log(const char* tag, bool force, bool wait) {
-    if (!__atomic_load_n(&xfbStats.dirty, __ATOMIC_RELAXED)) return;
+    if (!__atomic_load_n(&xfbStats.counted, __ATOMIC_RELAXED)) return;
     uint64_t now = xfb_now_ns();
     if (!force && now - __atomic_load_n(&xfbStats.lastLogNs, __ATOMIC_RELAXED) < XFB_LOG_INTERVAL_NS) return;
     if (wait) pthread_mutex_lock(&xfbStats.lock);
     else if (pthread_mutex_trylock(&xfbStats.lock)) return;
     if (force || now - xfbStats.lastLogNs >= XFB_LOG_INTERVAL_NS) {
-        __atomic_store_n(&xfbStats.dirty, 0, __ATOMIC_RELAXED);
         uint64_t v[4] = {__atomic_load_n(&xfbStats.pipelines, __ATOMIC_RELAXED), __atomic_load_n(&xfbStats.gs, __ATOMIC_RELAXED),
                          __atomic_load_n(&xfbStats.begins, __ATOMIC_RELAXED), __atomic_load_n(&xfbStats.drawAuto, __ATOMIC_RELAXED)};
-        if (v[0] != xfbStats.logged[0] || v[1] != xfbStats.logged[1] || v[2] != xfbStats.logged[2] || v[3] != xfbStats.logged[3]) {
-            uint64_t start = __atomic_load_n(&xfbStats.startNs, __ATOMIC_RELAXED);
+        uint64_t start = __atomic_load_n(&xfbStats.startNs, __ATOMIC_RELAXED);
+        uint64_t seconds = start && now > start ? (now - start) / 1000000000ull : 0;
+        if (v[0] != xfbStats.logged[0] || v[1] != xfbStats.logged[1] || v[2] != xfbStats.logged[2] || v[3] != xfbStats.logged[3]
+            || seconds != xfbStats.logged[4]) {
             fprintf(stderr, "%s: xfb stats: pid %d, pipelines %llu, gs %llu, begins %llu, drawauto %llu, seconds %llu\n", tag, (int)getpid(),
                     (unsigned long long)v[0], (unsigned long long)v[1], (unsigned long long)v[2], (unsigned long long)v[3],
-                    (unsigned long long)(start && now > start ? (now - start) / 1000000000ull : 0));
+                    (unsigned long long)seconds);
             for (int i = 0; i < 4; i++) xfbStats.logged[i] = v[i];
+            xfbStats.logged[4] = seconds;
+            __atomic_store_n(&xfbStats.lastLogNs, now, __ATOMIC_RELAXED);
         }
-        __atomic_store_n(&xfbStats.lastLogNs, now, __ATOMIC_RELAXED);
     }
     pthread_mutex_unlock(&xfbStats.lock);
 }
@@ -185,25 +191,25 @@ static inline void xfb_stats_pipelines_created(const char* tag, uint32_t count, 
     }
     if (!xfb && !gs) return;
     uint64_t before = __atomic_fetch_add(&xfbStats.pipelines, xfb, __ATOMIC_RELAXED) + __atomic_fetch_add(&xfbStats.gs, gs, __ATOMIC_RELAXED);
-    __atomic_store_n(&xfbStats.dirty, 1, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&xfbStats.counted, __ATOMIC_RELAXED)) __atomic_store_n(&xfbStats.counted, 1, __ATOMIC_RELAXED);
     xfb_stats_maybe_log(tag, before == 0, true);
 }
 
 static inline void xfb_stats_begin(const char* tag) {
     uint64_t n = __atomic_add_fetch(&xfbStats.begins, 1, __ATOMIC_RELAXED);
-    __atomic_store_n(&xfbStats.dirty, 1, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&xfbStats.counted, __ATOMIC_RELAXED)) __atomic_store_n(&xfbStats.counted, 1, __ATOMIC_RELAXED);
     if (!(n & XFB_COMMAND_CHECK_MASK)) xfb_stats_maybe_log(tag, false, false);
 }
 
 static inline void xfb_stats_draw_auto(const char* tag) {
     uint64_t n = __atomic_add_fetch(&xfbStats.drawAuto, 1, __ATOMIC_RELAXED);
-    __atomic_store_n(&xfbStats.dirty, 1, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&xfbStats.counted, __ATOMIC_RELAXED)) __atomic_store_n(&xfbStats.counted, 1, __ATOMIC_RELAXED);
     if (!(n & XFB_COMMAND_CHECK_MASK)) xfb_stats_maybe_log(tag, false, false);
 }
 
-/* At every present: nothing to do (one relaxed load) unless something was counted since the last line. */
+/* At every present: nothing to do (one relaxed load) until something was counted. */
 static inline void xfb_stats_present(const char* tag) {
-    if (!__atomic_load_n(&xfbStats.dirty, __ATOMIC_RELAXED)) return;
+    if (!__atomic_load_n(&xfbStats.counted, __ATOMIC_RELAXED)) return;
     if (!(__atomic_add_fetch(&xfbStats.presents, 1, __ATOMIC_RELAXED) & XFB_PRESENT_CHECK_MASK)) xfb_stats_maybe_log(tag, false, false);
 }
 
