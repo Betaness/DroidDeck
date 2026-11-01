@@ -86,7 +86,25 @@ class JournalTest(unittest.TestCase):
         duckov = next(l for l in out.splitlines() if "Escape from Duckov" in l)
         self.assertIn("3167020", duckov)
         self.assertIn("1/0/0/0", duckov)
+        self.assertTrue(duckov.rstrip().endswith("-"))  # no stream output recorded
         self.assertIn("vortek", next(l for l in out.splitlines() if "A.V.A" in l))
+
+    def test_games_summary_shows_the_most_stream_output_of_any_play(self):
+        plays = []
+        for i, xfb in enumerate(({"pipelines": 3, "gs": 0, "begins": 900, "drawAuto": 0, "beginsPerMin": 30.0},
+                                 {"pipelines": 1, "gs": 2, "begins": 9000, "drawAuto": 4, "beginsPerMin": 1800.4}, None)):
+            play = json.loads(PLAY)
+            play["id"] = "p%d" % i
+            if xfb:
+                play["gpu"]["xfb"] = xfb
+            plays.append(json.dumps(play))
+        self.path.write_text("\n".join(plays) + "\n", encoding="utf-8")
+        out, _ = self.run_cli("games")
+        duckov = next(l for l in out.splitlines() if "Escape from Duckov" in l)
+        self.assertTrue(duckov.rstrip().endswith("3p/2g 1800/min"), duckov)
+        self.assertIn("xfb", out.splitlines()[0])
+        shown, _ = self.run_cli("show", "p1")
+        self.assertIn('xfb       {"pipelines": 1, "gs": 2, "begins": 9000, "drawAuto": 4, "beginsPerMin": 1800.4}', shown)
 
     def test_show_prints_the_whole_play(self):
         out, _ = self.run_cli("show", "1")

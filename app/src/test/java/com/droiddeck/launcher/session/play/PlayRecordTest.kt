@@ -47,14 +47,17 @@ class PlayRecordTest {
         return s
     }
 
-    private fun finished(): MutableMap<String, Any?> {
+    private fun finished(streamOutput: Boolean = true): MutableMap<String, Any?> {
         val s = play()
         val end = t0 + 1_830_000
         val r = PlayRecord.base(s, end, zone)
         val log = tmp.newFile("Player.log").apply {
             writeText("    Renderer: Mali-G2-Ultra-NX MC16 (ID=0x8001)\nCrash!!!\nerr:vulkan:vkCreateDevice failed, token=abcd1234efgh from 10.0.0.5\n")
         }
-        val f = LogSliceScanner().scan(listOf(LogSliceScanner.Source("Player.log", log)))
+        val proton = tmp.newFile().apply {
+            if (streamOutput) writeText("hybris-icd: xfb stats: pid 4242, pipelines 3, gs 1, begins 54000, drawauto 12, seconds 1800\n")
+        }
+        val f = LogSliceScanner().scan(listOf(LogSliceScanner.Source("Player.log", log), LogSliceScanner.Source("steam-3167020.log", proton)))
         val exit = ExitClassifier.classify(PlayRecord.evidenceFrom(PlayRecord.evidence(s, end), f, usedVortek = false))
         PlayRecord.finish(r, f, exit, zone)
         return r
@@ -74,6 +77,7 @@ class PlayRecordTest {
         val gpu = r["gpu"] as Map<*, *>
         assertEquals("hybris", gpu["used"])
         assertEquals("Mali-G2-Ultra-NX MC16 (ID=0x8001)", gpu["renderer"])
+        assertEquals(mapOf("pipelines" to 3L, "gs" to 1L, "begins" to 54000L, "drawAuto" to 12L, "beginsPerMin" to 1800.0), gpu["xfb"])
         val fps = r["fps"] as Map<*, *>
         assertEquals("game-layer", fps["source"])
         assertEquals(78.0, fps["mean"] as Double, 0.5)
@@ -87,6 +91,11 @@ class PlayRecordTest {
         assertEquals(2210L, mem["gameHwmMB"])
         assertEquals(120L, mem["appNativeMaxMB"])
         assertEquals(listOf(mapOf("atS" to 1210L, "t" to "2026-10-28T01:37:42+11:00")), r["marks"])
+    }
+
+    @Test fun aGameWithoutStreamOutputHasNoXfb() {
+        val gpu = finished(streamOutput = false)["gpu"] as Map<*, *>
+        assertEquals(listOf("asked", "used", "renderer", "dxvk"), gpu.keys.toList())
     }
 
     @Test fun theTimelineFoldsRefreshRateFlipsAndTakesTheLogsFirstTimes() {
@@ -142,6 +151,7 @@ class PlayRecordTest {
         val back = Json.parse(line) as Map<*, *>
         assertEquals(r.keys.toList(), back.keys.toList())
         assertEquals(Json.write((r["fps"])), Json.write(back["fps"]))
+        assertEquals(Json.write((r["gpu"])), Json.write(back["gpu"]))
         assertEquals(Json.write((r["settings"])), Json.write(back["settings"]))
     }
 

@@ -59,6 +59,26 @@ class LogSliceScanner(
         val sources = ArrayList<String>()
         /** Labels of the game's own logs (see [Source.game]). */
         val gameLabels = LinkedHashSet<String>()
+        /**
+         * D3D11 stream output, from the GPU paths' "xfb stats" lines in the game's logs
+         * (mali-g2/vortek/src/xfb_stats.h): the last line of each process, by pid.
+         */
+        val xfb = LinkedHashMap<Int, XfbLine>()
+
+        /** Summed over the processes; null when no line was seen (none used stream output or geometry shaders). */
+        fun xfbTotals(): Map<String, Any?>? {
+            if (xfb.isEmpty()) return null
+            val begins = xfb.values.sumOf { it.begins }
+            val seconds = xfb.values.maxOf { it.seconds }
+            return linkedMapOf(
+                "pipelines" to xfb.values.sumOf { it.pipelines },
+                "gs" to xfb.values.sumOf { it.gs },
+                "begins" to begins,
+                "drawAuto" to xfb.values.sumOf { it.drawAuto },
+                // Over the longest-running process's seconds: the other processes' counts fall in them too.
+                "beginsPerMin" to if (seconds > 0) PlayAccumulator.r1(begins * 60.0 / seconds) else null,
+            )
+        }
 
         fun swapchain(size: String) { if (swapchainSet.size < 32) swapchainSet.add(size) }
 
@@ -77,6 +97,8 @@ class LogSliceScanner(
 
         private fun area(s: String): Long = s.split('x').mapNotNull { it.toLongOrNull() }.takeIf { it.size == 2 }?.let { it[0] * it[1] } ?: 0L
     }
+
+    class XfbLine(val pipelines: Long, val gs: Long, val begins: Long, val drawAuto: Long, val seconds: Long)
 
     private class Pattern(val kind: String, val needle: String)
 
@@ -210,6 +232,14 @@ class LogSliceScanner(
             line.contains("droiddeck-game-env:") && line.contains("Vulkan in-process (libhybris)") -> { f.gpuUsed = "hybris"; return true }
             line.contains("droiddeck-game-env:") && line.contains("in-process GPU asked for, but") -> { f.gpuUsed = "vortek"; return true }
             line.contains("cluster steering: moved") -> { f.steers++; return true }
+            line.contains(": xfb stats: pid ") -> {
+                // Steam's own processes write to the session's logs, and zink has transform feedback too.
+                if (label !in f.gameLabels) return true
+                XFB_STATS.find(line)?.destructured?.let { (pid, p, g, b, a, sec) ->
+                    f.xfb[pid.toInt()] = XfbLine(p.toLong(), g.toLong(), b.toLong(), a.toLong(), sec.toLong())
+                }
+                return true
+            }
             line.contains("Found device: ") && f.device == null && line.contains("info:") && label in f.gameLabels -> {
                 f.device = line.substringAfter("Found device: ").trim().take(80)
                 if (SOFTWARE.any { f.device!!.contains(it) }) f.software = true
@@ -268,6 +298,7 @@ class LogSliceScanner(
         private val X11_FPS = Regex("""-x11: \d+ frames, ([0-9.]+) fps""")
         private val ZERO_COPY_SWAPCHAIN = Regex("""zero-copy swapchain \d+ of presenter \d+: (\d+)x(\d+)""")
         private val CLIENT_SWAPCHAIN = Regex("""(?:vortek-x11|hybris-wsi): swapchain (\d+)x(\d+) (?:for window|format)""")
+        private val XFB_STATS = Regex("""xfb stats: pid (\d+), pipelines (\d+), gs (\d+), begins (\d+), drawauto (\d+), seconds (\d+)""")
         private val TRACKED = Regex("""adding PID (\d+) as a tracked process""")
         private val EXIT_CODE = Regex("""exit code (-?\d+)""")
         private val STAMP = Regex("""^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})]""")

@@ -156,5 +156,29 @@ class LogSliceScannerTest {
         val f = LogSliceScanner().scan(listOf(LogSliceScanner.Source("s", file("s.log", "all fine"))))
         assertTrue(f.errors.isEmpty())
         assertNull(f.steamExitCode)
+        assertNull(f.xfbTotals())
+    }
+
+    @Test fun streamOutputCountsAreTheLastLineOfEachGameProcess() {
+        val game = file("steam-3167020.log",
+            "hybris-icd: xfb stats: pid 120, pipelines 1, gs 0, begins 0, drawauto 0, seconds 3",
+            "hybris-icd: xfb stats: pid 120, pipelines 4, gs 2, begins 9000, drawauto 30, seconds 180",
+            "vortek-client: xfb stats: pid 77, pipelines 1, gs 1, begins 600, drawauto 0, seconds 60",
+            "hybris-icd: xfb stats: pid 120, pipelines nonsense",
+        )
+        // Steam's processes (zink has transform feedback) write to the session's log: not the game's.
+        val session = file("session.log", "vortek-client: xfb stats: pid 5, pipelines 9, gs 9, begins 99999, drawauto 9, seconds 9")
+        val f = LogSliceScanner().scan(listOf(
+            LogSliceScanner.Source("session.log", session, game = false), LogSliceScanner.Source("steam-3167020.log", game)))
+        assertEquals(setOf(120, 77), f.xfb.keys)
+        assertEquals(
+            mapOf("pipelines" to 5L, "gs" to 3L, "begins" to 9600L, "drawAuto" to 30L, "beginsPerMin" to 3200.0),
+            f.xfbTotals(),
+        )
+        assertTrue(f.errors.isEmpty())
+        // Counted at once, before a second has passed: no rate.
+        val early = LogSliceScanner().scan(listOf(LogSliceScanner.Source("g", file("g.log",
+            "hybris-icd: xfb stats: pid 1, pipelines 1, gs 0, begins 0, drawauto 0, seconds 0"))))
+        assertEquals(null, early.xfbTotals()!!["beginsPerMin"])
     }
 }

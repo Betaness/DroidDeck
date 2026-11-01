@@ -259,6 +259,7 @@ object PlayRecord {
                 if (f.software) put("used", "cpu")
                 put("renderer", f.renderer ?: f.device)
                 put("dxvk", f.dxvk)
+                f.xfbTotals()?.let { put("xfb", it) }
             }
         }
         (r["display"] as? Map<String, Any?>)?.let { d ->

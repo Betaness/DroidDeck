@@ -3,7 +3,7 @@
 
 usage: play-journal.py [--file PLAYS.jsonl] [--package PKG] [--json] COMMAND ...
   list [-n 30] [--game TEXT] [--since 2d]   one row per play, newest last (the default command)
-  games                                      per game: plays, time, typical fps, worst lows, problems
+  games                                      per game: plays, time, typical fps, worst lows, problems, stream output
   show <#|id|last>                           one play in full: per-minute fps / Hz / temperatures, errors, env
   problems                                   plays with flags and the owner's marks, and whether their logs are still there
   open                                       plays in progress (or left by an app that died: recorded at the next session)
@@ -17,6 +17,11 @@ selected records as JSON lines for further scripting. Lines that do not parse ar
 fps are frames the game presented (its own layer) or, for a game drawn through X11 (copy path, a window paced as
 hidden), frames the compositor composited: the list marks those with "s" (fps.source "screen"). Frame times
 (1% low, p99) exist only for the game layer. Hz per minute is the time-weighted mean refresh rate.
+
+gpu.xfb (only in plays that created a pipeline with D3D11 stream output or a geometry shader, mali-g2/vortek/src/
+xfb_stats.h): pipelines with transform feedback, gs pipelines with a geometry shader, begins of transform feedback
+(a lower bound of the stream-output draws), drawAuto, beginsPerMin. `games` shows the most of any play as
+"<pipelines>p/<gs>g <begins per minute>/min" ("-": no play of the game recorded any).
 """
 import argparse
 import json
@@ -248,7 +253,7 @@ def cmd_games(args, records):
     for r in plays_of(records):
         key = r.get("appid") or r.get("game") or "?"
         g = games.setdefault(key, {"name": r.get("game") or str(key), "plays": 0, "dur": 0, "focused": 0, "means": [], "low1": [],
-                                    "crash": 0, "devlost": 0, "freeze": 0, "killed": 0, "last": None, "gpus": set()})
+                                    "crash": 0, "devlost": 0, "freeze": 0, "killed": 0, "last": None, "gpus": set(), "xfb": None})
         g["plays"] += 1
         g["dur"] += r.get("durS") or 0
         g["focused"] += r.get("focusedS") or 0
@@ -266,14 +271,25 @@ def cmd_games(args, records):
         used = get(r, "gpu", "used")
         if used:
             g["gpus"].add(used)
+        xfb = get(r, "gpu", "xfb")
+        if isinstance(xfb, dict):
+            most = g["xfb"] or {"pipelines": 0, "gs": 0, "beginsPerMin": 0}
+            g["xfb"] = {k: max(most[k], xfb.get(k) or 0) for k in most}
     if args.json:
         return "\n".join(json.dumps({**g, "appid": k, "gpus": sorted(g["gpus"])}, ensure_ascii=False) for k, g in games.items())
     rows = []
     for k, g in sorted(games.items(), key=lambda kv: kv[1]["last"] or ""):
         rows.append([str(g["name"])[:28], str(k), str(g["plays"]), duration(g["dur"]), duration(g["focused"]),
                      num(median(g["means"])), num(min(g["low1"]) if g["low1"] else None),
-                     f"{g['crash']}/{g['devlost']}/{g['freeze']}/{g['killed']}", short_time(g["last"]), ",".join(sorted(g["gpus"])) or "-"])
-    return table(rows, ["game", "appid", "plays", "time", "focused", "fps~", "worst1%", "crash/lost/freeze/killed", "last", "gpu"])
+                     f"{g['crash']}/{g['devlost']}/{g['freeze']}/{g['killed']}", short_time(g["last"]), ",".join(sorted(g["gpus"])) or "-",
+                     xfb_text(g["xfb"])])
+    return table(rows, ["game", "appid", "plays", "time", "focused", "fps~", "worst1%", "crash/lost/freeze/killed", "last", "gpu", "xfb"])
+
+
+def xfb_text(x):
+    if not x:
+        return "-"
+    return f"{x['pipelines']}p/{x['gs']}g {num(x['beginsPerMin'])}/min"
 
 
 def per_minute(r):
