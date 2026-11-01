@@ -43,6 +43,11 @@
  *     *_CMD_RELEASE_MODE=every forces that (32 without a number), =adaptive the estimate
  *     (cmdmem_release_policy). The estimate stays the default here; the Vortek server's default is
  *     every 32nd reset.
+ *   - D3D11 stream output is counted (vortek/src/xfb_stats.h): graphics pipelines with a stage that
+ *     declares transform feedback or with a geometry shader, vkCmdBeginTransformFeedbackEXT and
+ *     vkCmdDrawIndirectByteCountEXT calls, logged as "hybris-icd: xfb stats: ..." once something is
+ *     counted, for the play journal. Counters only; vkDestroyShaderModule is wrapped for the handles
+ *     of modules that declare it.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -61,6 +66,9 @@
 #include "pipeline_cache.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
 #include "cmd_memory.h"
+#include "xfb_stats.h"
+
+#define XFB_TAG "hybris-icd"
 
 static void* findInChain(const void* chain, VkStructureType type) {
     for (const VkBaseInStructure* s = chain; s; s = s->pNext)
@@ -195,7 +203,15 @@ static VkResult VKAPI_CALL CreateShaderModule(VkDevice handle, const VkShaderMod
     uint32_t* code = NULL;
     VkResult result = device->CreateShaderModule(handle, rewriteShader(info, &rewritten, &code) ? &rewritten : info, allocator, module);
     free(code);
+    if (result == VK_SUCCESS) xfb_stats_module_created((uint64_t)*module, info);
     return result;
+}
+
+static void VKAPI_CALL DestroyShaderModule(VkDevice handle, VkShaderModule module, const VkAllocationCallbacks* allocator) {
+    Device* device = icd_device(handle);
+    if (!device) return;
+    xfb_stats_module_destroyed((uint64_t)module);
+    device->DestroyShaderModule(handle, module, allocator);
 }
 
 /* A stage's inline code (VkShaderModuleCreateInfo anywhere in its pNext chain) rewritten: the stage
@@ -290,6 +306,7 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCa
     }
     VkResult result = device->CreateGraphicsPipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
     if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
+    if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, infos, pipelines);
     for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
     free(rewrites);
     free(copy);
@@ -530,10 +547,46 @@ static void keepNext(void* slot, PFN_vkVoidFunction function) {
 void mali_device_created(Device* device) {
     releaseEvery(); /* before the device's first pool */
     keepNext(&nextResetCommandBuffer, (PFN_vkVoidFunction)device->ResetCommandBuffer);
+    xfb_stats_device_created();
 }
 
 void mali_device_destroyed(Device* device) {
     cmdmem_device_destroyed(commandMemory, (uint64_t)(uintptr_t)device->handle);
+    xfb_stats_flush(XFB_TAG);
+}
+
+void mali_presented(void) {
+    xfb_stats_present(XFB_TAG);
+}
+
+/* ---- stream output counts (xfb_stats.h): the driver's two commands, kept like the reset's ---- */
+
+static PFN_vkCmdBeginTransformFeedbackEXT nextBeginTransformFeedback;
+static PFN_vkCmdDrawIndirectByteCountEXT nextDrawIndirectByteCount;
+
+static void VKAPI_CALL CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount,
+                                                    const VkBuffer* counterBuffers, const VkDeviceSize* counterBufferOffsets) {
+    xfb_stats_begin(XFB_TAG);
+    __atomic_load_n(&nextBeginTransformFeedback, __ATOMIC_ACQUIRE)(commandBuffer, firstCounterBuffer, counterBufferCount, counterBuffers,
+                                                                  counterBufferOffsets);
+}
+
+static void VKAPI_CALL CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance,
+                                                   VkBuffer counterBuffer, VkDeviceSize counterBufferOffset, uint32_t counterOffset,
+                                                   uint32_t vertexStride) {
+    xfb_stats_draw_auto(XFB_TAG);
+    __atomic_load_n(&nextDrawIndirectByteCount, __ATOMIC_ACQUIRE)(commandBuffer, instanceCount, firstInstance, counterBuffer,
+                                                                 counterBufferOffset, counterOffset, vertexStride);
+}
+
+/* The wrapper when the device's driver has the command (vkGetDeviceProcAddr with a device; without one
+ * the driver's own is handed out, uncounted). */
+static PFN_vkVoidFunction xfbProc(VkDevice handle, const char* name, void* slot, PFN_vkVoidFunction wrapper) {
+    Device* device = handle ? icd_device(handle) : NULL;
+    PFN_vkVoidFunction driver = device ? device->instance->GetDeviceProcAddr(handle, name) : NULL;
+    if (!driver) return NULL;
+    keepNext(slot, driver);
+    return wrapper;
 }
 
 static VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags) {
@@ -691,6 +744,11 @@ PFN_vkVoidFunction mali_instance_proc(const char* name) {
 
 PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)CreateShaderModule;
+    if (!strcmp(name, "vkDestroyShaderModule")) return (PFN_vkVoidFunction)DestroyShaderModule;
+    if (!strcmp(name, "vkCmdBeginTransformFeedbackEXT"))
+        return xfbProc(handle, name, &nextBeginTransformFeedback, (PFN_vkVoidFunction)CmdBeginTransformFeedbackEXT);
+    if (!strcmp(name, "vkCmdDrawIndirectByteCountEXT"))
+        return xfbProc(handle, name, &nextDrawIndirectByteCount, (PFN_vkVoidFunction)CmdDrawIndirectByteCountEXT);
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
     if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)CreateComputePipelines;
     if (!strcmp(name, "vkCreateRayTracingPipelinesKHR") || !strcmp(name, "vkGetShaderModuleCreateInfoIdentifierEXT"))

@@ -1909,6 +1909,7 @@ static VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR
             if (overall >= 0) overall = result;
         }
     }
+    mali_presented();
     return overall;
 }
 

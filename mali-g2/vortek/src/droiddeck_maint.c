@@ -16,6 +16,11 @@
  * VK_KHR_maintenance7, VK_KHR_unified_image_layouts and VK_KHR_shader_float_controls2 (no
  * commands) also go over the wire (vortek-0010, winlator-0014): nothing to emulate here.
  *
+ * D3D11 stream output is counted here as on the in-process path (xfb_stats.h, "vortek-client: xfb
+ * stats: ..." in the game's log once something is counted): shader modules and graphics pipelines at
+ * creation, vkCmdBeginTransformFeedbackEXT and vkCmdDrawIndirectByteCountEXT, presents
+ * (client_x11_present.c) for the line's timing. Counters only.
+ *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
  */
@@ -423,6 +428,9 @@ static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
 #include "stage_inline_module.h"
+#include "xfb_stats.h"
+
+#define XFB_TAG "vortek-client"
 
 static bool clipStripOn(void) {
     static int on = -1;
@@ -519,12 +527,38 @@ static VkResult dd_vkCreateShaderModule(VkDevice device, const VkShaderModuleCre
     uint32_t* strippedCode = NULL;
     VkResult r = vt_call_vkCreateShaderModule(device, rewriteShader(info, &stripped, &strippedCode) ? &stripped : info, alloc, module);
     free(strippedCode);
+    if (r == VK_SUCCESS) xfb_stats_module_created((uint64_t)(uintptr_t)*module, info);
     if (dumpDir() && r == VK_SUCCESS) {
         char name[96];
         snprintf(name, sizeof(name), "m%p.spv", (void*)*module);
         dumpWrite(name, info->pCode, info->codeSize);
     }
     return r;
+}
+
+void vt_call_vkDestroyShaderModule(VkDevice, VkShaderModule, const VkAllocationCallbacks*);
+static void dd_vkDestroyShaderModule(VkDevice device, VkShaderModule module, const VkAllocationCallbacks* alloc) {
+    xfb_stats_module_destroyed((uint64_t)(uintptr_t)module);
+    vt_call_vkDestroyShaderModule(device, module, alloc);
+}
+
+void vt_call_vkCmdBeginTransformFeedbackEXT(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*);
+static void dd_vkCmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount,
+                                              const VkBuffer* counterBuffers, const VkDeviceSize* counterBufferOffsets) {
+    xfb_stats_begin(XFB_TAG);
+    vt_call_vkCmdBeginTransformFeedbackEXT(commandBuffer, firstCounterBuffer, counterBufferCount, counterBuffers, counterBufferOffsets);
+}
+
+void vt_call_vkCmdDrawIndirectByteCountEXT(VkCommandBuffer, uint32_t, uint32_t, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+static void dd_vkCmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance, VkBuffer counterBuffer,
+                                             VkDeviceSize counterBufferOffset, uint32_t counterOffset, uint32_t vertexStride) {
+    xfb_stats_draw_auto(XFB_TAG);
+    vt_call_vkCmdDrawIndirectByteCountEXT(commandBuffer, instanceCount, firstInstance, counterBuffer, counterBufferOffset, counterOffset, vertexStride);
+}
+
+/* Every present (client_x11_present.c): the stream output counts may be due for their line. */
+void droiddeck_presented(void) {
+    xfb_stats_present(XFB_TAG);
 }
 
 static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* pipelines) {
@@ -587,6 +621,7 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
         if (r) trace("  rendering colors %u fmt0 %d depth %d stencil %d viewMask %u", r->colorAttachmentCount, r->colorAttachmentCount ? r->pColorAttachmentFormats[0] : 0, r->depthAttachmentFormat, r->stencilAttachmentFormat, r->viewMask);
     }
     VkResult result = vt_call_vkCreateGraphicsPipelines(device, cache, count, copy, alloc, pipelines);
+    if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, infos, pipelines);
     for (uint32_t i = 0; codes && i < used; i++) free(codes[i]);
     free(codes);
     free(chains);
@@ -805,7 +840,14 @@ static VkResult dd_vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo*
     VkResult r = vt_call_vkCreateDevice(pd, &mapped, a, d);
     relink(saved, unlinked);
     trace("CreateDevice -> %d", r);
+    if (r == VK_SUCCESS) xfb_stats_device_created();
     return r;
+}
+
+void vt_call_vkDestroyDevice(VkDevice, const VkAllocationCallbacks*);
+static void dd_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
+    if (device) xfb_stats_flush(XFB_TAG);
+    vt_call_vkDestroyDevice(device, alloc);
 }
 
 VkResult vt_call_vkQueueSubmit(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
@@ -846,6 +888,9 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkGetPhysicalDeviceProperties2KHR", dd_vkGetPhysicalDeviceProperties2},
     {"vkCreateGraphicsPipelines", dd_vkCreateGraphicsPipelines},
     {"vkCreateShaderModule", dd_vkCreateShaderModule},
+    {"vkDestroyShaderModule", dd_vkDestroyShaderModule},
+    {"vkCmdBeginTransformFeedbackEXT", dd_vkCmdBeginTransformFeedbackEXT},
+    {"vkCmdDrawIndirectByteCountEXT", dd_vkCmdDrawIndirectByteCountEXT},
     {"vkCreateComputePipelines", dd_vkCreateComputePipelines},
     {"vkCreateBuffer", dd_vkCreateBuffer},
     {"vkEnumeratePhysicalDevices", dd_vkEnumeratePhysicalDevices},
@@ -854,6 +899,7 @@ static const struct { const char* name; void* func; } ddOverrides[] = {
     {"vkGetPhysicalDeviceFormatProperties", dd_vkGetPhysicalDeviceFormatProperties},
     {"vkEnumerateDeviceExtensionProperties", dd_vkEnumerateDeviceExtensionProperties},
     {"vkCreateDevice", dd_vkCreateDevice},
+    {"vkDestroyDevice", dd_vkDestroyDevice},
     {"vkCreateInstance", dd_vkCreateInstance},
     {"vkCreateSemaphore", dd_vkCreateSemaphore},
     {"vkQueueSubmit", dd_vkQueueSubmit},

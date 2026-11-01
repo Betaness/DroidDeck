@@ -1128,10 +1128,13 @@ static void sweepLayers(void) {
     pthread_mutex_unlock(&registryLock);
 }
 
+extern void droiddeck_presented(void);
+
 VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, VkResult* results) {
     VkResult overall = VK_SUCCESS;
     bool waitedSemaphores = false;
     sweepLayers();
+    droiddeck_presented();
 
     for (uint32_t i = 0; i < presentInfo->swapchainCount; i++) {
         VkResult result = VK_SUCCESS;

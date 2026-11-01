@@ -131,7 +131,7 @@ typedef struct Device {
     X(AllocateCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) \
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(CreateSemaphore) X(DestroySemaphore) \
     X(ImportSemaphoreFdKHR) X(ImportFenceFdKHR) X(GetFenceFdKHR) X(GetAndroidHardwareBufferPropertiesANDROID) \
-    X(CreateShaderModule) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
+    X(CreateShaderModule) X(DestroyShaderModule) X(CreateGraphicsPipelines) X(CreateComputePipelines) X(ResetCommandPool) X(ResetCommandBuffer) X(FreeCommandBuffers) \
     X(MapMemory2KHR) X(UnmapMemory2KHR) X(FlushMappedMemoryRanges) X(GetImageSubresourceLayout) X(GetImageSubresourceLayout2) \
     X(GetImageSubresourceLayout2KHR) X(GetImageSubresourceLayout2EXT) X(GetDeviceImageSubresourceLayout) \
     X(GetDeviceImageSubresourceLayoutKHR) X(CreatePipelineCache) X(DestroyPipelineCache) X(GetPipelineCacheData) X(MergePipelineCaches) \
@@ -168,6 +168,8 @@ PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name);
 void mali_drop_emulated_features(Instance* instance, VkPhysicalDevice physical, VkPhysicalDeviceFeatures* enabled);
 void mali_device_created(Device* device);
 void mali_device_destroyed(Device* device);
+/* Every vkQueuePresentKHR (wsi.c): the stream output counts may be due for their line. */
+void mali_presented(void);
 
 /* placed.c */
 extern const char* const placed_extension;
