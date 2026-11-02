@@ -1,0 +1,141 @@
+diff --git a/app/src/main/cpp/vortekrenderer/include/vortek_serializer.h b/app/src/main/cpp/vortekrenderer/include/vortek_serializer.h
+index 936a511..c195540 100644
+--- a/app/src/main/cpp/vortekrenderer/include/vortek_serializer.h
++++ b/app/src/main/cpp/vortekrenderer/include/vortek_serializer.h
+@@ -6309,7 +6309,7 @@ static inline int vt_sizeof_VkPhysicalDeviceMemoryProperties(VkPhysicalDeviceMem
+     bufferSize += 4; // memoryTypeCount
+     bufferSize += val->memoryTypeCount * vt_sizeof_VkMemoryType(&val->memoryTypes[0]);
+     bufferSize += 4; // memoryHeapCount
+-    bufferSize += val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]);
++    bufferSize += val->memoryHeapCount * sizeof(VkMemoryHeap); /* [mali-g2] whole structs: the array is copied as it is in memory (16 bytes each, not 12) */
+     return bufferSize;
+ }
+ 
+@@ -6321,8 +6321,8 @@ static inline void vt_serialize_VkPhysicalDeviceMemoryProperties(VkPhysicalDevic
+     bufferOffset += val->memoryTypeCount * vt_sizeof_VkMemoryType(&val->memoryTypes[0]);
+     *(uint32_t*)(outputBuffer + bufferOffset) = val->memoryHeapCount;
+     bufferOffset += 4;
+-    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(outputBuffer + bufferOffset, val->memoryHeaps, val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]));
+-    bufferOffset += val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]);
++    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(outputBuffer + bufferOffset, val->memoryHeaps, val->memoryHeapCount * sizeof(VkMemoryHeap));
++    bufferOffset += val->memoryHeapCount * sizeof(VkMemoryHeap);
+ }
+ 
+ static inline void vt_unserialize_VkPhysicalDeviceMemoryProperties(VkPhysicalDeviceMemoryProperties* val, char* inputBuffer, MemoryPool* memoryPool) {
+@@ -6333,15 +6333,15 @@ static inline void vt_unserialize_VkPhysicalDeviceMemoryProperties(VkPhysicalDev
+     bufferOffset += val->memoryTypeCount * vt_sizeof_VkMemoryType(&val->memoryTypes[0]);
+     val->memoryHeapCount = *(uint32_t*)(inputBuffer + bufferOffset);
+     bufferOffset += 4;
+-    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(val->memoryHeaps, inputBuffer + bufferOffset, val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]));
+-    bufferOffset += val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]);
++    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(val->memoryHeaps, inputBuffer + bufferOffset, val->memoryHeapCount * sizeof(VkMemoryHeap));
++    bufferOffset += val->memoryHeapCount * sizeof(VkMemoryHeap);
+ }
+ 
+ static inline int vt_sizeof_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPhysicalDeviceMemoryBudgetPropertiesEXT* val) {
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+-    bufferSize += VK_MAX_MEMORY_HEAPS;
+-    bufferSize += VK_MAX_MEMORY_HEAPS;
++    bufferSize += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize); /* [mali-g2] arrays of VkDeviceSize, not bytes */
++    bufferSize += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
+     return bufferSize;
+ }
+ 
+@@ -6349,10 +6349,10 @@ static inline void vt_serialize_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPhys
+     int bufferOffset = 0;
+     *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
+     bufferOffset += 4;
+-    memcpy(outputBuffer + bufferOffset, val->heapBudget, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
+-    memcpy(outputBuffer + bufferOffset, val->heapUsage, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
++    memcpy(outputBuffer + bufferOffset, val->heapBudget, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
++    memcpy(outputBuffer + bufferOffset, val->heapUsage, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
+ }
+ 
+ static inline void vt_unserialize_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPhysicalDeviceMemoryBudgetPropertiesEXT* val, char* inputBuffer, MemoryPool* memoryPool) {
+@@ -6362,10 +6362,10 @@ static inline void vt_unserialize_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPh
+ #ifdef VT_SERVER
+     val->pNext = NULL;
+ #endif
+-    memcpy(val->heapBudget, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
+-    memcpy(val->heapUsage, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
++    memcpy(val->heapBudget, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
++    memcpy(val->heapUsage, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
+ }
+ 
+ static inline int vt_sizeof_VkQueueFamilyProperties(VkQueueFamilyProperties* val) {
+@@ -7223,6 +7223,7 @@ static inline int vt_sizeof_VkPhysicalDeviceProperties(VkPhysicalDevicePropertie
+     bufferSize += 4; // vendorID
+     bufferSize += 4; // deviceID
+     bufferSize += 4; // deviceType
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->deviceName) + 1;
+     bufferSize += VK_UUID_SIZE;
+     bufferSize += vt_sizeof_VkPhysicalDeviceLimits(&val->limits);
+@@ -7902,7 +7903,9 @@ static inline int vt_sizeof_VkPhysicalDeviceVulkan12Properties(VkPhysicalDeviceV
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+     bufferSize += 4; // driverID
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverName) + 1;
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverInfo) + 1;
+     bufferSize += vt_sizeof_VkConformanceVersion(&val->conformanceVersion);
+     bufferSize += 4; // denormBehaviorIndependence
+@@ -9159,7 +9162,9 @@ static inline int vt_sizeof_VkPhysicalDeviceDriverProperties(VkPhysicalDeviceDri
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+     bufferSize += 4; // driverID
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverName) + 1;
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverInfo) + 1;
+     bufferSize += vt_sizeof_VkConformanceVersion(&val->conformanceVersion);
+     return bufferSize;
+@@ -12421,7 +12426,7 @@ static inline void vt_unserialize_VkAcquireNextImageInfoKHR(VkAcquireNextImageIn
+ static inline int vt_sizeof_VkDeviceGroupPresentCapabilitiesKHR(VkDeviceGroupPresentCapabilitiesKHR* val) {
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+-    bufferSize += VK_MAX_DEVICE_GROUP_SIZE;
++    bufferSize += VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t); /* [mali-g2] uint32_t array, not bytes */
+     bufferSize += 4; // modes
+     return bufferSize;
+ }
+@@ -12430,8 +12435,8 @@ static inline void vt_serialize_VkDeviceGroupPresentCapabilitiesKHR(VkDeviceGrou
+     int bufferOffset = 0;
+     *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
+     bufferOffset += 4;
+-    memcpy(outputBuffer + bufferOffset, val->presentMask, VK_MAX_DEVICE_GROUP_SIZE);
+-    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE;
++    memcpy(outputBuffer + bufferOffset, val->presentMask, VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t));
++    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t);
+     *(VkDeviceGroupPresentModeFlagsKHR*)(outputBuffer + bufferOffset) = val->modes;
+     bufferOffset += 4;
+ }
+@@ -12443,8 +12448,8 @@ static inline void vt_unserialize_VkDeviceGroupPresentCapabilitiesKHR(VkDeviceGr
+ #ifdef VT_SERVER
+     val->pNext = NULL;
+ #endif
+-    memcpy(val->presentMask, inputBuffer + bufferOffset, VK_MAX_DEVICE_GROUP_SIZE);
+-    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE;
++    memcpy(val->presentMask, inputBuffer + bufferOffset, VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t));
++    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t);
+     val->modes = *(VkDeviceGroupPresentModeFlagsKHR*)(inputBuffer + bufferOffset);
+     bufferOffset += 4;
+ }
+@@ -22854,6 +22859,7 @@ static inline void vt_unserialize_VkDeviceCreateInfo(VkDeviceCreateInfo* val, ch
+ 
+ static inline int vt_sizeof_VkExtensionProperties(VkExtensionProperties* val) {
+     int bufferSize = 0;
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->extensionName) + 1;
+     bufferSize += 4; // specVersion
+     return bufferSize;

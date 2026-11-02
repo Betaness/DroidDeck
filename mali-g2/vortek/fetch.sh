@@ -47,4 +47,6 @@ done
 for p in "$HERE"/patches/winlator-*.patch; do
   git -C "$WORK/winlator-app" apply --whitespace=nowarn "$p"
 done
+# the client's copy of the serializer only: bounds-checked reply reads (vortek-0014)
+python3 "$HERE/tools/harden_replies.py" "$WORK/vortek/include/vortek_serializer.h"
 echo "patched upstream sources in $WORK"

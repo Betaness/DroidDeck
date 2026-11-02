@@ -1,0 +1,2133 @@
+diff --git a/include/vortek.h b/include/vortek.h
+index 48afffd..a0b77d7 100755
+--- a/include/vortek.h
++++ b/include/vortek.h
+@@ -91,11 +91,16 @@ extern void droiddeck_trace_cmd(const char* name);
+     } \
+     while (0)
+ 
++/* [mali-g2] The reply is read into the calling thread's memory pool and the call lock is released
++ * right away (VT_REPLY_READ, vulkan_calls.c): unserialising it, which writes into the application's
++ * structures and parses what the server sent, runs without the lock, so a fault there (Wine turns
++ * it into an exception and unwinds past the rest of the call) cannot leave the lock held. */
+ #define VT_RECV_CHECKED(...) \
+     char* inputBuffer = NULL; \
+     int result; \
+     do { \
+         result = vt_recv(clientRing, &inputBuffer, NULL, &globalMemoryPool); \
++        VT_REPLY_READ(); \
+         if (result == VK_ERROR_DEVICE_LOST) { \
+             VT_CALL_UNLOCK(); \
+             return __VA_OPT__(VK_ERROR_DEVICE_LOST); \
+@@ -134,6 +139,14 @@ typedef struct MemoryPool {
+     void* data;
+     int size;
+     ArrayList allocationList;
++#ifndef VT_SERVER
++    /* [mali-g2] the reply being unserialised (set by vt_recv) and how many elements the
++     * application's output array holds (set by the caller); see tools/harden_replies.py */
++    const char* inStart;
++    const char* inEnd;
++    uint32_t inCap;
++    bool inBad;
++#endif
+ } MemoryPool;
+ 
+ typedef struct VkContext VkContext;
+@@ -178,9 +191,23 @@ extern void vt_sendCommandChunk(CommandBatch* batch);
+ extern bool vortekInitOnce();
+ extern int serverFd;
+ extern uint16_t maxClientRequestId;
+-extern MemoryPool globalMemoryPool;
+ extern RingBuffer* serverRing;
+ extern RingBuffer* clientRing;
++
++/* [mali-g2] Each calling thread has its own memory pool (vulkan_calls.c): requests are serialised
++ * and replies unserialised outside the call lock, so the pool can no longer be shared. */
++extern MemoryPool* vt_threadMemoryPool(void);
++#define globalMemoryPool (*vt_threadMemoryPool())
++
++/* [mali-g2] Once the request and reply streams may be out of step (the server is gone, a reply
++ * header is garbage, a thread died holding the call lock) every later call fails with
++ * VK_ERROR_DEVICE_LOST instead of reading somebody else's reply. */
++extern void vt_markConnectionLost(const char* why);
++extern bool vt_connectionLost;
++
++/* Largest reply accepted (pipeline cache data is the biggest, tens of MB); a larger or negative
++ * size in a reply header means the stream is garbage. */
++#define VT_REPLY_MAX_SIZE (1 << 30)
+ #endif
+ 
+ static inline void* findNextVkStructure(void* pNext, VkStructureType type) {
+@@ -231,6 +258,9 @@ static inline void* vt_alloc(MemoryPool* memoryPool, int size) {
+     void* chunk;
+     if (isFull) {
+         chunk = malloc(size);
++#ifndef VT_SERVER
++        if (!chunk) return NULL;
++#endif
+         ArrayList_add(&memoryPool->allocationList, chunk);
+     }
+     else {
+@@ -261,6 +291,9 @@ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int siz
+ #ifdef VORTEK_DROIDDECK
+     droiddeck_trace_request(requestCode, size);
+ #endif
++    /* [mali-g2] -1 (never equal to a request's size, not even 0) once the connection is lost or a
++     * write fails; a request written in part leaves the server out of step, so that loses it too */
++    if (vt_connectionLost || !ring) return -1;
+     if (size >= SERVER_RING_BUFFER_SIZE) {
+         const uint16_t requestId = maxClientRequestId++;
+         char header[HEADER_SIZE];
+@@ -268,15 +301,15 @@ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int siz
+         *(int*)(header + 4) = size;
+ 
+         int bytesSent = sock_write(serverFd, header, HEADER_SIZE) ;
+-        if (bytesSent != HEADER_SIZE) return 0;
++        if (bytesSent != HEADER_SIZE) { vt_markConnectionLost("request write failed"); return -1; }
+ 
+         bytesSent = sock_write(serverFd, data, size);
+-        if (bytesSent != size) return 0;
++        if (bytesSent != size) { vt_markConnectionLost("request write failed"); return -1; }
+ 
+         *(int*)(header + 0) = PACK16(requestCode, requestId);
+         *(int*)(header + 4) = 0;
+         bool result = RingBuffer_write(ring, header, HEADER_SIZE);
+-        if (!result) return 0;
++        if (!result) { vt_markConnectionLost("request write failed"); return -1; }
+ 
+         return size;
+     }
+@@ -288,7 +321,10 @@ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int siz
+ 
+ #if !defined(VT_SERVER) && defined(VORTEK_DROIDDECK)
+     /* [mali-g2] header and payload published together: one wake of a sleeping server per request */
+-    if (!RingBuffer_write2(ring, header, HEADER_SIZE, data, size > 0 ? size : 0)) return 0;
++    if (!RingBuffer_write2(ring, header, HEADER_SIZE, data, size > 0 ? size : 0)) {
++        vt_markConnectionLost("request write failed");
++        return -1;
++    }
+     return size;
+ #else
+     bool result = RingBuffer_write(ring, header, HEADER_SIZE);
+@@ -303,6 +339,135 @@ static inline int vt_send(RingBuffer* ring, int requestCode, void* data, int siz
+ #endif
+ }
+ 
++#ifndef VT_SERVER
++/* [mali-g2] Client: a reply is checked before anything trusts it. A header that cannot be read or
++ * a size outside 0..VT_REPLY_MAX_SIZE loses the connection (the stream is out of step); when the
++ * payload cannot be allocated it is drained so the stream stays in step and the call gets
++ * VK_ERROR_OUT_OF_HOST_MEMORY. The payload's bounds go to the pool for the checked unserialisers
++ * (tools/harden_replies.py); an empty reply has none, so whatever reads it fails cleanly. */
++static inline int vt_recv(RingBuffer* ring, char** inputBuffer, int* bufferSize, MemoryPool* memoryPool) {
++    memoryPool->inStart = memoryPool->inEnd = NULL;
++    memoryPool->inCap = 0;
++    memoryPool->inBad = false;
++    if (bufferSize) *bufferSize = 0;
++    if (vt_connectionLost || !ring) return VK_ERROR_DEVICE_LOST;
++
++    char header[HEADER_SIZE];
++    bool result = RingBuffer_read(ring, header, HEADER_SIZE);
++    if (!result) {
++        vt_markConnectionLost("reply read failed");
++        return VK_ERROR_DEVICE_LOST;
++    }
++
++    int requestCode = *(int*)(header + 0);
++    int size = *(int*)(header + 4);
++    if (size < 0 || size > VT_REPLY_MAX_SIZE) {
++        vt_markConnectionLost("reply header with an impossible size");
++        return VK_ERROR_DEVICE_LOST;
++    }
++
++    if (size > 0) {
++        *inputBuffer = vt_alloc(memoryPool, size);
++        if (!*inputBuffer) {
++            char scratch[4096];
++            for (int left = size, n; left > 0; left -= n) {
++                n = left < (int)sizeof(scratch) ? left : (int)sizeof(scratch);
++                if (!RingBuffer_read(ring, scratch, n)) {
++                    vt_markConnectionLost("reply read failed");
++                    return VK_ERROR_DEVICE_LOST;
++                }
++            }
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++        }
++        result = RingBuffer_read(ring, *inputBuffer, size);
++        if (!result) {
++            *inputBuffer = NULL;
++            vt_markConnectionLost("reply read failed");
++            return VK_ERROR_DEVICE_LOST;
++        }
++        memoryPool->inStart = *inputBuffer;
++        memoryPool->inEnd = *inputBuffer + size;
++    }
++
++    if (bufferSize) *bufferSize = size;
++    return requestCode;
++}
++
++/* [mali-g2] Checked reads for the client's vt_unserialize_* functions (rewritten by
++ * tools/harden_replies.py). Everything is relative to the reply vt_recv read: a read outside it
++ * yields zeros and marks the reply bad, and the caller fails the call. */
++static inline bool vt_inOk(MemoryPool* memoryPool, const void* p, size_t n) {
++    uintptr_t a = (uintptr_t)p, start = (uintptr_t)memoryPool->inStart, end = (uintptr_t)memoryPool->inEnd;
++    if (start && a >= start && a <= end && n <= end - a) return true;
++    memoryPool->inBad = true;
++    return false;
++}
++
++#define VT_IN(T, p) \
++    ({ \
++        const char* vt_inP_ = (const char*)(p); \
++        T vt_inV_; \
++        if (vt_inOk(memoryPool, vt_inP_, sizeof(T))) memcpy(&vt_inV_, vt_inP_, sizeof(T)); \
++        else memset(&vt_inV_, 0, sizeof(T)); \
++        vt_inV_; \
++    })
++
++#define VT_IS_ARRAY(a) (!__builtin_types_compatible_p(__typeof__(a), __typeof__(&(a)[0])))
++#define VT_COUNTOF(a) __builtin_choose_expr(VT_IS_ARRAY(a), sizeof(a) / sizeof((a)[0]), (size_t)INT32_MAX)
++/* capacity of a structure field: its size when it is a fixed array, unknown (trusted) otherwise */
++#define VT_DST_CAP(a) __builtin_choose_expr(VT_IS_ARRAY(a), sizeof(a), (size_t)-1)
++/* a fixed char array (extensionName, deviceName ...) is always NUL-terminated for the application */
++#define VT_IN_TERMINATE(a) \
++    ((VT_IS_ARRAY(a) && _Generic(&(a)[0], char*: 1, default: 0)) ? (void)(((char*)(a))[sizeof(a) - 1] = 0) : (void)0)
++
++/* count of elements that each take at least one byte of the reply */
++static inline int vt_inCount(MemoryPool* memoryPool, long long count) {
++    if (count <= 0) return 0;
++    if (count > memoryPool->inEnd - memoryPool->inStart) {
++        memoryPool->inBad = true;
++        return 0;
++    }
++    return (int)count;
++}
++
++static inline bool vt_inIndex(MemoryPool* memoryPool, int index, size_t count) {
++    if ((size_t)index < count) return true;
++    memoryPool->inBad = true;
++    return false;
++}
++
++/* element i of an array the application passed (memoryPool->inCap elements) */
++static inline bool vt_inSlot(MemoryPool* memoryPool, int index) {
++    return vt_inIndex(memoryPool, index, memoryPool->inCap);
++}
++
++static inline void vt_inCopy(MemoryPool* memoryPool, void* dst, size_t cap, const void* src, long long size) {
++    if (memoryPool->inBad || size < 0 || (unsigned long long)size > cap || !vt_inOk(memoryPool, src, (size_t)size)) {
++        memoryPool->inBad = true;
++        return;
++    }
++    if (size > 0) memcpy(dst, src, (size_t)size);
++}
++
++/* Allocation sized by the reply. A failure returns zeroed scratch memory (enough for any single
++ * structure; arrays are not written once the reply is bad) so the unserialiser need not check. */
++#define VT_IN_SCRATCH_SIZE 16384
++extern void* vt_inScratch(void);
++
++static inline void* vt_inAlloc(MemoryPool* memoryPool, long long count, size_t size) {
++    if (count < 0 || (count > 1 && count > memoryPool->inEnd - memoryPool->inStart) || size > (1u << 20) ||
++        (unsigned long long)count * size > (256u << 20)) {
++        memoryPool->inBad = true;
++        return memset(vt_inScratch(), 0, VT_IN_SCRATCH_SIZE);
++    }
++    void* chunk = count > 0 ? vt_alloc(memoryPool, (int)(count * size)) : NULL;
++    if (!chunk) {
++        if (count > 0) memoryPool->inBad = true;
++        return memset(vt_inScratch(), 0, VT_IN_SCRATCH_SIZE);
++    }
++    return chunk;
++}
++#else
+ static inline int vt_recv(RingBuffer* ring, char** inputBuffer, int* bufferSize, MemoryPool* memoryPool) {
+     char header[HEADER_SIZE];
+     bool result = RingBuffer_read(ring, header, HEADER_SIZE);
+@@ -320,5 +485,6 @@ static inline int vt_recv(RingBuffer* ring, char** inputBuffer, int* bufferSize,
+     if (bufferSize) *bufferSize = size;
+     return requestCode;
+ }
++#endif
+ 
+ #endif
+\ No newline at end of file
+diff --git a/include/vortek_serializer.h b/include/vortek_serializer.h
+index 936a511..c195540 100644
+--- a/include/vortek_serializer.h
++++ b/include/vortek_serializer.h
+@@ -6309,7 +6309,7 @@ static inline int vt_sizeof_VkPhysicalDeviceMemoryProperties(VkPhysicalDeviceMem
+     bufferSize += 4; // memoryTypeCount
+     bufferSize += val->memoryTypeCount * vt_sizeof_VkMemoryType(&val->memoryTypes[0]);
+     bufferSize += 4; // memoryHeapCount
+-    bufferSize += val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]);
++    bufferSize += val->memoryHeapCount * sizeof(VkMemoryHeap); /* [mali-g2] whole structs: the array is copied as it is in memory (16 bytes each, not 12) */
+     return bufferSize;
+ }
+ 
+@@ -6321,8 +6321,8 @@ static inline void vt_serialize_VkPhysicalDeviceMemoryProperties(VkPhysicalDevic
+     bufferOffset += val->memoryTypeCount * vt_sizeof_VkMemoryType(&val->memoryTypes[0]);
+     *(uint32_t*)(outputBuffer + bufferOffset) = val->memoryHeapCount;
+     bufferOffset += 4;
+-    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(outputBuffer + bufferOffset, val->memoryHeaps, val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]));
+-    bufferOffset += val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]);
++    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(outputBuffer + bufferOffset, val->memoryHeaps, val->memoryHeapCount * sizeof(VkMemoryHeap));
++    bufferOffset += val->memoryHeapCount * sizeof(VkMemoryHeap);
+ }
+ 
+ static inline void vt_unserialize_VkPhysicalDeviceMemoryProperties(VkPhysicalDeviceMemoryProperties* val, char* inputBuffer, MemoryPool* memoryPool) {
+@@ -6333,15 +6333,15 @@ static inline void vt_unserialize_VkPhysicalDeviceMemoryProperties(VkPhysicalDev
+     bufferOffset += val->memoryTypeCount * vt_sizeof_VkMemoryType(&val->memoryTypes[0]);
+     val->memoryHeapCount = *(uint32_t*)(inputBuffer + bufferOffset);
+     bufferOffset += 4;
+-    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(val->memoryHeaps, inputBuffer + bufferOffset, val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]));
+-    bufferOffset += val->memoryHeapCount * vt_sizeof_VkMemoryHeap(&val->memoryHeaps[0]);
++    if (val->memoryHeapCount <= VK_MAX_MEMORY_HEAPS) memcpy(val->memoryHeaps, inputBuffer + bufferOffset, val->memoryHeapCount * sizeof(VkMemoryHeap));
++    bufferOffset += val->memoryHeapCount * sizeof(VkMemoryHeap);
+ }
+ 
+ static inline int vt_sizeof_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPhysicalDeviceMemoryBudgetPropertiesEXT* val) {
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+-    bufferSize += VK_MAX_MEMORY_HEAPS;
+-    bufferSize += VK_MAX_MEMORY_HEAPS;
++    bufferSize += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize); /* [mali-g2] arrays of VkDeviceSize, not bytes */
++    bufferSize += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
+     return bufferSize;
+ }
+ 
+@@ -6349,10 +6349,10 @@ static inline void vt_serialize_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPhys
+     int bufferOffset = 0;
+     *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
+     bufferOffset += 4;
+-    memcpy(outputBuffer + bufferOffset, val->heapBudget, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
+-    memcpy(outputBuffer + bufferOffset, val->heapUsage, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
++    memcpy(outputBuffer + bufferOffset, val->heapBudget, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
++    memcpy(outputBuffer + bufferOffset, val->heapUsage, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
+ }
+ 
+ static inline void vt_unserialize_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPhysicalDeviceMemoryBudgetPropertiesEXT* val, char* inputBuffer, MemoryPool* memoryPool) {
+@@ -6362,10 +6362,10 @@ static inline void vt_unserialize_VkPhysicalDeviceMemoryBudgetPropertiesEXT(VkPh
+ #ifdef VT_SERVER
+     val->pNext = NULL;
+ #endif
+-    memcpy(val->heapBudget, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
+-    memcpy(val->heapUsage, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS);
+-    bufferOffset += VK_MAX_MEMORY_HEAPS;
++    memcpy(val->heapBudget, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
++    memcpy(val->heapUsage, inputBuffer + bufferOffset, VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize));
++    bufferOffset += VK_MAX_MEMORY_HEAPS * sizeof(VkDeviceSize);
+ }
+ 
+ static inline int vt_sizeof_VkQueueFamilyProperties(VkQueueFamilyProperties* val) {
+@@ -7223,6 +7223,7 @@ static inline int vt_sizeof_VkPhysicalDeviceProperties(VkPhysicalDevicePropertie
+     bufferSize += 4; // vendorID
+     bufferSize += 4; // deviceID
+     bufferSize += 4; // deviceType
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->deviceName) + 1;
+     bufferSize += VK_UUID_SIZE;
+     bufferSize += vt_sizeof_VkPhysicalDeviceLimits(&val->limits);
+@@ -7902,7 +7903,9 @@ static inline int vt_sizeof_VkPhysicalDeviceVulkan12Properties(VkPhysicalDeviceV
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+     bufferSize += 4; // driverID
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverName) + 1;
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverInfo) + 1;
+     bufferSize += vt_sizeof_VkConformanceVersion(&val->conformanceVersion);
+     bufferSize += 4; // denormBehaviorIndependence
+@@ -9159,7 +9162,9 @@ static inline int vt_sizeof_VkPhysicalDeviceDriverProperties(VkPhysicalDeviceDri
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+     bufferSize += 4; // driverID
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverName) + 1;
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->driverInfo) + 1;
+     bufferSize += vt_sizeof_VkConformanceVersion(&val->conformanceVersion);
+     return bufferSize;
+@@ -12421,7 +12426,7 @@ static inline void vt_unserialize_VkAcquireNextImageInfoKHR(VkAcquireNextImageIn
+ static inline int vt_sizeof_VkDeviceGroupPresentCapabilitiesKHR(VkDeviceGroupPresentCapabilitiesKHR* val) {
+     int bufferSize = 0;
+     bufferSize += 4; // sType
+-    bufferSize += VK_MAX_DEVICE_GROUP_SIZE;
++    bufferSize += VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t); /* [mali-g2] uint32_t array, not bytes */
+     bufferSize += 4; // modes
+     return bufferSize;
+ }
+@@ -12430,8 +12435,8 @@ static inline void vt_serialize_VkDeviceGroupPresentCapabilitiesKHR(VkDeviceGrou
+     int bufferOffset = 0;
+     *(VkStructureType*)(outputBuffer + bufferOffset) = val->sType;
+     bufferOffset += 4;
+-    memcpy(outputBuffer + bufferOffset, val->presentMask, VK_MAX_DEVICE_GROUP_SIZE);
+-    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE;
++    memcpy(outputBuffer + bufferOffset, val->presentMask, VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t));
++    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t);
+     *(VkDeviceGroupPresentModeFlagsKHR*)(outputBuffer + bufferOffset) = val->modes;
+     bufferOffset += 4;
+ }
+@@ -12443,8 +12448,8 @@ static inline void vt_unserialize_VkDeviceGroupPresentCapabilitiesKHR(VkDeviceGr
+ #ifdef VT_SERVER
+     val->pNext = NULL;
+ #endif
+-    memcpy(val->presentMask, inputBuffer + bufferOffset, VK_MAX_DEVICE_GROUP_SIZE);
+-    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE;
++    memcpy(val->presentMask, inputBuffer + bufferOffset, VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t));
++    bufferOffset += VK_MAX_DEVICE_GROUP_SIZE * sizeof(uint32_t);
+     val->modes = *(VkDeviceGroupPresentModeFlagsKHR*)(inputBuffer + bufferOffset);
+     bufferOffset += 4;
+ }
+@@ -22854,6 +22859,7 @@ static inline void vt_unserialize_VkDeviceCreateInfo(VkDeviceCreateInfo* val, ch
+ 
+ static inline int vt_sizeof_VkExtensionProperties(VkExtensionProperties* val) {
+     int bufferSize = 0;
++    bufferSize += 4; /* [mali-g2] the string's length, written before it */
+     bufferSize += strlen(val->extensionName) + 1;
+     bufferSize += 4; // specVersion
+     return bufferSize;
+diff --git a/src/main.c b/src/main.c
+index e72ce5a..f768c18 100755
+--- a/src/main.c
++++ b/src/main.c
+@@ -7,7 +7,6 @@
+ 
+ int serverFd = -1;
+ uint16_t maxClientRequestId = 1;
+-MemoryPool globalMemoryPool = {0};
+ RingBuffer* serverRing = NULL;
+ RingBuffer* clientRing = NULL;
+ 
+@@ -46,23 +45,23 @@ static bool createVkContext() {
+     int res = write(serverFd, header, HEADER_SIZE);
+     if (res < 0) return false;
+     
+-    int shmFds[2];
+-    int numFds;
++    /* [mali-g2] room for as many descriptors as recv_fds accepts, whatever the server sends */
++    int shmFds[MAX_FDS];
++    int numFds = 0;
+     recv_fds(serverFd, shmFds, &numFds, NULL, 0);
+-    if (numFds != 2) return false;
++    if (numFds != 2) {
++        for (int i = 0; i < numFds; i++) close(shmFds[i]);
++        return false;
++    }
+     
+     serverRing = RingBuffer_attach(shmFds[0], SERVER_RING_BUFFER_SIZE);
+-    if (!serverRing) return false;
+-    
+-    clientRing = RingBuffer_attach(shmFds[1], CLIENT_RING_BUFFER_SIZE);
+-    if (!clientRing) return false;
+-    
++    clientRing = serverRing ? RingBuffer_attach(shmFds[1], CLIENT_RING_BUFFER_SIZE) : NULL;
+     close(shmFds[0]);
+     close(shmFds[1]);
+-    
+-    if (!globalMemoryPool.data) {
+-        globalMemoryPool.data = malloc(MEMORY_POOL_MAX_SIZE);
+-        memset(globalMemoryPool.data, 0, MEMORY_POOL_MAX_SIZE);        
++    if (!clientRing) {
++        if (serverRing) RingBuffer_free(serverRing);
++        serverRing = NULL;
++        return false;
+     }
+     return true;
+ }
+@@ -71,9 +70,6 @@ static void terminationCallback() {
+     CLOSEFD(serverFd);
+     if (serverRing) RingBuffer_free(serverRing);
+     if (clientRing) RingBuffer_free(clientRing);
+-    
+-    vt_free(&globalMemoryPool);
+-    MEMFREE(globalMemoryPool.data);
+ }
+ 
+ bool vortekInitOnce() {
+diff --git a/src/vk_object.c b/src/vk_object.c
+index e09f569..59bf73d 100644
+--- a/src/vk_object.c
++++ b/src/vk_object.c
+@@ -1,6 +1,10 @@
+ #include "vk_object.h"
+ 
++/* [mali-g2] Handles are now created after the call lock is released (vulkan_calls.c), so the cache
++ * of physical device and queue objects has its own lock, and a cached object's handle is
++ * published with a compare-and-swap: two threads enumerating at once get the same handle. */
+ static ArrayList cachedObjects = {0};
++static pthread_mutex_t cachedObjectsLock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ VkObject vkNullObject = {
+     .id = VKOBJECT_NULL_ID,
+@@ -27,32 +31,30 @@ static VkObject* getCachedObject(uint64_t id) {
+ }
+ 
+ VkObject* VkObject_create(VkObjectType type, uint64_t id) {
+-    if (type == VK_OBJECT_TYPE_PHYSICAL_DEVICE) {
+-        VkObject* physicalDeviceObject = getCachedObject(id);
+-        if (!VKOBJECT_IS_NULL(physicalDeviceObject)) return physicalDeviceObject;
+-
+-        physicalDeviceObject = internalCreate(type, id);
+-        ArrayList_add(&cachedObjects, physicalDeviceObject);
+-        return physicalDeviceObject;
+-    }
+-    else if (type == VK_OBJECT_TYPE_QUEUE) {
+-        VkObject* queueObject = getCachedObject(id);
+-        if (!VKOBJECT_IS_NULL(queueObject)) return queueObject;
+-
+-        queueObject = internalCreate(type, id);
+-        ArrayList_add(&cachedObjects, queueObject);
+-        return queueObject;
++    if (type == VK_OBJECT_TYPE_PHYSICAL_DEVICE || type == VK_OBJECT_TYPE_QUEUE) {
++        pthread_mutex_lock(&cachedObjectsLock);
++        VkObject* object = getCachedObject(id);
++        if (VKOBJECT_IS_NULL(object)) {
++            object = internalCreate(type, id);
++            ArrayList_add(&cachedObjects, object);
++        }
++        pthread_mutex_unlock(&cachedObjectsLock);
++        return object;
+     }
+ 
+     return internalCreate(type, id);
+ }
+ 
+ void* VkObject_toHandle(VkObject* object) {
+-    if (object->handle) return object->handle;
++    void* existing = __atomic_load_n(&object->handle, __ATOMIC_ACQUIRE);
++    if (existing) return existing;
+ 
+     char* handle = calloc(2, sizeof(uint64_t));
+     *(uint64_t*)(handle + sizeof(uint64_t)) = (uint64_t)object;
+-    object->handle = handle;
++    if (!__atomic_compare_exchange_n(&object->handle, &existing, (void*)handle, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++        free(handle);
++        return existing;
++    }
+     return handle;
+ }
+ 
+diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
+index c3f6ec2..1aecb91 100644
+--- a/src/vulkan_calls.c
++++ b/src/vulkan_calls.c
+@@ -1,5 +1,8 @@
+ #include <sys/mman.h>
+ #include <pthread.h>
++#include <errno.h>
++#include <sys/syscall.h>
++#include <time.h>
+ 
+ #include "vortek.h"
+ #include "vortek_serializer.h"
+@@ -20,12 +23,229 @@ struct VulkanFunc {
+ 
+ static void* findVkDispatchFuncWithName(const char* name);
+ 
++/* [mali-g2] The call lock (vt_call_mutex) keeps a request and its reply together on the shared rings
++ * and socket. Under Wine a fault in a Unix call becomes an exception and the call is abandoned
++ * where it faulted, none of its cleanup runs: A.V.A. once faulted in
++ * vkGetPhysicalDeviceMemoryProperties2 while holding the lock, and every other thread then waited
++ * for it forever (black window, zombie process). So:
++ *  - VT_CALL_LOCK only marks the call as begun; the lock is taken when the request is sent (vt_send
++ *    below) and released as soon as its reply has been read (VT_REPLY_READ in VT_RECV_CHECKED) or
++ *    the call ends. Serialising the application's structures and unserialising the reply into
++ *    them, the steps that can fault, run without it, in the calling thread's own memory pool;
++ *  - replies are bounds-checked (vt_recv, the vt_unserialize_* functions rewritten by
++ *    tools/harden_replies.py, VT_REPLY_BAD after each) and a bad one fails the call;
++ *  - should a call still be abandoned with the lock held, the same thread's next call finds
++ *    vt_callState.inCall still set and releases it; and a thread that ended while holding it (a
++ *    TerminateThread while it waited for a reply) is noticed by the threads waiting for the lock
++ *    (vt_callOwner, checked once a second while they wait), which release it for it. If a reply
++ *    may still be pending then, the connection is marked lost rather than letting the next caller
++ *    read it as its own. (A robust mutex would do the latter, but proot answers set_robust_list
++ *    with ENOSYS.) */
+ static pthread_mutex_t vt_call_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pid_t vt_callOwner; /* thread id of the holder, 0 when free */
++bool vt_connectionLost = false;
++
++/* Everything per thread in one small block, so that the library's TLS stays small enough for the
++ * static TLS of a dlopen()ed module (fast access) and one address serves a whole call. */
++typedef struct VtThread {
++    MemoryPool pool;   /* serialised requests and received replies (globalMemoryPool) */
++    char* scratch;     /* vt_inScratch, allocated when a reply first needs it */
++    pid_t tid;
++    bool poolReady;
++    bool inCall;       /* between VT_CALL_LOCK and VT_CALL_UNLOCK */
++    bool held;         /* this thread holds vt_call_mutex */
++    bool pending;      /* a request went out under the lock and its reply may not have been read */
++} VtThread;
++static __thread VtThread vt_thread;
++#define vt_callState vt_thread
++
++/* [mali-g2] Per-thread memory pool for serialised requests and received replies (vortek.h maps
++ * globalMemoryPool to it, vulkan_calls.c to the inline vt_poolFast); its blocks are freed when the
++ * thread exits. */
++static pthread_key_t vt_poolKey;
++static pthread_once_t vt_poolKeyOnce = PTHREAD_ONCE_INIT;
++
++static void vt_poolThreadExit(void* arg) {
++    VtThread* thread = arg;
++    vt_free(&thread->pool);
++    MEMFREE(thread->pool.allocationList.elements);
++    thread->pool.allocationList.capacity = 0;
++    MEMFREE(thread->pool.data);
++    MEMFREE(thread->scratch);
++}
++
++static void vt_poolKeyCreate(void) {
++    pthread_key_create(&vt_poolKey, vt_poolThreadExit);
++}
++
++static __attribute__((noinline)) void vt_poolInit(VtThread* thread) {
++    thread->poolReady = true;
++    thread->pool.data = malloc(MEMORY_POOL_MAX_SIZE); /* NULL: vt_alloc mallocs every chunk */
++    pthread_once(&vt_poolKeyOnce, vt_poolKeyCreate);
++    pthread_setspecific(vt_poolKey, thread);
++}
++
++static inline __attribute__((always_inline)) MemoryPool* vt_poolFast(void) {
++    VtThread* thread = &vt_thread;
++    if (__builtin_expect(!thread->poolReady, 0)) vt_poolInit(thread);
++    return &thread->pool;
++}
++
++void vt_markConnectionLost(const char* why) {
++    if (__atomic_exchange_n(&vt_connectionLost, true, __ATOMIC_SEQ_CST)) return;
++    fprintf(stderr, "vortek: connection to the server lost (%s), Vulkan calls fail with VK_ERROR_DEVICE_LOST from now on\n", why);
++}
++
++static pid_t vt_threadId(void) {
++    if (!vt_thread.tid) vt_thread.tid = (pid_t)syscall(SYS_gettid);
++    return vt_thread.tid;
++}
++
++static void vt_callLocked(void) {
++    __atomic_store_n(&vt_callOwner, vt_threadId(), __ATOMIC_RELEASE);
++    vt_callState.held = true;
++}
++
++/* The holder's thread no longer exists: it can never release the lock, so release it for it
++ * (once: whoever clears vt_callOwner first). The lock is a default glibc mutex, which any thread
++ * may unlock. */
++static void vt_callCheckOwner(void) {
++    pid_t owner = __atomic_load_n(&vt_callOwner, __ATOMIC_ACQUIRE);
++    if (owner <= 0 || syscall(SYS_tgkill, getpid(), owner, 0) == 0 || errno != ESRCH) return;
++    if (!__atomic_compare_exchange_n(&vt_callOwner, &owner, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
++    vt_markConnectionLost("a thread ended while it held the call lock");
++    pthread_mutex_unlock(&vt_call_mutex);
++}
++
++static void vt_callLockNow(void) {
++    if (vt_callState.held) return;
++    if (pthread_mutex_trylock(&vt_call_mutex) != 0) {
++        for (;;) {
++            struct timespec deadline;
++            clock_gettime(CLOCK_REALTIME, &deadline);
++            deadline.tv_sec += 1;
++            int rc = pthread_mutex_timedlock(&vt_call_mutex, &deadline);
++            if (rc == 0) break;
++            if (rc == ETIMEDOUT) vt_callCheckOwner();
++        }
++    }
++    vt_callLocked();
++}
+ 
+-#define VT_CALL_LOCK() pthread_mutex_lock(&vt_call_mutex)
+-#define VT_CALL_UNLOCK() \
+-    vt_free(&globalMemoryPool); \
++static bool vt_callTryLockNow(void) {
++    if (vt_callState.held) return true;
++    if (pthread_mutex_trylock(&vt_call_mutex) != 0) return false;
++    vt_callLocked();
++    return true;
++}
++
++static void vt_callUnlockNow(void) {
++    if (!vt_callState.held) return;
++    vt_callState.held = false;
++    vt_callState.pending = false;
++    __atomic_store_n(&vt_callOwner, 0, __ATOMIC_RELEASE);
+     pthread_mutex_unlock(&vt_call_mutex);
++}
++
++static void vt_callBegin(void) {
++    if (__builtin_expect(vt_callState.inCall, 0)) {
++        /* this thread's previous call never reached its end: it faulted and was unwound */
++        static int logged;
++        if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
++            fprintf(stderr, "vortek: a Vulkan call was abandoned (fault in the call)%s\n",
++                    vt_callState.held ? ", releasing the call lock it held" : "");
++        }
++        if (vt_callState.held && vt_callState.pending) vt_markConnectionLost("a call was abandoned before reading its reply");
++        vt_callUnlockNow();
++        vt_free(vt_poolFast());
++    }
++    vt_callState.inCall = true;
++}
++
++static void vt_callEnd(void) {
++    vt_callUnlockNow();
++    vt_free(vt_poolFast());
++    vt_callState.inCall = false;
++}
++
++#define VT_CALL_LOCK() vt_callBegin()
++#define VT_CALL_UNLOCK() vt_callEnd()
++#define VT_REPLY_READ() vt_callUnlockNow()
++
++/* every request of a call goes out under the lock, which then stays held until the reply is read
++ * or the call ends (calls that wait for descriptors on the socket keep it until then) */
++static inline int vt_lockedSend(RingBuffer* ring, int requestCode, void* data, int size) {
++    vt_callLockNow();
++    vt_callState.pending = true;
++    return vt_send(ring, requestCode, data, size);
++}
++#define vt_send vt_lockedSend
++
++MemoryPool* vt_threadMemoryPool(void) {
++    return vt_poolFast();
++}
++#undef globalMemoryPool
++#define globalMemoryPool (*vt_poolFast())
++
++void* vt_inScratch(void) {
++    static char fallback[VT_IN_SCRATCH_SIZE] __attribute__((aligned(16))); /* only if malloc fails */
++    if (!vt_thread.scratch) vt_thread.scratch = malloc(VT_IN_SCRATCH_SIZE);
++    return vt_thread.scratch ? vt_thread.scratch : fallback;
++}
++
++/* [mali-g2] After unserialising a reply: a reply the checked unserialisers found bad (truncated,
++ * counts beyond its end or beyond the application's array, ...) fails the call. */
++#define VT_REPLY_BAD() (globalMemoryPool.inBad)
++#define VT_REPLY_CAP(n) (globalMemoryPool.inCap = (uint32_t)(n))
++
++/* [mali-g2] A reply that comes over the socket with descriptors. recv_fds stores as many as the
++ * server sent (up to MAX_FDS) whatever the caller expects, so they land here and at most `max`
++ * are kept, the rest closed. A short or failed read loses the connection (the socket is out of
++ * step); the return value is the number of descriptors kept, or -1. */
++static int vt_recvFds(int* fds, int max, void* data, int size) {
++    int all[MAX_FDS];
++    int numFds = 0;
++    int res = recv_fds(serverFd, all, &numFds, data, size);
++    if (numFds < 0 || numFds > MAX_FDS) numFds = 0;
++    if (res != (data ? size : 1)) {
++        for (int i = 0; i < numFds; i++) close(all[i]);
++        vt_markConnectionLost("socket reply read failed");
++        return -1;
++    }
++    int kept = numFds < max ? numFds : max;
++    for (int i = 0; i < kept; i++) fds[i] = all[i];
++    for (int i = kept; i < numFds; i++) close(all[i]);
++    return kept;
++}
++
++/* a reply that is a single value (0 when it is missing) */
++#define VT_REPLY_VALUE(T) \
++    ({ \
++        MemoryPool* memoryPool = &globalMemoryPool; \
++        VT_IN(T, inputBuffer); \
++    })
++
++/* the count the server returned for an array the application passed (VT_REPLY_CAP elements) */
++#define VT_REPLY_COUNT_OK(pCount, pArray) (!VT_REPLY_BAD() && (!(pArray) || *(pCount) <= globalMemoryPool.inCap))
++
++/* clears a structure but its sType and pNext */
++static inline void vt_zeroAfterHeader(void* s, size_t size) {
++    if (size > sizeof(VkBaseOutStructure)) memset((char*)s + sizeof(VkBaseOutStructure), 0, size - sizeof(VkBaseOutStructure));
++}
++
++/* the counts within their arrays and every memory type on an existing heap */
++static bool vt_memoryPropertiesOk(const VkPhysicalDeviceMemoryProperties* p) {
++    if (p->memoryTypeCount > VK_MAX_MEMORY_TYPES || p->memoryHeapCount > VK_MAX_MEMORY_HEAPS) return false;
++    for (uint32_t i = 0; i < p->memoryTypeCount; i++) {
++        if (p->memoryTypes[i].heapIndex >= p->memoryHeapCount) return false;
++    }
++    return true;
++}
++
++static void vt_badReply(const char* call) {
++    static int logged;
++    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 16) fprintf(stderr, "vortek: bad reply to %s, call failed\n", call);
++}
+ 
+ #ifdef VORTEK_DROIDDECK
+ #include "droiddeck_requests.h"
+@@ -59,12 +279,13 @@ __attribute__((constructor)) static void vt_initCmdChunkSize(void) {
+  * waits for the lock, which keeps chunks well inside the server ring. */
+ void vt_sendCommandChunk(CommandBatch* batch) {
+     if (batch->size <= VK_HANDLE_BYTE_COUNT) return;
++    if (vt_callState.inCall) return; /* never from inside a call (it may hold the lock) */
+     if (batch->size < SERVER_RING_BUFFER_SIZE / 4) {
+-        if (pthread_mutex_trylock(&vt_call_mutex) != 0) return;
++        if (!vt_callTryLockNow()) return;
+     }
+-    else VT_CALL_LOCK();
++    else vt_callLockNow();
+     vt_send(serverRing, REQUEST_CODE_DD_CMD_CHUNK, batch->buffer, batch->size);
+-    VT_CALL_UNLOCK();
++    vt_callUnlockNow();
+     batch->size = VK_HANDLE_BYTE_COUNT;
+ }
+ 
+@@ -83,12 +304,15 @@ int droiddeck_request(int requestCode, const void* payload, int size) {
+ #endif
+ 
+ static VkResult waitForPipelineCreation(int pipelineCount, VkPipeline* pPipelines) {
+-    int numFds, fd;
++    int fd = -1;
+     char success = 0;
+-    recv_fds(serverFd, &fd, &numFds, &success, 1);
++    int numFds = vt_recvFds(&fd, 1, &success, 1);
+     VT_CALL_UNLOCK();
+ 
+-    if (!success || numFds != 1) return VK_ERROR_DEVICE_LOST;
++    if (!success || numFds != 1) {
++        if (numFds == 1) CLOSEFD(fd);
++        return VK_ERROR_DEVICE_LOST;
++    }
+ 
+     int bufferSize = sizeof(VkResult) + pipelineCount * VK_HANDLE_BYTE_COUNT;
+     char inputBuffer[bufferSize];
+@@ -124,6 +348,12 @@ VkResult vt_call_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const
+ 
+     uint64_t instanceId;
+     vt_unserialize_VkInstance((VkInstance)&instanceId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateInstance");
++        VT_CALL_UNLOCK();
++        *pInstance = VK_NULL_HANDLE;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VkObject* instanceObject = VkObject_create(VK_OBJECT_TYPE_INSTANCE, instanceId);
+     *pInstance = VkObject_toHandle(instanceObject);
+ 
+@@ -151,7 +381,14 @@ VkResult vt_call_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhys
+     VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_PHYSICAL_DEVICES, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pPhysicalDevices ? *pPhysicalDeviceCount : 0);
+     vt_unserialize_vkEnumeratePhysicalDevices(VK_NULL_HANDLE, pPhysicalDeviceCount, pPhysicalDevices, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPhysicalDeviceCount, pPhysicalDevices)) {
++        vt_badReply("vkEnumeratePhysicalDevices");
++        VT_CALL_UNLOCK();
++        *pPhysicalDeviceCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -173,6 +410,12 @@ void vt_call_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPh
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkPhysicalDeviceProperties(pProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceProperties");
++        memset(pProperties, 0, sizeof(*pProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -185,7 +428,14 @@ void vt_call_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalD
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pQueueFamilyProperties ? *pQueueFamilyPropertyCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceQueueFamilyProperties(VK_NULL_HANDLE, pQueueFamilyPropertyCount, pQueueFamilyProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pQueueFamilyPropertyCount, pQueueFamilyProperties)) {
++        vt_badReply("vkGetPhysicalDeviceQueueFamilyProperties");
++        VT_CALL_UNLOCK();
++        *pQueueFamilyPropertyCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -198,6 +448,12 @@ void vt_call_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkPhysicalDeviceMemoryProperties(pMemoryProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD() || !vt_memoryPropertiesOk(pMemoryProperties)) {
++        vt_badReply("vkGetPhysicalDeviceMemoryProperties");
++        memset(pMemoryProperties, 0, sizeof(*pMemoryProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -210,6 +466,12 @@ void vt_call_vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhys
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkPhysicalDeviceFeatures(pFeatures, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceFeatures");
++        memset(pFeatures, 0, sizeof(*pFeatures));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -222,6 +484,12 @@ void vt_call_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkFormatProperties(pFormatProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceFormatProperties");
++        memset(pFormatProperties, 0, sizeof(*pFormatProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -234,6 +502,12 @@ VkResult vt_call_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physi
+     VT_RECV_CHECKED(VT_RETURN);
+ 
+     vt_unserialize_VkImageFormatProperties(pImageFormatProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceImageFormatProperties");
++        memset(pImageFormatProperties, 0, sizeof(*pImageFormatProperties));
++        VT_CALL_UNLOCK();
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -248,6 +522,12 @@ VkResult vt_call_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceC
+ 
+     uint64_t deviceId;
+     vt_unserialize_VkDevice((VkDevice)&deviceId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateDevice");
++        VT_CALL_UNLOCK();
++        *pDevice = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* deviceObject = VkObject_create(VK_OBJECT_TYPE_DEVICE, deviceId);
+     *pDevice = VkObject_toHandle(deviceObject);
+ #ifdef VORTEK_STANDALONE
+@@ -279,7 +559,13 @@ VkResult vt_call_vkEnumerateInstanceVersion(uint32_t* pApiVersion) {
+     }
+     
+     VT_RECV_CHECKED(VT_RETURN);
+-    *pApiVersion = *(uint32_t*)(inputBuffer);
++    uint32_t apiVersion = VT_REPLY_VALUE(uint32_t);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkEnumerateInstanceVersion");
++        VT_CALL_UNLOCK();
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
++    *pApiVersion = apiVersion;
+     
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+@@ -298,7 +584,14 @@ VkResult vt_call_vkEnumerateInstanceExtensionProperties(const char* pLayerName,
+     VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_INSTANCE_EXTENSION_PROPERTIES, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pProperties ? *pPropertyCount : 0);
+     vt_unserialize_vkEnumerateInstanceExtensionProperties(NULL, pPropertyCount, pProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPropertyCount, pProperties)) {
++        vt_badReply("vkEnumerateInstanceExtensionProperties");
++        VT_CALL_UNLOCK();
++        *pPropertyCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -375,7 +668,14 @@ VkResult vt_call_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalD
+     VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_DEVICE_EXTENSION_PROPERTIES, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pProperties ? *pPropertyCount : 0);
+     vt_unserialize_vkEnumerateDeviceExtensionProperties(NULL, NULL, pPropertyCount, pProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPropertyCount, pProperties)) {
++        vt_badReply("vkEnumerateDeviceExtensionProperties");
++        VT_CALL_UNLOCK();
++        *pPropertyCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -390,6 +690,12 @@ void vt_call_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32
+     
+     uint64_t queueId;
+     vt_unserialize_VkQueue((VkQueue)&queueId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetDeviceQueue");
++        VT_CALL_UNLOCK();
++        *pQueue = VK_NULL_HANDLE;
++        return;
++    }
+     VkObject* queueObject = VkObject_create(VK_OBJECT_TYPE_QUEUE, queueId);
+     *pQueue = VkObject_toHandle(queueObject);
+ #ifdef VORTEK_STANDALONE
+@@ -404,9 +710,12 @@ VkResult vt_call_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubm
+     VkObject* queueObject = VkObject_fromHandle(queue);
+     VkObject* fenceObject = VkObject_fromHandle(fence);
+     
+-    bool shouldWait = RingBuffer_hasStatus(clientRing, RING_STATUS_WAIT);
+-    
+     VT_SERIALIZE_CMD(vkQueueSubmit, (VkQueue)&queueObject->id, submitCount, pSubmits, (VkFence)&fenceObject->id);
++
++    /* [mali-g2] read under the lock, as before: the server sets WAIT while answering another
++     * thread's call, and whether it replies to this submit depends on it */
++    vt_callLockNow();
++    bool shouldWait = clientRing && RingBuffer_hasStatus(clientRing, RING_STATUS_WAIT);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_SUBMIT, VT_RETURN);
+     
+     if (shouldWait) {
+@@ -455,6 +764,12 @@ VkResult vt_call_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* p
+     if (result == VK_SUCCESS) {
+         uint64_t memoryId;
+         vt_unserialize_VkDeviceMemory((VkDeviceMemory)&memoryId, inputBuffer, &globalMemoryPool);
++        if (VT_REPLY_BAD()) {
++            vt_badReply("vkAllocateMemory");
++            VT_CALL_UNLOCK();
++            *pMemory = VK_NULL_HANDLE;
++            return VK_ERROR_DEVICE_LOST;
++        }
+         VkObject* memoryObject = VkObject_create(VK_OBJECT_TYPE_DEVICE_MEMORY, memoryId);
+         *pMemory = VkObject_toHandle(memoryObject);
+         
+@@ -495,23 +810,24 @@ VkResult vt_call_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSiz
+     VT_SERIALIZE_CMD(VkDeviceMemory, (VkDeviceMemory)&memoryObject->id);    
+     VT_SEND_CHECKED(REQUEST_CODE_VK_MAP_MEMORY, VT_RETURN);
+     
+-    int fd, result, numFds;
+-    recv_fds(serverFd, &fd, &numFds, &result, sizeof(VkResult));
+-    if (numFds == 1) {
++    int fd = -1, result = VK_ERROR_MEMORY_MAP_FAILED;
++    void* mapped = NULL;
++    if (vt_recvFds(&fd, 1, &result, sizeof(VkResult)) == 1) {
+         if (size == VK_WHOLE_SIZE) size = mappedMemory->allocationSize;
+         mappedMemory->size = size;
+         
+         void* data = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, offset);
++        CLOSEFD(fd);
+         if (data != MAP_FAILED) {
+-            CLOSEFD(fd);
+             mappedMemory->data = data;
+-            *ppData = data;
++            mapped = data;
+         }
+         else result = VK_ERROR_MEMORY_MAP_FAILED;
+     }
+     else result = VK_ERROR_MEMORY_MAP_FAILED;
+     
+     VT_CALL_UNLOCK();
++    if (mapped) *ppData = mapped;
+     return (VkResult)result;
+ }
+ 
+@@ -563,7 +879,7 @@ void vt_call_vkGetDeviceMemoryCommitment(VkDevice device, VkDeviceMemory memory,
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_MEMORY_COMMITMENT);
+     VT_RECV_CHECKED();
+ 
+-    *pCommittedMemoryInBytes = *(VkDeviceSize*)(inputBuffer);
++    *pCommittedMemoryInBytes = VT_REPLY_VALUE(VkDeviceSize);
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -577,6 +893,12 @@ void vt_call_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkM
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkMemoryRequirements(pMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetBufferMemoryRequirements");
++        memset(pMemoryRequirements, 0, sizeof(*pMemoryRequirements));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -604,6 +926,12 @@ void vt_call_vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemo
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkMemoryRequirements(pMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetImageMemoryRequirements");
++        memset(pMemoryRequirements, 0, sizeof(*pMemoryRequirements));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -631,7 +959,14 @@ void vt_call_vkGetImageSparseMemoryRequirements(VkDevice device, VkImage image,
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pSparseMemoryRequirements ? *pSparseMemoryRequirementCount : 0);
+     vt_unserialize_vkGetImageSparseMemoryRequirements(VK_NULL_HANDLE, VK_NULL_HANDLE, pSparseMemoryRequirementCount, pSparseMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pSparseMemoryRequirementCount, pSparseMemoryRequirements)) {
++        vt_badReply("vkGetImageSparseMemoryRequirements");
++        VT_CALL_UNLOCK();
++        *pSparseMemoryRequirementCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -644,7 +979,14 @@ void vt_call_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice phy
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pProperties ? *pPropertyCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceSparseImageFormatProperties(VK_NULL_HANDLE, NULL, NULL, NULL, NULL, NULL, pPropertyCount, pProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPropertyCount, pProperties)) {
++        vt_badReply("vkGetPhysicalDeviceSparseImageFormatProperties");
++        VT_CALL_UNLOCK();
++        *pPropertyCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -671,6 +1013,12 @@ VkResult vt_call_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreate
+ 
+     uint64_t fenceId;
+     vt_unserialize_VkFence((VkFence)&fenceId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateFence");
++        VT_CALL_UNLOCK();
++        *pFence = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* fenceObject = VkObject_create(VK_OBJECT_TYPE_FENCE, fenceId);
+     *pFence = VkObject_toHandle(fenceObject);
+ 
+@@ -728,12 +1076,15 @@ VkResult vt_call_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkF
+         return (VkResult)result;   
+     }
+     else {
+-        int fds[fenceCount];
+-        int result, numFds;
+-        recv_fds(serverFd, fds, &numFds, &result, sizeof(VkResult));
++        int fds[MAX_FDS];
++        int result = VK_ERROR_DEVICE_LOST;
++        int numFds = vt_recvFds(fds, MAX_FDS, &result, sizeof(VkResult));
+         VT_CALL_UNLOCK();
+         
+-        if (numFds == 0 || result != VK_SUCCESS) return VK_ERROR_DEVICE_LOST;
++        if (numFds <= 0 || result != VK_SUCCESS) {
++            for (int i = 0; i < numFds; i++) CLOSEFD(fds[i]);
++            return VK_ERROR_DEVICE_LOST;
++        }
+         int timeoutMs = timeout != UINT64_MAX ? timeout / 1000000 : 0;
+         result = waitForEvents(fds, numFds, waitAll ? true : false, timeoutMs);
+         for (int i = 0; i < numFds; i++) CLOSEFD(fds[i]);
+@@ -751,6 +1102,12 @@ VkResult vt_call_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo*
+ 
+     uint64_t semaphoreId;
+     vt_unserialize_VkSemaphore((VkSemaphore)&semaphoreId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateSemaphore");
++        VT_CALL_UNLOCK();
++        *pSemaphore = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* semaphoreObject = VkObject_create(VK_OBJECT_TYPE_SEMAPHORE, semaphoreId);
+     *pSemaphore = VkObject_toHandle(semaphoreObject);
+ 
+@@ -780,6 +1137,12 @@ VkResult vt_call_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreate
+ 
+     uint64_t eventId;
+     vt_unserialize_VkEvent((VkEvent)&eventId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateEvent");
++        VT_CALL_UNLOCK();
++        *pEvent = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* eventObject = VkObject_create(VK_OBJECT_TYPE_EVENT, eventId);
+     *pEvent = VkObject_toHandle(eventObject);
+ 
+@@ -848,6 +1211,12 @@ VkResult vt_call_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo*
+ 
+     uint64_t queryPoolId;
+     vt_unserialize_VkQueryPool((VkQueryPool)&queryPoolId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateQueryPool");
++        VT_CALL_UNLOCK();
++        *pQueryPool = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* queryPoolObject = VkObject_create(VK_OBJECT_TYPE_QUERY_POOL, queryPoolId);
+     *pQueryPool = VkObject_toHandle(queryPoolObject);
+ 
+@@ -876,7 +1245,13 @@ VkResult vt_call_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, u
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_QUERY_POOL_RESULTS, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
++    VT_REPLY_CAP(pData ? dataSize : 0);
+     vt_unserialize_vkGetQueryPoolResults(VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, NULL, NULL, pData, NULL, NULL, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetQueryPoolResults");
++        VT_CALL_UNLOCK();
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -902,6 +1277,12 @@ VkResult vt_call_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCrea
+ 
+     uint64_t bufferId;
+     vt_unserialize_VkBuffer((VkBuffer)&bufferId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateBuffer");
++        VT_CALL_UNLOCK();
++        *pBuffer = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* bufferObject = VkObject_create(VK_OBJECT_TYPE_BUFFER, bufferId);
+     *pBuffer = VkObject_toHandle(bufferObject);
+ 
+@@ -931,6 +1312,12 @@ VkResult vt_call_vkCreateBufferView(VkDevice device, const VkBufferViewCreateInf
+ 
+     uint64_t viewId;
+     vt_unserialize_VkBufferView((VkBufferView)&viewId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateBufferView");
++        VT_CALL_UNLOCK();
++        *pView = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* viewObject = VkObject_create(VK_OBJECT_TYPE_BUFFER_VIEW, viewId);
+     *pView = VkObject_toHandle(viewObject);
+ 
+@@ -960,6 +1347,12 @@ VkResult vt_call_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreate
+ 
+     uint64_t imageId;
+     vt_unserialize_VkImage((VkImage)&imageId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateImage");
++        VT_CALL_UNLOCK();
++        *pImage = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* imageObject = VkObject_create(VK_OBJECT_TYPE_IMAGE, imageId);
+     *pImage = VkObject_toHandle(imageObject);
+ 
+@@ -989,6 +1382,12 @@ void vt_call_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const V
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkSubresourceLayout(pLayout, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetImageSubresourceLayout");
++        memset(pLayout, 0, sizeof(*pLayout));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -1002,6 +1401,12 @@ VkResult vt_call_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo*
+ 
+     uint64_t viewId;
+     vt_unserialize_VkImageView((VkImageView)&viewId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateImageView");
++        VT_CALL_UNLOCK();
++        *pView = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* viewObject = VkObject_create(VK_OBJECT_TYPE_IMAGE_VIEW, viewId);
+     *pView = VkObject_toHandle(viewObject);
+ 
+@@ -1031,6 +1436,12 @@ VkResult vt_call_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreat
+ 
+     uint64_t shaderModuleId;
+     vt_unserialize_VkShaderModule((VkShaderModule)&shaderModuleId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateShaderModule");
++        VT_CALL_UNLOCK();
++        *pShaderModule = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* shaderModuleObject = VkObject_create(VK_OBJECT_TYPE_SHADER_MODULE, shaderModuleId);
+     *pShaderModule = VkObject_toHandle(shaderModuleObject);
+ 
+@@ -1060,6 +1471,12 @@ VkResult vt_call_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCre
+ 
+     uint64_t pipelineCacheId;
+     vt_unserialize_VkPipelineCache((VkPipelineCache)&pipelineCacheId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreatePipelineCache");
++        VT_CALL_UNLOCK();
++        *pPipelineCache = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* pipelineCacheObject = VkObject_create(VK_OBJECT_TYPE_PIPELINE_CACHE, pipelineCacheId);
+     *pPipelineCache = VkObject_toHandle(pipelineCacheObject);
+ 
+@@ -1089,7 +1506,15 @@ VkResult vt_call_vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelin
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PIPELINE_CACHE_DATA, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
++    size_t dataCap = pData ? *pDataSize : 0;
++    VT_REPLY_CAP(dataCap);
+     vt_unserialize_vkGetPipelineCacheData(VK_NULL_HANDLE, VK_NULL_HANDLE, pDataSize, pData, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD() || (pData && *pDataSize > dataCap)) {
++        vt_badReply("vkGetPipelineCacheData");
++        *pDataSize = 0;
++        VT_CALL_UNLOCK();
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -1151,6 +1576,12 @@ VkResult vt_call_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutC
+ 
+     uint64_t pipelineLayoutId;
+     vt_unserialize_VkPipelineLayout((VkPipelineLayout)&pipelineLayoutId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreatePipelineLayout");
++        VT_CALL_UNLOCK();
++        *pPipelineLayout = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* pipelineLayoutObject = VkObject_create(VK_OBJECT_TYPE_PIPELINE_LAYOUT, pipelineLayoutId);
+     *pPipelineLayout = VkObject_toHandle(pipelineLayoutObject);
+ 
+@@ -1180,6 +1611,12 @@ VkResult vt_call_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCr
+ 
+     uint64_t samplerId;
+     vt_unserialize_VkSampler((VkSampler)&samplerId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateSampler");
++        VT_CALL_UNLOCK();
++        *pSampler = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* samplerObject = VkObject_create(VK_OBJECT_TYPE_SAMPLER, samplerId);
+     *pSampler = VkObject_toHandle(samplerObject);
+ 
+@@ -1209,6 +1646,12 @@ VkResult vt_call_vkCreateDescriptorSetLayout(VkDevice device, const VkDescriptor
+ 
+     uint64_t setLayoutId;
+     vt_unserialize_VkDescriptorSetLayout((VkDescriptorSetLayout)&setLayoutId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateDescriptorSetLayout");
++        VT_CALL_UNLOCK();
++        *pSetLayout = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* setLayoutObject = VkObject_create(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, setLayoutId);
+     *pSetLayout = VkObject_toHandle(setLayoutObject);
+ 
+@@ -1238,6 +1681,12 @@ VkResult vt_call_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolC
+ 
+     uint64_t descriptorPoolId;
+     vt_unserialize_VkDescriptorPool((VkDescriptorPool)&descriptorPoolId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateDescriptorPool");
++        VT_CALL_UNLOCK();
++        *pDescriptorPool = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* descriptorPoolObject = VkObject_create(VK_OBJECT_TYPE_DESCRIPTOR_POOL, descriptorPoolId);
+     *pDescriptorPool = VkObject_toHandle(descriptorPoolObject);
+     
+@@ -1289,10 +1738,18 @@ VkResult vt_call_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSet
+         return (VkResult)result;
+     }
+     
++    /* [mali-g2] one id per set, all inside the reply */
++    MemoryPool* memoryPool = &globalMemoryPool;
++    if (!vt_inOk(memoryPool, inputBuffer, (size_t)pAllocateInfo->descriptorSetCount * VK_HANDLE_BYTE_COUNT)) {
++        vt_badReply("vkAllocateDescriptorSets");
++        for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; i++) pDescriptorSets[i] = VK_NULL_HANDLE;
++        VT_CALL_UNLOCK();
++        return VK_ERROR_DEVICE_LOST;
++    }
++
+     VkObjectPool* objectPool = descriptorPoolObject->tag;
+     for (int i = 0, j = 0; i < pAllocateInfo->descriptorSetCount; i++, j += VK_HANDLE_BYTE_COUNT) {
+-        uint64_t descriptorSetId;
+-        vt_unserialize_VkDescriptorSet((VkDescriptorSet)&descriptorSetId, inputBuffer + j, NULL);
++        uint64_t descriptorSetId = VT_IN(uint64_t, inputBuffer + j);
+         
+         VkObject* descriptorSetObject = VkObjectPool_get(objectPool);
+         if (!descriptorSetObject) {
+@@ -1346,6 +1803,12 @@ VkResult vt_call_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateI
+ 
+     uint64_t framebufferId;
+     vt_unserialize_VkFramebuffer((VkFramebuffer)&framebufferId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateFramebuffer");
++        VT_CALL_UNLOCK();
++        *pFramebuffer = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* framebufferObject = VkObject_create(VK_OBJECT_TYPE_FRAMEBUFFER, framebufferId);
+     *pFramebuffer = VkObject_toHandle(framebufferObject);
+ 
+@@ -1375,6 +1838,12 @@ VkResult vt_call_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInf
+ 
+     uint64_t renderPassId;
+     vt_unserialize_VkRenderPass((VkRenderPass)&renderPassId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateRenderPass");
++        VT_CALL_UNLOCK();
++        *pRenderPass = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* renderPassObject = VkObject_create(VK_OBJECT_TYPE_RENDER_PASS, renderPassId);
+     *pRenderPass = VkObject_toHandle(renderPassObject);
+ 
+@@ -1404,6 +1873,12 @@ void vt_call_vkGetRenderAreaGranularity(VkDevice device, VkRenderPass renderPass
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkExtent2D(pGranularity, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetRenderAreaGranularity");
++        memset(pGranularity, 0, sizeof(*pGranularity));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -1417,6 +1892,12 @@ VkResult vt_call_vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateI
+ 
+     uint64_t commandPoolId;
+     vt_unserialize_VkCommandPool((VkCommandPool)&commandPoolId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateCommandPool");
++        VT_CALL_UNLOCK();
++        *pCommandPool = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* commandPoolObject = VkObject_create(VK_OBJECT_TYPE_COMMAND_POOL, commandPoolId);
+     *pCommandPool = VkObject_toHandle(commandPoolObject);
+ 
+@@ -1456,10 +1937,25 @@ VkResult vt_call_vkAllocateCommandBuffers(VkDevice device, const VkCommandBuffer
+     VT_SEND_CHECKED(REQUEST_CODE_VK_ALLOCATE_COMMAND_BUFFERS, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
++    /* [mali-g2] exactly one command buffer per one asked for, or the call fails */
++    uint32_t commandBufferCount = pAllocateInfo->commandBufferCount;
++    for (uint32_t i = 0; i < commandBufferCount; i++) pCommandBuffers[i] = VK_NULL_HANDLE;
+     VkCommandBufferAllocateInfo allocateInfo = {0};
++    VT_REPLY_CAP(commandBufferCount);
+     vt_unserialize_vkAllocateCommandBuffers(VK_NULL_HANDLE, &allocateInfo, pCommandBuffers, inputBuffer, &globalMemoryPool);
++    bool allocated = !VT_REPLY_BAD();
++    for (uint32_t i = 0; i < commandBufferCount; i++) allocated = allocated && pCommandBuffers[i];
++    if (!allocated) {
++        vt_badReply("vkAllocateCommandBuffers");
++        for (uint32_t i = 0; i < commandBufferCount; i++) {
++            if (pCommandBuffers[i]) VkObject_free(VkObject_fromHandle(pCommandBuffers[i]));
++            pCommandBuffers[i] = VK_NULL_HANDLE;
++        }
++        VT_CALL_UNLOCK();
++        return VK_ERROR_DEVICE_LOST;
++    }
+     
+-    for (int i = 0; i < pAllocateInfo->commandBufferCount; i++) {
++    for (int i = 0; i < commandBufferCount; i++) {
+         VkObject* commandBufferObject = VkObject_fromHandle(pCommandBuffers[i]);
+         CommandBatch* batch = calloc(1, sizeof(CommandBatch));
+         ENSURE_ARRAY_CAPACITY(VK_HANDLE_BYTE_COUNT, batch->capacity, batch->buffer, 1);
+@@ -1912,6 +2408,12 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice phys
+     VT_RECV_CHECKED(VT_RETURN);
+     
+     vt_unserialize_VkSurfaceCapabilitiesKHR(pSurfaceCapabilities, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
++        memset(pSurfaceCapabilities, 0, sizeof(*pSurfaceCapabilities));
++        VT_CALL_UNLOCK();
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+ #ifdef VORTEK_STANDALONE
+     if (result == VK_SUCCESS) X11Present_fixSurfaceCapabilities(surface, pSurfaceCapabilities);
+@@ -1928,7 +2430,14 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalD
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SURFACE_FORMATS_KHR, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pSurfaceFormats ? *pSurfaceFormatCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceSurfaceFormatsKHR(VK_NULL_HANDLE, NULL, pSurfaceFormatCount, pSurfaceFormats, inputBuffer, &globalMemoryPool);    
++    if (!VT_REPLY_COUNT_OK(pSurfaceFormatCount, pSurfaceFormats)) {
++        vt_badReply("vkGetPhysicalDeviceSurfaceFormatsKHR");
++        VT_CALL_UNLOCK();
++        *pSurfaceFormatCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -1942,7 +2451,14 @@ VkResult vt_call_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice phys
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SURFACE_PRESENT_MODES_KHR, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pPresentModes ? *pPresentModeCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceSurfacePresentModesKHR(VK_NULL_HANDLE, NULL, pPresentModeCount, pPresentModes, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPresentModeCount, pPresentModes)) {
++        vt_badReply("vkGetPhysicalDeviceSurfacePresentModesKHR");
++        VT_CALL_UNLOCK();
++        *pPresentModeCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -1962,6 +2478,12 @@ VkResult vt_call_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateIn
+     
+     uint64_t swapchainId;
+     vt_unserialize_VkSwapchainKHR((VkSwapchainKHR)&swapchainId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateSwapchainKHR");
++        VT_CALL_UNLOCK();
++        *pSwapchain = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* swapchainObject = VkObject_create(VK_OBJECT_TYPE_SWAPCHAIN_KHR, swapchainId);
+     *pSwapchain = VkObject_toHandle(swapchainObject);
+     
+@@ -1997,7 +2519,14 @@ VkResult vt_call_vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapcha
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_SWAPCHAIN_IMAGES_KHR, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pSwapchainImages ? *pSwapchainImageCount : 0);
+     vt_unserialize_vkGetSwapchainImagesKHR(VK_NULL_HANDLE, VK_NULL_HANDLE, pSwapchainImageCount, pSwapchainImages, inputBuffer, &globalMemoryPool);    
++    if (!VT_REPLY_COUNT_OK(pSwapchainImageCount, pSwapchainImages)) {
++        vt_badReply("vkGetSwapchainImagesKHR");
++        VT_CALL_UNLOCK();
++        *pSwapchainImageCount = 0;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2068,6 +2597,12 @@ void vt_call_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhy
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkPhysicalDeviceFeatures2(pFeatures, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceFeatures2");
++        vt_zeroAfterHeader(pFeatures, sizeof(*pFeatures));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2080,6 +2615,12 @@ void vt_call_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkP
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkPhysicalDeviceProperties2(pProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceProperties2");
++        vt_zeroAfterHeader(pProperties, sizeof(*pProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2092,6 +2633,12 @@ void vt_call_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevic
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkFormatProperties2(pFormatProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceFormatProperties2");
++        vt_zeroAfterHeader(pFormatProperties, sizeof(*pFormatProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2104,6 +2651,12 @@ VkResult vt_call_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice phys
+     VT_RECV_CHECKED(VT_RETURN);
+ 
+     vt_unserialize_VkImageFormatProperties2(pImageFormatProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceImageFormatProperties2");
++        vt_zeroAfterHeader(pImageFormatProperties, sizeof(*pImageFormatProperties));
++        VT_CALL_UNLOCK();
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2117,7 +2670,14 @@ void vt_call_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pQueueFamilyProperties ? *pQueueFamilyPropertyCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceQueueFamilyProperties2(VK_NULL_HANDLE, pQueueFamilyPropertyCount, pQueueFamilyProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pQueueFamilyPropertyCount, pQueueFamilyProperties)) {
++        vt_badReply("vkGetPhysicalDeviceQueueFamilyProperties2");
++        VT_CALL_UNLOCK();
++        *pQueueFamilyPropertyCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2130,6 +2690,12 @@ void vt_call_vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevic
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkPhysicalDeviceMemoryProperties2(pMemoryProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD() || !vt_memoryPropertiesOk(&pMemoryProperties->memoryProperties)) {
++        vt_badReply("vkGetPhysicalDeviceMemoryProperties2");
++        vt_zeroAfterHeader(pMemoryProperties, sizeof(*pMemoryProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2142,7 +2708,14 @@ void vt_call_vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice ph
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES2);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pProperties ? *pPropertyCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceSparseImageFormatProperties2(VK_NULL_HANDLE, NULL, pPropertyCount, pProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPropertyCount, pProperties)) {
++        vt_badReply("vkGetPhysicalDeviceSparseImageFormatProperties2");
++        VT_CALL_UNLOCK();
++        *pPropertyCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2174,6 +2747,12 @@ void vt_call_vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physic
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkExternalBufferProperties(pExternalBufferProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceExternalBufferProperties");
++        vt_zeroAfterHeader(pExternalBufferProperties, sizeof(*pExternalBufferProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2184,11 +2763,11 @@ VkResult vt_call_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* p
+     VT_SERIALIZE_CMD(VkDeviceMemory, (VkDeviceMemory)&memoryObject->id);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_MEMORY_FD_KHR, VT_RETURN);
+ 
+-    *pFd = -1;
+-    int result, numFds;
+-    recv_fds(serverFd, pFd, &numFds, &result, sizeof(VkResult));
++    int fd = -1, result = VK_ERROR_DEVICE_LOST;
++    vt_recvFds(&fd, 1, &result, sizeof(VkResult));
+        
+     VT_CALL_UNLOCK();
++    *pFd = fd;
+     return (VkResult)result;
+ }
+ 
+@@ -2205,6 +2784,12 @@ void vt_call_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice phy
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkExternalSemaphoreProperties(pExternalSemaphoreProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceExternalSemaphoreProperties");
++        vt_zeroAfterHeader(pExternalSemaphoreProperties, sizeof(*pExternalSemaphoreProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2215,11 +2800,11 @@ VkResult vt_call_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfo
+     VT_SERIALIZE_CMD(vkGetSemaphoreFdKHR, (VkDevice)&deviceObject->id, pGetFdInfo, NULL);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_SEMAPHORE_FD_KHR, VT_RETURN);
+ 
+-    *pFd = -1;
+-    int result, numFds;
+-    recv_fds(serverFd, pFd, &numFds, &result, sizeof(VkResult));
++    int fd = -1, result = VK_ERROR_DEVICE_LOST;
++    vt_recvFds(&fd, 1, &result, sizeof(VkResult));
+        
+     VT_CALL_UNLOCK();
++    *pFd = fd;
+     return (VkResult)result;
+ }
+ 
+@@ -2236,6 +2821,12 @@ void vt_call_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physica
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkExternalFenceProperties(pExternalFenceProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceExternalFenceProperties");
++        vt_zeroAfterHeader(pExternalFenceProperties, sizeof(*pExternalFenceProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2246,11 +2837,11 @@ VkResult vt_call_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGe
+     VT_SERIALIZE_CMD(vkGetFenceFdKHR, (VkDevice)&deviceObject->id, pGetFdInfo, NULL);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_FENCE_FD_KHR, VT_RETURN);
+ 
+-    *pFd = -1;
+-    int result, numFds;
+-    recv_fds(serverFd, pFd, &numFds, &result, sizeof(VkResult));
++    int fd = -1, result = VK_ERROR_DEVICE_LOST;
++    vt_recvFds(&fd, 1, &result, sizeof(VkResult));
+        
+     VT_CALL_UNLOCK();
++    *pFd = fd;
+     return (VkResult)result;
+ }
+ 
+@@ -2267,7 +2858,14 @@ VkResult vt_call_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t*
+     VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_PHYSICAL_DEVICE_GROUPS, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pPhysicalDeviceGroupProperties ? *pPhysicalDeviceGroupCount : 0);
+     vt_unserialize_vkEnumeratePhysicalDeviceGroups(VK_NULL_HANDLE, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties)) {
++        vt_badReply("vkEnumeratePhysicalDeviceGroups");
++        VT_CALL_UNLOCK();
++        *pPhysicalDeviceGroupCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2280,7 +2878,7 @@ void vt_call_vkGetDeviceGroupPeerMemoryFeatures(VkDevice device, uint32_t heapIn
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_GROUP_PEER_MEMORY_FEATURES);
+     VT_RECV_CHECKED();
+     
+-    *pPeerMemoryFeatures = *(uint32_t*)(inputBuffer);
++    *pPeerMemoryFeatures = VT_REPLY_VALUE(uint32_t);
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2361,7 +2959,14 @@ VkResult vt_call_vkGetPhysicalDevicePresentRectanglesKHR(VkPhysicalDevice physic
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_PRESENT_RECTANGLES_KHR, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
++    VT_REPLY_CAP(pRects ? *pRectCount : 0);
+     vt_unserialize_vkGetPhysicalDevicePresentRectanglesKHR(VK_NULL_HANDLE, VK_NULL_HANDLE, pRectCount, pRects, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pRectCount, pRects)) {
++        vt_badReply("vkGetPhysicalDevicePresentRectanglesKHR");
++        VT_CALL_UNLOCK();
++        *pRectCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2440,6 +3045,12 @@ void vt_call_vkGetPhysicalDeviceMultisamplePropertiesEXT(VkPhysicalDevice physic
+     VT_RECV_CHECKED();
+ 
+     vt_unserialize_VkMultisamplePropertiesEXT(pMultisampleProperties, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetPhysicalDeviceMultisamplePropertiesEXT");
++        vt_zeroAfterHeader(pMultisampleProperties, sizeof(*pMultisampleProperties));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2452,6 +3063,12 @@ void vt_call_vkGetBufferMemoryRequirements2(VkDevice device, const VkBufferMemor
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetBufferMemoryRequirements2");
++        vt_zeroAfterHeader(pMemoryRequirements, sizeof(*pMemoryRequirements));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2464,6 +3081,12 @@ void vt_call_vkGetImageMemoryRequirements2(VkDevice device, const VkImageMemoryR
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetImageMemoryRequirements2");
++        vt_zeroAfterHeader(pMemoryRequirements, sizeof(*pMemoryRequirements));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2476,7 +3099,14 @@ void vt_call_vkGetImageSparseMemoryRequirements2(VkDevice device, const VkImageS
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS2);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pSparseMemoryRequirements ? *pSparseMemoryRequirementCount : 0);
+     vt_unserialize_vkGetImageSparseMemoryRequirements2(VK_NULL_HANDLE, NULL, pSparseMemoryRequirementCount, pSparseMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pSparseMemoryRequirementCount, pSparseMemoryRequirements)) {
++        vt_badReply("vkGetImageSparseMemoryRequirements2");
++        VT_CALL_UNLOCK();
++        *pSparseMemoryRequirementCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2489,6 +3119,12 @@ void vt_call_vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDevice
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetDeviceBufferMemoryRequirements");
++        vt_zeroAfterHeader(pMemoryRequirements, sizeof(*pMemoryRequirements));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2501,6 +3137,12 @@ void vt_call_vkGetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceI
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetDeviceImageMemoryRequirements");
++        vt_zeroAfterHeader(pMemoryRequirements, sizeof(*pMemoryRequirements));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2513,7 +3155,14 @@ void vt_call_vkGetDeviceImageSparseMemoryRequirements(VkDevice device, const VkD
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_IMAGE_SPARSE_MEMORY_REQUIREMENTS);
+     VT_RECV_CHECKED();
+ 
++    VT_REPLY_CAP(pSparseMemoryRequirements ? *pSparseMemoryRequirementCount : 0);
+     vt_unserialize_vkGetDeviceImageSparseMemoryRequirements(VK_NULL_HANDLE, NULL, pSparseMemoryRequirementCount, pSparseMemoryRequirements, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pSparseMemoryRequirementCount, pSparseMemoryRequirements)) {
++        vt_badReply("vkGetDeviceImageSparseMemoryRequirements");
++        VT_CALL_UNLOCK();
++        *pSparseMemoryRequirementCount = 0;
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2527,6 +3176,12 @@ VkResult vt_call_vkCreateSamplerYcbcrConversion(VkDevice device, const VkSampler
+ 
+     uint64_t ycbcrConversionId;
+     vt_unserialize_VkSamplerYcbcrConversion((VkSamplerYcbcrConversion)&ycbcrConversionId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateSamplerYcbcrConversion");
++        VT_CALL_UNLOCK();
++        *pYcbcrConversion = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* ycbcrConversionObject = VkObject_create(VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION, ycbcrConversionId);
+     *pYcbcrConversion = VkObject_toHandle(ycbcrConversionObject);
+ 
+@@ -2556,6 +3211,12 @@ void vt_call_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueue
+     
+     uint64_t queueId;
+     vt_unserialize_VkQueue((VkQueue)&queueId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetDeviceQueue2");
++        VT_CALL_UNLOCK();
++        *pQueue = VK_NULL_HANDLE;
++        return;
++    }
+     VkObject* queueObject = VkObject_create(VK_OBJECT_TYPE_QUEUE, queueId);
+     *pQueue = VkObject_toHandle(queueObject);
+        
+@@ -2571,6 +3232,12 @@ void vt_call_vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptor
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkDescriptorSetLayoutSupport(pSupport, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetDescriptorSetLayoutSupport");
++        vt_zeroAfterHeader(pSupport, sizeof(*pSupport));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -2583,7 +3250,14 @@ VkResult vt_call_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_CALIBRATEABLE_TIME_DOMAINS_KHR, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pTimeDomains ? *pTimeDomainCount : 0);
+     vt_unserialize_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VK_NULL_HANDLE, pTimeDomainCount, pTimeDomains, inputBuffer, &globalMemoryPool);
++    if (!VT_REPLY_COUNT_OK(pTimeDomainCount, pTimeDomains)) {
++        vt_badReply("vkGetPhysicalDeviceCalibrateableTimeDomainsKHR");
++        VT_CALL_UNLOCK();
++        *pTimeDomainCount = 0;
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2596,7 +3270,13 @@ VkResult vt_call_vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timestam
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_CALIBRATED_TIMESTAMPS_KHR, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+ 
++    VT_REPLY_CAP(pTimestamps ? timestampCount : 0);
+     vt_unserialize_vkGetCalibratedTimestampsKHR(VK_NULL_HANDLE, &timestampCount, NULL, pTimestamps, pMaxDeviation, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetCalibratedTimestampsKHR");
++        VT_CALL_UNLOCK();
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2611,6 +3291,12 @@ VkResult vt_call_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateIn
+ 
+     uint64_t renderPassId;
+     vt_unserialize_VkRenderPass((VkRenderPass)&renderPassId, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkCreateRenderPass2");
++        VT_CALL_UNLOCK();
++        *pRenderPass = VK_NULL_HANDLE;
++        return VK_ERROR_DEVICE_LOST;
++    }
+     VkObject* renderPassObject = VkObject_create(VK_OBJECT_TYPE_RENDER_PASS, renderPassId);
+     *pRenderPass = VkObject_toHandle(renderPassObject);
+ 
+@@ -2648,7 +3334,13 @@ VkResult vt_call_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semapho
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_SEMAPHORE_COUNTER_VALUE, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
+-    *pValue = *(uint64_t*)(inputBuffer);
++    uint64_t counterValue = VT_REPLY_VALUE(uint64_t);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetSemaphoreCounterValue");
++        VT_CALL_UNLOCK();
++        return VK_ERROR_DEVICE_LOST;
++    }
++    *pValue = counterValue;
+     VT_CALL_UNLOCK();
+     return (VkResult)result;
+ }
+@@ -2660,9 +3352,10 @@ VkResult vt_call_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pW
+     VT_SERIALIZE_CMD(vkWaitSemaphores, (VkDevice)&deviceObject->id, pWaitInfo, timeout);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_WAIT_SEMAPHORES, VT_RETURN);
+     
+-    int numFds, fd;
+-    recv_fds(serverFd, &fd, &numFds, NULL, 0);
++    int fd = -1;
++    int numFds = vt_recvFds(&fd, 1, NULL, 0);
+     VT_CALL_UNLOCK();
++    if (numFds != 1) return VK_ERROR_DEVICE_LOST;
+     
+     uint64_t value = 0;
+     int bytesRead = read(fd, &value, sizeof(uint64_t));
+@@ -2755,7 +3448,7 @@ uint64_t vt_call_vkGetBufferOpaqueCaptureAddress(VkDevice device, const VkBuffer
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_BUFFER_OPAQUE_CAPTURE_ADDRESS, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
+-    uint64_t value = *(uint64_t*)(inputBuffer);
++    uint64_t value = VT_REPLY_VALUE(uint64_t);
+     VT_CALL_UNLOCK();
+     return value;
+ }
+@@ -2768,7 +3461,7 @@ VkDeviceAddress vt_call_vkGetBufferDeviceAddress(VkDevice device, const VkBuffer
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_BUFFER_DEVICE_ADDRESS, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
+-    VkDeviceAddress value = *(VkDeviceAddress*)(inputBuffer);
++    VkDeviceAddress value = VT_REPLY_VALUE(VkDeviceAddress);
+     VT_CALL_UNLOCK();
+     return value;
+ }
+@@ -2781,7 +3474,7 @@ uint64_t vt_call_vkGetDeviceMemoryOpaqueCaptureAddress(VkDevice device, const Vk
+     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS, VT_RETURN);
+     VT_RECV_CHECKED(VT_RETURN);
+     
+-    uint64_t value = *(uint64_t*)(inputBuffer);
++    uint64_t value = VT_REPLY_VALUE(uint64_t);
+     VT_CALL_UNLOCK();
+     return value;
+ }
+@@ -3050,30 +3743,33 @@ void vt_call_vkCmdSetDepthClipNegativeOneToOneEXT(VkCommandBuffer commandBuffer,
+     VT_CMD_ENQUEUE(vkCmdSetDepthClipNegativeOneToOneEXT, REQUEST_CODE_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, batch, (VkCommandBuffer)&commandBufferObject->id, negativeOneToOne);
+ }
+ 
++/* [mali-g2] Private data lives in the client only; it has its own lock now that the call lock is
++ * only held around requests to the server (vkSetPrivateData and vkGetPrivateData are not
++ * externally synchronised). */
++static pthread_mutex_t vt_privateDataMutex = PTHREAD_MUTEX_INITIALIZER;
++
+ VkResult vt_call_vkCreatePrivateDataSlot(VkDevice device, const VkPrivateDataSlotCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkPrivateDataSlot* pPrivateDataSlot) {
+-    VT_CALL_LOCK();
+     ArrayList* dataList = calloc(1, sizeof(ArrayList)); 
++    if (!dataList) return VK_ERROR_OUT_OF_HOST_MEMORY;
+     VkObject* privateDataSlotObject = VkObject_create(VK_OBJECT_TYPE_PRIVATE_DATA_SLOT, (uint64_t)dataList);
+     privateDataSlotObject->tag = dataList;
+     *pPrivateDataSlot = VkObject_toHandle(privateDataSlotObject);
+-
+-    VT_CALL_UNLOCK();
+     return VK_SUCCESS;
+ }
+ 
+ void vt_call_vkDestroyPrivateDataSlot(VkDevice device, VkPrivateDataSlot privateDataSlot, const VkAllocationCallbacks* pAllocator) {
+-    VT_CALL_LOCK();
+     VkObject* privateDataSlotObject = VkObject_fromHandle(privateDataSlot);
++    pthread_mutex_lock(&vt_privateDataMutex);
+     ArrayList* dataList = privateDataSlotObject->tag;
+     
+     ArrayList_free(dataList, true);
+     VkObject_free(privateDataSlotObject);
+-    VT_CALL_UNLOCK();
++    pthread_mutex_unlock(&vt_privateDataMutex);
+ }
+ 
+ VkResult vt_call_vkSetPrivateData(VkDevice device, VkObjectType objectType, uint64_t objectHandle, VkPrivateDataSlot privateDataSlot, uint64_t data) {
+-    VT_CALL_LOCK();
+     VkObject* privateDataSlotObject = VkObject_fromHandle(privateDataSlot);
++    pthread_mutex_lock(&vt_privateDataMutex);
+     ArrayList* dataList = privateDataSlotObject->tag;
+     
+     uint64_t* slot = NULL;
+@@ -3086,30 +3782,35 @@ VkResult vt_call_vkSetPrivateData(VkDevice device, VkObjectType objectType, uint
+     
+     if (!slot) {
+         slot = malloc(2 * sizeof(uint64_t));
++        if (!slot) {
++            pthread_mutex_unlock(&vt_privateDataMutex);
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++        }
+         ArrayList_add(dataList, slot);
+     }
+     
+     slot[0] = objectHandle;
+     slot[1] = data;
+     
+-    VT_CALL_UNLOCK();
++    pthread_mutex_unlock(&vt_privateDataMutex);
+     return VK_SUCCESS;
+ }
+ 
+ void vt_call_vkGetPrivateData(VkDevice device, VkObjectType objectType, uint64_t objectHandle, VkPrivateDataSlot privateDataSlot, uint64_t* pData) {
+-    VT_CALL_LOCK();
+     VkObject* privateDataSlotObject = VkObject_fromHandle(privateDataSlot);
++    uint64_t value = 0;
++    pthread_mutex_lock(&vt_privateDataMutex);
+     ArrayList* dataList = privateDataSlotObject->tag;
+     
+-    *pData = 0;
+     for (int i = 0; i < dataList->size; i++) {
+         if (((uint64_t*)dataList->elements[i])[0] == objectHandle) {
+-            *pData = ((uint64_t*)dataList->elements[i])[1];
++            value = ((uint64_t*)dataList->elements[i])[1];
+             break;
+         }
+     }
+     
+-    VT_CALL_UNLOCK();
++    pthread_mutex_unlock(&vt_privateDataMutex);
++    *pData = value;
+ }
+ 
+ void vt_call_vkCmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2* pCopyBufferInfo) {
+@@ -3196,9 +3897,12 @@ VkResult vt_call_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSub
+     VkObject* queueObject = VkObject_fromHandle(queue);
+     VkObject* fenceObject = VkObject_fromHandle(fence);
+     
+-    bool shouldWait = RingBuffer_hasStatus(clientRing, RING_STATUS_WAIT);
+-    
+     VT_SERIALIZE_CMD(vkQueueSubmit2, (VkQueue)&queueObject->id, submitCount, pSubmits, (VkFence)&fenceObject->id);
++
++    /* [mali-g2] read under the lock, as before: the server sets WAIT while answering another
++     * thread's call, and whether it replies to this submit depends on it */
++    vt_callLockNow();
++    bool shouldWait = clientRing && RingBuffer_hasStatus(clientRing, RING_STATUS_WAIT);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_SUBMIT2, VT_RETURN);
+     
+     if (shouldWait) {
+@@ -3244,6 +3948,12 @@ void vt_call_vkGetShaderModuleIdentifierEXT(VkDevice device, VkShaderModule shad
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkShaderModuleIdentifierEXT(pIdentifier, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetShaderModuleIdentifierEXT");
++        vt_zeroAfterHeader(pIdentifier, sizeof(*pIdentifier));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -3256,6 +3966,12 @@ void vt_call_vkGetShaderModuleCreateInfoIdentifierEXT(VkDevice device, const VkS
+     VT_RECV_CHECKED();
+     
+     vt_unserialize_VkShaderModuleIdentifierEXT(pIdentifier, inputBuffer, &globalMemoryPool);
++    if (VT_REPLY_BAD()) {
++        vt_badReply("vkGetShaderModuleCreateInfoIdentifierEXT");
++        vt_zeroAfterHeader(pIdentifier, sizeof(*pIdentifier));
++        VT_CALL_UNLOCK();
++        return;
++    }
+     VT_CALL_UNLOCK();
+ }
+ 
+@@ -3269,30 +3985,32 @@ VkResult vt_call_vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR* pMem
+         return VK_SUCCESS;
+     }
+ 
++    /* [mali-g2] read before the request goes out (and the lock is taken) */
++    VkMemoryMapPlacedInfoEXT* placedInfo = findNextVkStructure(pMemoryMapInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT);
++    void* placedAddr = placedInfo ? placedInfo->pPlacedAddress : NULL;
++    VkDeviceSize mapSize = pMemoryMapInfo->size, mapOffset = pMemoryMapInfo->offset;
++
+     VT_SERIALIZE_CMD(VkDeviceMemory, (VkDeviceMemory)&memoryObject->id);
+     VT_SEND_CHECKED(REQUEST_CODE_VK_MAP_MEMORY, VT_RETURN);
+ 
+-    int fd, result, numFds;
+-    recv_fds(serverFd, &fd, &numFds, &result, sizeof(VkResult));
+-    if (numFds == 1) {
+-        mappedMemory->size = pMemoryMapInfo->size;
++    int fd = -1, result = VK_ERROR_MEMORY_MAP_FAILED;
++    void* mapped = NULL;
++    if (vt_recvFds(&fd, 1, &result, sizeof(VkResult)) == 1) {
++        mappedMemory->size = mapSize;
+         if (mappedMemory->size == VK_WHOLE_SIZE) mappedMemory->size = mappedMemory->allocationSize;
+ 
+-        VkMemoryMapPlacedInfoEXT* placedInfo = findNextVkStructure(pMemoryMapInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT);
+-        void* placedAddr = placedInfo ? placedInfo->pPlacedAddress : NULL;
+-
+-        void* data = mmap(placedAddr, mappedMemory->size, PROT_WRITE | PROT_READ, MAP_SHARED | (placedAddr ? MAP_FIXED : 0), fd, pMemoryMapInfo->offset);
++        void* data = mmap(placedAddr, mappedMemory->size, PROT_WRITE | PROT_READ, MAP_SHARED | (placedAddr ? MAP_FIXED : 0), fd, mapOffset);
++        CLOSEFD(fd);
+         if (data != MAP_FAILED) {
+-            CLOSEFD(fd);
+             mappedMemory->data = data;
+-
+-            if (!placedAddr) *ppData = data;
++            if (!placedAddr) mapped = data;
+         }
+         else result = VK_ERROR_MEMORY_MAP_FAILED;
+     }
+     else result = VK_ERROR_MEMORY_MAP_FAILED;
+ 
+     VT_CALL_UNLOCK();
++    if (mapped) *ppData = mapped;
+     return (VkResult)result;
+ }
+ 
