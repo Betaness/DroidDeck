@@ -36,7 +36,10 @@
  *        fail with VK_ERROR_DEVICE_LOST at once;
  *      - a thread that ends while it holds the call lock (it faulted inside it, as above, and its
  *        function returned) must not block the others: within about a second their calls fail with
- *        VK_ERROR_DEVICE_LOST instead of hanging.
+ *        VK_ERROR_DEVICE_LOST instead of hanging;
+ *      - the library unloaded (the Vulkan loader dlclose()s the ICD when the last instance is
+ *        destroyed) and then a thread that had made calls exits: nothing of the library may run
+ *        then (the first r12-vortek client crashed here: its thread-specific key's destructor).
  *    Run against the g2-060 client, the fault scenarios hang (alarm).
  *
  * Build and run (from mali-g2/vortek, after fetch.sh and build-client.sh <dir>):
@@ -776,8 +779,10 @@ static VkQueue queue;
 
 static void setMode(int mode) { atomic_store(&shared->mode, mode); }
 
+static void* clientLib;
+
 static int clientSetup(const char* library) {
-    void* lib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+    void* lib = clientLib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
     if (!lib) {
         printf("dlopen %s: %s\n", library, dlerror());
         return 0;
@@ -1023,6 +1028,33 @@ static int scenarioFaultInLock(void) {
     return 1;
 }
 
+/* the Vulkan loader dlclose()s the ICD when its last instance is destroyed: a thread that made calls
+ * and exits after that must not run anything the library left behind (a thread-specific key's
+ * destructor would jump into the unmapped library) */
+static atomic_int unloadStep;
+static void* callThenExitAfterUnload(void* arg) {
+    (void)arg;
+    uint32_t n = 0;
+    VkResult r = FN(vkEnumeratePhysicalDevices)(instance, &n, NULL);
+    atomic_store(&unloadStep, r == VK_SUCCESS ? 1 : -1);
+    while (atomic_load(&unloadStep) == 1) usleep(1000);
+    return NULL; /* the thread exits here, after the library is gone */
+}
+
+static const char* unloadLibrary;
+static int scenarioUnloaded(void) {
+    pthread_t thread;
+    pthread_create(&thread, NULL, callThenExitAfterUnload, NULL);
+    while (atomic_load(&unloadStep) == 0) usleep(1000);
+    if (atomic_load(&unloadStep) < 0) { printf("  the call before unloading failed\n"); return 0; }
+    dlclose(clientLib);
+    void* still = dlopen(unloadLibrary, RTLD_NOW | RTLD_NOLOAD);
+    if (still) printf("  (the library stayed loaded after dlclose, nothing to check)\n");
+    atomic_store(&unloadStep, 2);
+    pthread_join(thread, NULL); /* crashes here if the exiting thread called into the unloaded library */
+    return 1;
+}
+
 static int runScenario(const char* library, const char* name, int (*scenario)(void)) {
     fflush(stdout);
     pid_t pid = fork();
@@ -1057,6 +1089,8 @@ int main(int argc, char** argv) {
         runScenario(argv[1], "fault inside the call lock (reply ring gone)", scenarioFaultInLock);
         runScenario(argv[1], "reply header size -5 loses the connection", scenarioBadHeader);
         runScenario(argv[1], "thread ends holding the call lock", scenarioThreadEnds);
+        unloadLibrary = argv[1];
+        runScenario(argv[1], "library unloaded, then a thread that called it exits", scenarioUnloaded);
         kill(server, SIGKILL);
         waitpid(server, NULL, 0);
         unlink(socketPath);

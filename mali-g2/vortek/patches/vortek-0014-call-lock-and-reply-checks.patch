@@ -517,7 +517,7 @@ index e09f569..59bf73d 100644
  }
  
 diff --git a/src/vulkan_calls.c b/src/vulkan_calls.c
-index c3f6ec2..1aecb91 100644
+index c3f6ec2..74c0116 100644
 --- a/src/vulkan_calls.c
 +++ b/src/vulkan_calls.c
 @@ -1,5 +1,8 @@
@@ -529,7 +529,7 @@ index c3f6ec2..1aecb91 100644
  
  #include "vortek.h"
  #include "vortek_serializer.h"
-@@ -20,12 +23,229 @@ struct VulkanFunc {
+@@ -20,12 +23,250 @@ struct VulkanFunc {
  
  static void* findVkDispatchFuncWithName(const char* name);
  
@@ -584,8 +584,19 @@ index c3f6ec2..1aecb91 100644
 +    MEMFREE(thread->scratch);
 +}
 +
++static bool vt_poolKeyMade;
++
 +static void vt_poolKeyCreate(void) {
-+    pthread_key_create(&vt_poolKey, vt_poolThreadExit);
++    vt_poolKeyMade = pthread_key_create(&vt_poolKey, vt_poolThreadExit) == 0;
++}
++
++/* The Vulkan loader dlclose()s the ICD when its last instance is destroyed and loads it again for the
++ * next one. A key destructor left registered would run when any thread that had made a call exits
++ * and jump into the unmapped library, so the key goes with the library. The pools of threads still
++ * alive then are left behind (the next load starts with fresh TLS). */
++__attribute__((destructor)) static void vt_poolKeyUnload(void) {
++    if (vt_poolKeyMade) pthread_key_delete(vt_poolKey);
++    vt_poolKeyMade = false;
 +}
 +
 +static __attribute__((noinline)) void vt_poolInit(VtThread* thread) {
@@ -606,13 +617,19 @@ index c3f6ec2..1aecb91 100644
 +    fprintf(stderr, "vortek: connection to the server lost (%s), Vulkan calls fail with VK_ERROR_DEVICE_LOST from now on\n", why);
 +}
 +
-+static pid_t vt_threadId(void) {
-+    if (!vt_thread.tid) vt_thread.tid = (pid_t)syscall(SYS_gettid);
++/* The fast paths below are inlined into every call: an uncontended call costs about what the
++ * plain pthread_mutex_lock/unlock did. */
++#define VT_INLINE static inline __attribute__((always_inline))
++
++VT_INLINE pid_t vt_threadId(void) {
++    if (__builtin_expect(!vt_thread.tid, 0)) vt_thread.tid = (pid_t)syscall(SYS_gettid);
 +    return vt_thread.tid;
 +}
 +
-+static void vt_callLocked(void) {
-+    __atomic_store_n(&vt_callOwner, vt_threadId(), __ATOMIC_RELEASE);
++/* vt_callOwner only tells waiters whom to check (the mutex orders everything else), so relaxed
++ * stores do */
++VT_INLINE void vt_callLocked(void) {
++    __atomic_store_n(&vt_callOwner, vt_threadId(), __ATOMIC_RELAXED);
 +    vt_callState.held = true;
 +}
 +
@@ -627,55 +644,59 @@ index c3f6ec2..1aecb91 100644
 +    pthread_mutex_unlock(&vt_call_mutex);
 +}
 +
-+static void vt_callLockNow(void) {
-+    if (vt_callState.held) return;
-+    if (pthread_mutex_trylock(&vt_call_mutex) != 0) {
-+        for (;;) {
-+            struct timespec deadline;
-+            clock_gettime(CLOCK_REALTIME, &deadline);
-+            deadline.tv_sec += 1;
-+            int rc = pthread_mutex_timedlock(&vt_call_mutex, &deadline);
-+            if (rc == 0) break;
-+            if (rc == ETIMEDOUT) vt_callCheckOwner();
-+        }
++static __attribute__((noinline, cold)) void vt_callLockWait(void) {
++    for (;;) {
++        struct timespec deadline;
++        clock_gettime(CLOCK_REALTIME, &deadline);
++        deadline.tv_sec += 1;
++        int rc = pthread_mutex_timedlock(&vt_call_mutex, &deadline);
++        if (rc == 0) break;
++        if (rc == ETIMEDOUT) vt_callCheckOwner();
 +    }
++}
++
++VT_INLINE void vt_callLockNow(void) {
++    if (vt_callState.held) return;
++    if (__builtin_expect(pthread_mutex_trylock(&vt_call_mutex) != 0, 0)) vt_callLockWait();
 +    vt_callLocked();
 +}
- 
--#define VT_CALL_LOCK() pthread_mutex_lock(&vt_call_mutex)
--#define VT_CALL_UNLOCK() \
--    vt_free(&globalMemoryPool); \
-+static bool vt_callTryLockNow(void) {
++
++VT_INLINE bool vt_callTryLockNow(void) {
 +    if (vt_callState.held) return true;
 +    if (pthread_mutex_trylock(&vt_call_mutex) != 0) return false;
 +    vt_callLocked();
 +    return true;
 +}
-+
+ 
+-#define VT_CALL_LOCK() pthread_mutex_lock(&vt_call_mutex)
+-#define VT_CALL_UNLOCK() \
+-    vt_free(&globalMemoryPool); \
 +static void vt_callUnlockNow(void) {
 +    if (!vt_callState.held) return;
 +    vt_callState.held = false;
 +    vt_callState.pending = false;
-+    __atomic_store_n(&vt_callOwner, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&vt_callOwner, 0, __ATOMIC_RELAXED);
      pthread_mutex_unlock(&vt_call_mutex);
 +}
 +
-+static void vt_callBegin(void) {
-+    if (__builtin_expect(vt_callState.inCall, 0)) {
-+        /* this thread's previous call never reached its end: it faulted and was unwound */
-+        static int logged;
-+        if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
-+            fprintf(stderr, "vortek: a Vulkan call was abandoned (fault in the call)%s\n",
-+                    vt_callState.held ? ", releasing the call lock it held" : "");
-+        }
-+        if (vt_callState.held && vt_callState.pending) vt_markConnectionLost("a call was abandoned before reading its reply");
-+        vt_callUnlockNow();
-+        vt_free(vt_poolFast());
++/* this thread's previous call never reached its end: it faulted and was unwound */
++static __attribute__((noinline, cold)) void vt_callAbandoned(void) {
++    static int logged;
++    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
++        fprintf(stderr, "vortek: a Vulkan call was abandoned (fault in the call)%s\n",
++                vt_callState.held ? ", releasing the call lock it held" : "");
 +    }
++    if (vt_callState.held && vt_callState.pending) vt_markConnectionLost("a call was abandoned before reading its reply");
++    vt_callUnlockNow();
++    vt_free(vt_poolFast());
++}
++
++VT_INLINE void vt_callBegin(void) {
++    if (__builtin_expect(vt_callState.inCall, 0)) vt_callAbandoned();
 +    vt_callState.inCall = true;
 +}
 +
-+static void vt_callEnd(void) {
++static __attribute__((noinline)) void vt_callEnd(void) {
 +    vt_callUnlockNow();
 +    vt_free(vt_poolFast());
 +    vt_callState.inCall = false;
@@ -762,7 +783,7 @@ index c3f6ec2..1aecb91 100644
  
  #ifdef VORTEK_DROIDDECK
  #include "droiddeck_requests.h"
-@@ -59,12 +279,13 @@ __attribute__((constructor)) static void vt_initCmdChunkSize(void) {
+@@ -59,12 +300,13 @@ __attribute__((constructor)) static void vt_initCmdChunkSize(void) {
   * waits for the lock, which keeps chunks well inside the server ring. */
  void vt_sendCommandChunk(CommandBatch* batch) {
      if (batch->size <= VK_HANDLE_BYTE_COUNT) return;
@@ -779,7 +800,7 @@ index c3f6ec2..1aecb91 100644
      batch->size = VK_HANDLE_BYTE_COUNT;
  }
  
-@@ -83,12 +304,15 @@ int droiddeck_request(int requestCode, const void* payload, int size) {
+@@ -83,12 +325,15 @@ int droiddeck_request(int requestCode, const void* payload, int size) {
  #endif
  
  static VkResult waitForPipelineCreation(int pipelineCount, VkPipeline* pPipelines) {
@@ -798,7 +819,7 @@ index c3f6ec2..1aecb91 100644
  
      int bufferSize = sizeof(VkResult) + pipelineCount * VK_HANDLE_BYTE_COUNT;
      char inputBuffer[bufferSize];
-@@ -124,6 +348,12 @@ VkResult vt_call_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const
+@@ -124,6 +369,12 @@ VkResult vt_call_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const
  
      uint64_t instanceId;
      vt_unserialize_VkInstance((VkInstance)&instanceId, inputBuffer, &globalMemoryPool);
@@ -811,7 +832,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* instanceObject = VkObject_create(VK_OBJECT_TYPE_INSTANCE, instanceId);
      *pInstance = VkObject_toHandle(instanceObject);
  
-@@ -151,7 +381,14 @@ VkResult vt_call_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhys
+@@ -151,7 +402,14 @@ VkResult vt_call_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhys
      VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_PHYSICAL_DEVICES, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -826,7 +847,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -173,6 +410,12 @@ void vt_call_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPh
+@@ -173,6 +431,12 @@ void vt_call_vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice, VkPh
      VT_RECV_CHECKED();
      
      vt_unserialize_VkPhysicalDeviceProperties(pProperties, inputBuffer, &globalMemoryPool);
@@ -839,7 +860,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -185,7 +428,14 @@ void vt_call_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalD
+@@ -185,7 +449,14 @@ void vt_call_vkGetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalD
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES);
      VT_RECV_CHECKED();
  
@@ -854,7 +875,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -198,6 +448,12 @@ void vt_call_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice
+@@ -198,6 +469,12 @@ void vt_call_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice
      VT_RECV_CHECKED();
      
      vt_unserialize_VkPhysicalDeviceMemoryProperties(pMemoryProperties, inputBuffer, &globalMemoryPool);
@@ -867,7 +888,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -210,6 +466,12 @@ void vt_call_vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhys
+@@ -210,6 +487,12 @@ void vt_call_vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhys
      VT_RECV_CHECKED();
      
      vt_unserialize_VkPhysicalDeviceFeatures(pFeatures, inputBuffer, &globalMemoryPool);
@@ -880,7 +901,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -222,6 +484,12 @@ void vt_call_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice
+@@ -222,6 +505,12 @@ void vt_call_vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice
      VT_RECV_CHECKED();
      
      vt_unserialize_VkFormatProperties(pFormatProperties, inputBuffer, &globalMemoryPool);
@@ -893,7 +914,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -234,6 +502,12 @@ VkResult vt_call_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physi
+@@ -234,6 +523,12 @@ VkResult vt_call_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physi
      VT_RECV_CHECKED(VT_RETURN);
  
      vt_unserialize_VkImageFormatProperties(pImageFormatProperties, inputBuffer, &globalMemoryPool);
@@ -906,7 +927,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -248,6 +522,12 @@ VkResult vt_call_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceC
+@@ -248,6 +543,12 @@ VkResult vt_call_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceC
  
      uint64_t deviceId;
      vt_unserialize_VkDevice((VkDevice)&deviceId, inputBuffer, &globalMemoryPool);
@@ -919,7 +940,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* deviceObject = VkObject_create(VK_OBJECT_TYPE_DEVICE, deviceId);
      *pDevice = VkObject_toHandle(deviceObject);
  #ifdef VORTEK_STANDALONE
-@@ -279,7 +559,13 @@ VkResult vt_call_vkEnumerateInstanceVersion(uint32_t* pApiVersion) {
+@@ -279,7 +580,13 @@ VkResult vt_call_vkEnumerateInstanceVersion(uint32_t* pApiVersion) {
      }
      
      VT_RECV_CHECKED(VT_RETURN);
@@ -934,7 +955,7 @@ index c3f6ec2..1aecb91 100644
      
      VT_CALL_UNLOCK();
      return (VkResult)result;
-@@ -298,7 +584,14 @@ VkResult vt_call_vkEnumerateInstanceExtensionProperties(const char* pLayerName,
+@@ -298,7 +605,14 @@ VkResult vt_call_vkEnumerateInstanceExtensionProperties(const char* pLayerName,
      VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_INSTANCE_EXTENSION_PROPERTIES, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -949,7 +970,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -375,7 +668,14 @@ VkResult vt_call_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalD
+@@ -375,7 +689,14 @@ VkResult vt_call_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalD
      VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_DEVICE_EXTENSION_PROPERTIES, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -964,7 +985,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -390,6 +690,12 @@ void vt_call_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32
+@@ -390,6 +711,12 @@ void vt_call_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32
      
      uint64_t queueId;
      vt_unserialize_VkQueue((VkQueue)&queueId, inputBuffer, &globalMemoryPool);
@@ -977,7 +998,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* queueObject = VkObject_create(VK_OBJECT_TYPE_QUEUE, queueId);
      *pQueue = VkObject_toHandle(queueObject);
  #ifdef VORTEK_STANDALONE
-@@ -404,9 +710,12 @@ VkResult vt_call_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubm
+@@ -404,9 +731,12 @@ VkResult vt_call_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubm
      VkObject* queueObject = VkObject_fromHandle(queue);
      VkObject* fenceObject = VkObject_fromHandle(fence);
      
@@ -992,7 +1013,7 @@ index c3f6ec2..1aecb91 100644
      VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_SUBMIT, VT_RETURN);
      
      if (shouldWait) {
-@@ -455,6 +764,12 @@ VkResult vt_call_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* p
+@@ -455,6 +785,12 @@ VkResult vt_call_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* p
      if (result == VK_SUCCESS) {
          uint64_t memoryId;
          vt_unserialize_VkDeviceMemory((VkDeviceMemory)&memoryId, inputBuffer, &globalMemoryPool);
@@ -1005,7 +1026,7 @@ index c3f6ec2..1aecb91 100644
          VkObject* memoryObject = VkObject_create(VK_OBJECT_TYPE_DEVICE_MEMORY, memoryId);
          *pMemory = VkObject_toHandle(memoryObject);
          
-@@ -495,23 +810,24 @@ VkResult vt_call_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSiz
+@@ -495,23 +831,24 @@ VkResult vt_call_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSiz
      VT_SERIALIZE_CMD(VkDeviceMemory, (VkDeviceMemory)&memoryObject->id);    
      VT_SEND_CHECKED(REQUEST_CODE_VK_MAP_MEMORY, VT_RETURN);
      
@@ -1035,7 +1056,7 @@ index c3f6ec2..1aecb91 100644
      return (VkResult)result;
  }
  
-@@ -563,7 +879,7 @@ void vt_call_vkGetDeviceMemoryCommitment(VkDevice device, VkDeviceMemory memory,
+@@ -563,7 +900,7 @@ void vt_call_vkGetDeviceMemoryCommitment(VkDevice device, VkDeviceMemory memory,
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_MEMORY_COMMITMENT);
      VT_RECV_CHECKED();
  
@@ -1044,7 +1065,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -577,6 +893,12 @@ void vt_call_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkM
+@@ -577,6 +914,12 @@ void vt_call_vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer, VkM
      VT_RECV_CHECKED();
      
      vt_unserialize_VkMemoryRequirements(pMemoryRequirements, inputBuffer, &globalMemoryPool);
@@ -1057,7 +1078,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -604,6 +926,12 @@ void vt_call_vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemo
+@@ -604,6 +947,12 @@ void vt_call_vkGetImageMemoryRequirements(VkDevice device, VkImage image, VkMemo
      VT_RECV_CHECKED();
      
      vt_unserialize_VkMemoryRequirements(pMemoryRequirements, inputBuffer, &globalMemoryPool);
@@ -1070,7 +1091,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -631,7 +959,14 @@ void vt_call_vkGetImageSparseMemoryRequirements(VkDevice device, VkImage image,
+@@ -631,7 +980,14 @@ void vt_call_vkGetImageSparseMemoryRequirements(VkDevice device, VkImage image,
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS);
      VT_RECV_CHECKED();
  
@@ -1085,7 +1106,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -644,7 +979,14 @@ void vt_call_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice phy
+@@ -644,7 +1000,14 @@ void vt_call_vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice phy
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES);
      VT_RECV_CHECKED();
  
@@ -1100,7 +1121,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -671,6 +1013,12 @@ VkResult vt_call_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreate
+@@ -671,6 +1034,12 @@ VkResult vt_call_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreate
  
      uint64_t fenceId;
      vt_unserialize_VkFence((VkFence)&fenceId, inputBuffer, &globalMemoryPool);
@@ -1113,7 +1134,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* fenceObject = VkObject_create(VK_OBJECT_TYPE_FENCE, fenceId);
      *pFence = VkObject_toHandle(fenceObject);
  
-@@ -728,12 +1076,15 @@ VkResult vt_call_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkF
+@@ -728,12 +1097,15 @@ VkResult vt_call_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkF
          return (VkResult)result;   
      }
      else {
@@ -1133,7 +1154,7 @@ index c3f6ec2..1aecb91 100644
          int timeoutMs = timeout != UINT64_MAX ? timeout / 1000000 : 0;
          result = waitForEvents(fds, numFds, waitAll ? true : false, timeoutMs);
          for (int i = 0; i < numFds; i++) CLOSEFD(fds[i]);
-@@ -751,6 +1102,12 @@ VkResult vt_call_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo*
+@@ -751,6 +1123,12 @@ VkResult vt_call_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo*
  
      uint64_t semaphoreId;
      vt_unserialize_VkSemaphore((VkSemaphore)&semaphoreId, inputBuffer, &globalMemoryPool);
@@ -1146,7 +1167,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* semaphoreObject = VkObject_create(VK_OBJECT_TYPE_SEMAPHORE, semaphoreId);
      *pSemaphore = VkObject_toHandle(semaphoreObject);
  
-@@ -780,6 +1137,12 @@ VkResult vt_call_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreate
+@@ -780,6 +1158,12 @@ VkResult vt_call_vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreate
  
      uint64_t eventId;
      vt_unserialize_VkEvent((VkEvent)&eventId, inputBuffer, &globalMemoryPool);
@@ -1159,7 +1180,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* eventObject = VkObject_create(VK_OBJECT_TYPE_EVENT, eventId);
      *pEvent = VkObject_toHandle(eventObject);
  
-@@ -848,6 +1211,12 @@ VkResult vt_call_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo*
+@@ -848,6 +1232,12 @@ VkResult vt_call_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo*
  
      uint64_t queryPoolId;
      vt_unserialize_VkQueryPool((VkQueryPool)&queryPoolId, inputBuffer, &globalMemoryPool);
@@ -1172,7 +1193,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* queryPoolObject = VkObject_create(VK_OBJECT_TYPE_QUERY_POOL, queryPoolId);
      *pQueryPool = VkObject_toHandle(queryPoolObject);
  
-@@ -876,7 +1245,13 @@ VkResult vt_call_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, u
+@@ -876,7 +1266,13 @@ VkResult vt_call_vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, u
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_QUERY_POOL_RESULTS, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1186,7 +1207,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -902,6 +1277,12 @@ VkResult vt_call_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCrea
+@@ -902,6 +1298,12 @@ VkResult vt_call_vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pCrea
  
      uint64_t bufferId;
      vt_unserialize_VkBuffer((VkBuffer)&bufferId, inputBuffer, &globalMemoryPool);
@@ -1199,7 +1220,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* bufferObject = VkObject_create(VK_OBJECT_TYPE_BUFFER, bufferId);
      *pBuffer = VkObject_toHandle(bufferObject);
  
-@@ -931,6 +1312,12 @@ VkResult vt_call_vkCreateBufferView(VkDevice device, const VkBufferViewCreateInf
+@@ -931,6 +1333,12 @@ VkResult vt_call_vkCreateBufferView(VkDevice device, const VkBufferViewCreateInf
  
      uint64_t viewId;
      vt_unserialize_VkBufferView((VkBufferView)&viewId, inputBuffer, &globalMemoryPool);
@@ -1212,7 +1233,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* viewObject = VkObject_create(VK_OBJECT_TYPE_BUFFER_VIEW, viewId);
      *pView = VkObject_toHandle(viewObject);
  
-@@ -960,6 +1347,12 @@ VkResult vt_call_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreate
+@@ -960,6 +1368,12 @@ VkResult vt_call_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreate
  
      uint64_t imageId;
      vt_unserialize_VkImage((VkImage)&imageId, inputBuffer, &globalMemoryPool);
@@ -1225,7 +1246,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* imageObject = VkObject_create(VK_OBJECT_TYPE_IMAGE, imageId);
      *pImage = VkObject_toHandle(imageObject);
  
-@@ -989,6 +1382,12 @@ void vt_call_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const V
+@@ -989,6 +1403,12 @@ void vt_call_vkGetImageSubresourceLayout(VkDevice device, VkImage image, const V
      VT_RECV_CHECKED();
      
      vt_unserialize_VkSubresourceLayout(pLayout, inputBuffer, &globalMemoryPool);
@@ -1238,7 +1259,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -1002,6 +1401,12 @@ VkResult vt_call_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo*
+@@ -1002,6 +1422,12 @@ VkResult vt_call_vkCreateImageView(VkDevice device, const VkImageViewCreateInfo*
  
      uint64_t viewId;
      vt_unserialize_VkImageView((VkImageView)&viewId, inputBuffer, &globalMemoryPool);
@@ -1251,7 +1272,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* viewObject = VkObject_create(VK_OBJECT_TYPE_IMAGE_VIEW, viewId);
      *pView = VkObject_toHandle(viewObject);
  
-@@ -1031,6 +1436,12 @@ VkResult vt_call_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreat
+@@ -1031,6 +1457,12 @@ VkResult vt_call_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreat
  
      uint64_t shaderModuleId;
      vt_unserialize_VkShaderModule((VkShaderModule)&shaderModuleId, inputBuffer, &globalMemoryPool);
@@ -1264,7 +1285,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* shaderModuleObject = VkObject_create(VK_OBJECT_TYPE_SHADER_MODULE, shaderModuleId);
      *pShaderModule = VkObject_toHandle(shaderModuleObject);
  
-@@ -1060,6 +1471,12 @@ VkResult vt_call_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCre
+@@ -1060,6 +1492,12 @@ VkResult vt_call_vkCreatePipelineCache(VkDevice device, const VkPipelineCacheCre
  
      uint64_t pipelineCacheId;
      vt_unserialize_VkPipelineCache((VkPipelineCache)&pipelineCacheId, inputBuffer, &globalMemoryPool);
@@ -1277,7 +1298,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* pipelineCacheObject = VkObject_create(VK_OBJECT_TYPE_PIPELINE_CACHE, pipelineCacheId);
      *pPipelineCache = VkObject_toHandle(pipelineCacheObject);
  
-@@ -1089,7 +1506,15 @@ VkResult vt_call_vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelin
+@@ -1089,7 +1527,15 @@ VkResult vt_call_vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelin
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PIPELINE_CACHE_DATA, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1293,7 +1314,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -1151,6 +1576,12 @@ VkResult vt_call_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutC
+@@ -1151,6 +1597,12 @@ VkResult vt_call_vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutC
  
      uint64_t pipelineLayoutId;
      vt_unserialize_VkPipelineLayout((VkPipelineLayout)&pipelineLayoutId, inputBuffer, &globalMemoryPool);
@@ -1306,7 +1327,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* pipelineLayoutObject = VkObject_create(VK_OBJECT_TYPE_PIPELINE_LAYOUT, pipelineLayoutId);
      *pPipelineLayout = VkObject_toHandle(pipelineLayoutObject);
  
-@@ -1180,6 +1611,12 @@ VkResult vt_call_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCr
+@@ -1180,6 +1632,12 @@ VkResult vt_call_vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* pCr
  
      uint64_t samplerId;
      vt_unserialize_VkSampler((VkSampler)&samplerId, inputBuffer, &globalMemoryPool);
@@ -1319,7 +1340,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* samplerObject = VkObject_create(VK_OBJECT_TYPE_SAMPLER, samplerId);
      *pSampler = VkObject_toHandle(samplerObject);
  
-@@ -1209,6 +1646,12 @@ VkResult vt_call_vkCreateDescriptorSetLayout(VkDevice device, const VkDescriptor
+@@ -1209,6 +1667,12 @@ VkResult vt_call_vkCreateDescriptorSetLayout(VkDevice device, const VkDescriptor
  
      uint64_t setLayoutId;
      vt_unserialize_VkDescriptorSetLayout((VkDescriptorSetLayout)&setLayoutId, inputBuffer, &globalMemoryPool);
@@ -1332,7 +1353,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* setLayoutObject = VkObject_create(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, setLayoutId);
      *pSetLayout = VkObject_toHandle(setLayoutObject);
  
-@@ -1238,6 +1681,12 @@ VkResult vt_call_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolC
+@@ -1238,6 +1702,12 @@ VkResult vt_call_vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolC
  
      uint64_t descriptorPoolId;
      vt_unserialize_VkDescriptorPool((VkDescriptorPool)&descriptorPoolId, inputBuffer, &globalMemoryPool);
@@ -1345,7 +1366,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* descriptorPoolObject = VkObject_create(VK_OBJECT_TYPE_DESCRIPTOR_POOL, descriptorPoolId);
      *pDescriptorPool = VkObject_toHandle(descriptorPoolObject);
      
-@@ -1289,10 +1738,18 @@ VkResult vt_call_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSet
+@@ -1289,10 +1759,18 @@ VkResult vt_call_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSet
          return (VkResult)result;
      }
      
@@ -1366,7 +1387,7 @@ index c3f6ec2..1aecb91 100644
          
          VkObject* descriptorSetObject = VkObjectPool_get(objectPool);
          if (!descriptorSetObject) {
-@@ -1346,6 +1803,12 @@ VkResult vt_call_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateI
+@@ -1346,6 +1824,12 @@ VkResult vt_call_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateI
  
      uint64_t framebufferId;
      vt_unserialize_VkFramebuffer((VkFramebuffer)&framebufferId, inputBuffer, &globalMemoryPool);
@@ -1379,7 +1400,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* framebufferObject = VkObject_create(VK_OBJECT_TYPE_FRAMEBUFFER, framebufferId);
      *pFramebuffer = VkObject_toHandle(framebufferObject);
  
-@@ -1375,6 +1838,12 @@ VkResult vt_call_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInf
+@@ -1375,6 +1859,12 @@ VkResult vt_call_vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInf
  
      uint64_t renderPassId;
      vt_unserialize_VkRenderPass((VkRenderPass)&renderPassId, inputBuffer, &globalMemoryPool);
@@ -1392,7 +1413,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* renderPassObject = VkObject_create(VK_OBJECT_TYPE_RENDER_PASS, renderPassId);
      *pRenderPass = VkObject_toHandle(renderPassObject);
  
-@@ -1404,6 +1873,12 @@ void vt_call_vkGetRenderAreaGranularity(VkDevice device, VkRenderPass renderPass
+@@ -1404,6 +1894,12 @@ void vt_call_vkGetRenderAreaGranularity(VkDevice device, VkRenderPass renderPass
      VT_RECV_CHECKED();
      
      vt_unserialize_VkExtent2D(pGranularity, inputBuffer, &globalMemoryPool);
@@ -1405,7 +1426,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -1417,6 +1892,12 @@ VkResult vt_call_vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateI
+@@ -1417,6 +1913,12 @@ VkResult vt_call_vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateI
  
      uint64_t commandPoolId;
      vt_unserialize_VkCommandPool((VkCommandPool)&commandPoolId, inputBuffer, &globalMemoryPool);
@@ -1418,7 +1439,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* commandPoolObject = VkObject_create(VK_OBJECT_TYPE_COMMAND_POOL, commandPoolId);
      *pCommandPool = VkObject_toHandle(commandPoolObject);
  
-@@ -1456,10 +1937,25 @@ VkResult vt_call_vkAllocateCommandBuffers(VkDevice device, const VkCommandBuffer
+@@ -1456,10 +1958,25 @@ VkResult vt_call_vkAllocateCommandBuffers(VkDevice device, const VkCommandBuffer
      VT_SEND_CHECKED(REQUEST_CODE_VK_ALLOCATE_COMMAND_BUFFERS, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1445,7 +1466,7 @@ index c3f6ec2..1aecb91 100644
          VkObject* commandBufferObject = VkObject_fromHandle(pCommandBuffers[i]);
          CommandBatch* batch = calloc(1, sizeof(CommandBatch));
          ENSURE_ARRAY_CAPACITY(VK_HANDLE_BYTE_COUNT, batch->capacity, batch->buffer, 1);
-@@ -1912,6 +2408,12 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice phys
+@@ -1912,6 +2429,12 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice phys
      VT_RECV_CHECKED(VT_RETURN);
      
      vt_unserialize_VkSurfaceCapabilitiesKHR(pSurfaceCapabilities, inputBuffer, &globalMemoryPool);
@@ -1458,7 +1479,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  #ifdef VORTEK_STANDALONE
      if (result == VK_SUCCESS) X11Present_fixSurfaceCapabilities(surface, pSurfaceCapabilities);
-@@ -1928,7 +2430,14 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalD
+@@ -1928,7 +2451,14 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalD
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SURFACE_FORMATS_KHR, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -1473,7 +1494,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -1942,7 +2451,14 @@ VkResult vt_call_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice phys
+@@ -1942,7 +2472,14 @@ VkResult vt_call_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice phys
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SURFACE_PRESENT_MODES_KHR, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -1488,7 +1509,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -1962,6 +2478,12 @@ VkResult vt_call_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateIn
+@@ -1962,6 +2499,12 @@ VkResult vt_call_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateIn
      
      uint64_t swapchainId;
      vt_unserialize_VkSwapchainKHR((VkSwapchainKHR)&swapchainId, inputBuffer, &globalMemoryPool);
@@ -1501,7 +1522,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* swapchainObject = VkObject_create(VK_OBJECT_TYPE_SWAPCHAIN_KHR, swapchainId);
      *pSwapchain = VkObject_toHandle(swapchainObject);
      
-@@ -1997,7 +2519,14 @@ VkResult vt_call_vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapcha
+@@ -1997,7 +2540,14 @@ VkResult vt_call_vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapcha
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_SWAPCHAIN_IMAGES_KHR, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -1516,7 +1537,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2068,6 +2597,12 @@ void vt_call_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhy
+@@ -2068,6 +2618,12 @@ void vt_call_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhy
      VT_RECV_CHECKED();
      
      vt_unserialize_VkPhysicalDeviceFeatures2(pFeatures, inputBuffer, &globalMemoryPool);
@@ -1529,7 +1550,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2080,6 +2615,12 @@ void vt_call_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkP
+@@ -2080,6 +2636,12 @@ void vt_call_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkP
      VT_RECV_CHECKED();
      
      vt_unserialize_VkPhysicalDeviceProperties2(pProperties, inputBuffer, &globalMemoryPool);
@@ -1542,7 +1563,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2092,6 +2633,12 @@ void vt_call_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevic
+@@ -2092,6 +2654,12 @@ void vt_call_vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevic
      VT_RECV_CHECKED();
      
      vt_unserialize_VkFormatProperties2(pFormatProperties, inputBuffer, &globalMemoryPool);
@@ -1555,7 +1576,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2104,6 +2651,12 @@ VkResult vt_call_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice phys
+@@ -2104,6 +2672,12 @@ VkResult vt_call_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice phys
      VT_RECV_CHECKED(VT_RETURN);
  
      vt_unserialize_VkImageFormatProperties2(pImageFormatProperties, inputBuffer, &globalMemoryPool);
@@ -1568,7 +1589,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2117,7 +2670,14 @@ void vt_call_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical
+@@ -2117,7 +2691,14 @@ void vt_call_vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physical
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES2);
      VT_RECV_CHECKED();
  
@@ -1583,7 +1604,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2130,6 +2690,12 @@ void vt_call_vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevic
+@@ -2130,6 +2711,12 @@ void vt_call_vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevic
      VT_RECV_CHECKED();
      
      vt_unserialize_VkPhysicalDeviceMemoryProperties2(pMemoryProperties, inputBuffer, &globalMemoryPool);
@@ -1596,7 +1617,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2142,7 +2708,14 @@ void vt_call_vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice ph
+@@ -2142,7 +2729,14 @@ void vt_call_vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice ph
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SPARSE_IMAGE_FORMAT_PROPERTIES2);
      VT_RECV_CHECKED();
  
@@ -1611,7 +1632,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2174,6 +2747,12 @@ void vt_call_vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physic
+@@ -2174,6 +2768,12 @@ void vt_call_vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physic
      VT_RECV_CHECKED();
      
      vt_unserialize_VkExternalBufferProperties(pExternalBufferProperties, inputBuffer, &globalMemoryPool);
@@ -1624,7 +1645,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2184,11 +2763,11 @@ VkResult vt_call_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* p
+@@ -2184,11 +2784,11 @@ VkResult vt_call_vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR* p
      VT_SERIALIZE_CMD(VkDeviceMemory, (VkDeviceMemory)&memoryObject->id);
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_MEMORY_FD_KHR, VT_RETURN);
  
@@ -1639,7 +1660,7 @@ index c3f6ec2..1aecb91 100644
      return (VkResult)result;
  }
  
-@@ -2205,6 +2784,12 @@ void vt_call_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice phy
+@@ -2205,6 +2805,12 @@ void vt_call_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice phy
      VT_RECV_CHECKED();
      
      vt_unserialize_VkExternalSemaphoreProperties(pExternalSemaphoreProperties, inputBuffer, &globalMemoryPool);
@@ -1652,7 +1673,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2215,11 +2800,11 @@ VkResult vt_call_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfo
+@@ -2215,11 +2821,11 @@ VkResult vt_call_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfo
      VT_SERIALIZE_CMD(vkGetSemaphoreFdKHR, (VkDevice)&deviceObject->id, pGetFdInfo, NULL);
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_SEMAPHORE_FD_KHR, VT_RETURN);
  
@@ -1667,7 +1688,7 @@ index c3f6ec2..1aecb91 100644
      return (VkResult)result;
  }
  
-@@ -2236,6 +2821,12 @@ void vt_call_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physica
+@@ -2236,6 +2842,12 @@ void vt_call_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physica
      VT_RECV_CHECKED();
      
      vt_unserialize_VkExternalFenceProperties(pExternalFenceProperties, inputBuffer, &globalMemoryPool);
@@ -1680,7 +1701,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2246,11 +2837,11 @@ VkResult vt_call_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGe
+@@ -2246,11 +2858,11 @@ VkResult vt_call_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGe
      VT_SERIALIZE_CMD(vkGetFenceFdKHR, (VkDevice)&deviceObject->id, pGetFdInfo, NULL);
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_FENCE_FD_KHR, VT_RETURN);
  
@@ -1695,7 +1716,7 @@ index c3f6ec2..1aecb91 100644
      return (VkResult)result;
  }
  
-@@ -2267,7 +2858,14 @@ VkResult vt_call_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t*
+@@ -2267,7 +2879,14 @@ VkResult vt_call_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t*
      VT_SEND_CHECKED(REQUEST_CODE_VK_ENUMERATE_PHYSICAL_DEVICE_GROUPS, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -1710,7 +1731,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2280,7 +2878,7 @@ void vt_call_vkGetDeviceGroupPeerMemoryFeatures(VkDevice device, uint32_t heapIn
+@@ -2280,7 +2899,7 @@ void vt_call_vkGetDeviceGroupPeerMemoryFeatures(VkDevice device, uint32_t heapIn
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_GROUP_PEER_MEMORY_FEATURES);
      VT_RECV_CHECKED();
      
@@ -1719,7 +1740,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2361,7 +2959,14 @@ VkResult vt_call_vkGetPhysicalDevicePresentRectanglesKHR(VkPhysicalDevice physic
+@@ -2361,7 +2980,14 @@ VkResult vt_call_vkGetPhysicalDevicePresentRectanglesKHR(VkPhysicalDevice physic
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_PRESENT_RECTANGLES_KHR, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1734,7 +1755,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2440,6 +3045,12 @@ void vt_call_vkGetPhysicalDeviceMultisamplePropertiesEXT(VkPhysicalDevice physic
+@@ -2440,6 +3066,12 @@ void vt_call_vkGetPhysicalDeviceMultisamplePropertiesEXT(VkPhysicalDevice physic
      VT_RECV_CHECKED();
  
      vt_unserialize_VkMultisamplePropertiesEXT(pMultisampleProperties, inputBuffer, &globalMemoryPool);
@@ -1747,7 +1768,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2452,6 +3063,12 @@ void vt_call_vkGetBufferMemoryRequirements2(VkDevice device, const VkBufferMemor
+@@ -2452,6 +3084,12 @@ void vt_call_vkGetBufferMemoryRequirements2(VkDevice device, const VkBufferMemor
      VT_RECV_CHECKED();
      
      vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
@@ -1760,7 +1781,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2464,6 +3081,12 @@ void vt_call_vkGetImageMemoryRequirements2(VkDevice device, const VkImageMemoryR
+@@ -2464,6 +3102,12 @@ void vt_call_vkGetImageMemoryRequirements2(VkDevice device, const VkImageMemoryR
      VT_RECV_CHECKED();
      
      vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
@@ -1773,7 +1794,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2476,7 +3099,14 @@ void vt_call_vkGetImageSparseMemoryRequirements2(VkDevice device, const VkImageS
+@@ -2476,7 +3120,14 @@ void vt_call_vkGetImageSparseMemoryRequirements2(VkDevice device, const VkImageS
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_IMAGE_SPARSE_MEMORY_REQUIREMENTS2);
      VT_RECV_CHECKED();
  
@@ -1788,7 +1809,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2489,6 +3119,12 @@ void vt_call_vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDevice
+@@ -2489,6 +3140,12 @@ void vt_call_vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDevice
      VT_RECV_CHECKED();
      
      vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
@@ -1801,7 +1822,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2501,6 +3137,12 @@ void vt_call_vkGetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceI
+@@ -2501,6 +3158,12 @@ void vt_call_vkGetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceI
      VT_RECV_CHECKED();
      
      vt_unserialize_VkMemoryRequirements2(pMemoryRequirements, inputBuffer, &globalMemoryPool);
@@ -1814,7 +1835,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2513,7 +3155,14 @@ void vt_call_vkGetDeviceImageSparseMemoryRequirements(VkDevice device, const VkD
+@@ -2513,7 +3176,14 @@ void vt_call_vkGetDeviceImageSparseMemoryRequirements(VkDevice device, const VkD
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_IMAGE_SPARSE_MEMORY_REQUIREMENTS);
      VT_RECV_CHECKED();
  
@@ -1829,7 +1850,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2527,6 +3176,12 @@ VkResult vt_call_vkCreateSamplerYcbcrConversion(VkDevice device, const VkSampler
+@@ -2527,6 +3197,12 @@ VkResult vt_call_vkCreateSamplerYcbcrConversion(VkDevice device, const VkSampler
  
      uint64_t ycbcrConversionId;
      vt_unserialize_VkSamplerYcbcrConversion((VkSamplerYcbcrConversion)&ycbcrConversionId, inputBuffer, &globalMemoryPool);
@@ -1842,7 +1863,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* ycbcrConversionObject = VkObject_create(VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION, ycbcrConversionId);
      *pYcbcrConversion = VkObject_toHandle(ycbcrConversionObject);
  
-@@ -2556,6 +3211,12 @@ void vt_call_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueue
+@@ -2556,6 +3232,12 @@ void vt_call_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueue
      
      uint64_t queueId;
      vt_unserialize_VkQueue((VkQueue)&queueId, inputBuffer, &globalMemoryPool);
@@ -1855,7 +1876,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* queueObject = VkObject_create(VK_OBJECT_TYPE_QUEUE, queueId);
      *pQueue = VkObject_toHandle(queueObject);
         
-@@ -2571,6 +3232,12 @@ void vt_call_vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptor
+@@ -2571,6 +3253,12 @@ void vt_call_vkGetDescriptorSetLayoutSupport(VkDevice device, const VkDescriptor
      VT_RECV_CHECKED();
      
      vt_unserialize_VkDescriptorSetLayoutSupport(pSupport, inputBuffer, &globalMemoryPool);
@@ -1868,7 +1889,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -2583,7 +3250,14 @@ VkResult vt_call_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice
+@@ -2583,7 +3271,14 @@ VkResult vt_call_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_CALIBRATEABLE_TIME_DOMAINS_KHR, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -1883,7 +1904,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2596,7 +3270,13 @@ VkResult vt_call_vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timestam
+@@ -2596,7 +3291,13 @@ VkResult vt_call_vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timestam
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_CALIBRATED_TIMESTAMPS_KHR, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
  
@@ -1897,7 +1918,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2611,6 +3291,12 @@ VkResult vt_call_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateIn
+@@ -2611,6 +3312,12 @@ VkResult vt_call_vkCreateRenderPass2(VkDevice device, const VkRenderPassCreateIn
  
      uint64_t renderPassId;
      vt_unserialize_VkRenderPass((VkRenderPass)&renderPassId, inputBuffer, &globalMemoryPool);
@@ -1910,7 +1931,7 @@ index c3f6ec2..1aecb91 100644
      VkObject* renderPassObject = VkObject_create(VK_OBJECT_TYPE_RENDER_PASS, renderPassId);
      *pRenderPass = VkObject_toHandle(renderPassObject);
  
-@@ -2648,7 +3334,13 @@ VkResult vt_call_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semapho
+@@ -2648,7 +3355,13 @@ VkResult vt_call_vkGetSemaphoreCounterValue(VkDevice device, VkSemaphore semapho
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_SEMAPHORE_COUNTER_VALUE, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1925,7 +1946,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return (VkResult)result;
  }
-@@ -2660,9 +3352,10 @@ VkResult vt_call_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pW
+@@ -2660,9 +3373,10 @@ VkResult vt_call_vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* pW
      VT_SERIALIZE_CMD(vkWaitSemaphores, (VkDevice)&deviceObject->id, pWaitInfo, timeout);
      VT_SEND_CHECKED(REQUEST_CODE_VK_WAIT_SEMAPHORES, VT_RETURN);
      
@@ -1938,7 +1959,7 @@ index c3f6ec2..1aecb91 100644
      
      uint64_t value = 0;
      int bytesRead = read(fd, &value, sizeof(uint64_t));
-@@ -2755,7 +3448,7 @@ uint64_t vt_call_vkGetBufferOpaqueCaptureAddress(VkDevice device, const VkBuffer
+@@ -2755,7 +3469,7 @@ uint64_t vt_call_vkGetBufferOpaqueCaptureAddress(VkDevice device, const VkBuffer
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_BUFFER_OPAQUE_CAPTURE_ADDRESS, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1947,7 +1968,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return value;
  }
-@@ -2768,7 +3461,7 @@ VkDeviceAddress vt_call_vkGetBufferDeviceAddress(VkDevice device, const VkBuffer
+@@ -2768,7 +3482,7 @@ VkDeviceAddress vt_call_vkGetBufferDeviceAddress(VkDevice device, const VkBuffer
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_BUFFER_DEVICE_ADDRESS, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1956,7 +1977,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return value;
  }
-@@ -2781,7 +3474,7 @@ uint64_t vt_call_vkGetDeviceMemoryOpaqueCaptureAddress(VkDevice device, const Vk
+@@ -2781,7 +3495,7 @@ uint64_t vt_call_vkGetDeviceMemoryOpaqueCaptureAddress(VkDevice device, const Vk
      VT_SEND_CHECKED(REQUEST_CODE_VK_GET_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS, VT_RETURN);
      VT_RECV_CHECKED(VT_RETURN);
      
@@ -1965,7 +1986,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
      return value;
  }
-@@ -3050,30 +3743,33 @@ void vt_call_vkCmdSetDepthClipNegativeOneToOneEXT(VkCommandBuffer commandBuffer,
+@@ -3050,30 +3764,33 @@ void vt_call_vkCmdSetDepthClipNegativeOneToOneEXT(VkCommandBuffer commandBuffer,
      VT_CMD_ENQUEUE(vkCmdSetDepthClipNegativeOneToOneEXT, REQUEST_CODE_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, batch, (VkCommandBuffer)&commandBufferObject->id, negativeOneToOne);
  }
  
@@ -2005,7 +2026,7 @@ index c3f6ec2..1aecb91 100644
      ArrayList* dataList = privateDataSlotObject->tag;
      
      uint64_t* slot = NULL;
-@@ -3086,30 +3782,35 @@ VkResult vt_call_vkSetPrivateData(VkDevice device, VkObjectType objectType, uint
+@@ -3086,30 +3803,35 @@ VkResult vt_call_vkSetPrivateData(VkDevice device, VkObjectType objectType, uint
      
      if (!slot) {
          slot = malloc(2 * sizeof(uint64_t));
@@ -2046,7 +2067,7 @@ index c3f6ec2..1aecb91 100644
  }
  
  void vt_call_vkCmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2* pCopyBufferInfo) {
-@@ -3196,9 +3897,12 @@ VkResult vt_call_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSub
+@@ -3196,9 +3918,12 @@ VkResult vt_call_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSub
      VkObject* queueObject = VkObject_fromHandle(queue);
      VkObject* fenceObject = VkObject_fromHandle(fence);
      
@@ -2061,7 +2082,7 @@ index c3f6ec2..1aecb91 100644
      VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_SUBMIT2, VT_RETURN);
      
      if (shouldWait) {
-@@ -3244,6 +3948,12 @@ void vt_call_vkGetShaderModuleIdentifierEXT(VkDevice device, VkShaderModule shad
+@@ -3244,6 +3969,12 @@ void vt_call_vkGetShaderModuleIdentifierEXT(VkDevice device, VkShaderModule shad
      VT_RECV_CHECKED();
      
      vt_unserialize_VkShaderModuleIdentifierEXT(pIdentifier, inputBuffer, &globalMemoryPool);
@@ -2074,7 +2095,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -3256,6 +3966,12 @@ void vt_call_vkGetShaderModuleCreateInfoIdentifierEXT(VkDevice device, const VkS
+@@ -3256,6 +3987,12 @@ void vt_call_vkGetShaderModuleCreateInfoIdentifierEXT(VkDevice device, const VkS
      VT_RECV_CHECKED();
      
      vt_unserialize_VkShaderModuleIdentifierEXT(pIdentifier, inputBuffer, &globalMemoryPool);
@@ -2087,7 +2108,7 @@ index c3f6ec2..1aecb91 100644
      VT_CALL_UNLOCK();
  }
  
-@@ -3269,30 +3985,32 @@ VkResult vt_call_vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR* pMem
+@@ -3269,30 +4006,32 @@ VkResult vt_call_vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR* pMem
          return VK_SUCCESS;
      }
  
