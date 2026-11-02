@@ -562,32 +562,38 @@ void droiddeck_presented(void) {
 }
 
 static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc, VkPipeline* pipelines) {
-    for (uint32_t i = 0; dumpDir() && i < count; i++) dumpPipeline("graphics", infos[i].pStages, infos[i].stageCount, infos[i].flags);
     VkGraphicsPipelineCreateInfo* copy = malloc(count * sizeof(*copy));
     if (!copy) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memcpy(copy, infos, count * sizeof(*copy));
+    /* The state a library part does not provide is dropped first: its pointers (pStages of a
+     * vertex input or fragment output part ...) may dangle, so the stage loops, the SPIR-V dump
+     * and the xfb statistics read the copies, never infos[i].pStages. */
+    for (uint32_t i = 0; i < count; i++) {
+        const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
+        if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
+        dropIgnoredLibraryState(&copy[i]);
+    }
+    for (uint32_t i = 0; dumpDir() && i < count; i++) dumpPipeline("graphics", copy[i].pStages, copy[i].stageCount, copy[i].flags);
     /* Inline stage code (DXVK 3.x, pipeline libraries) gets the same rewrites as modules: the stage
      * and its VkShaderModuleCreateInfo (anywhere in the stage's pNext chain, with the structures
      * ahead of it: stage_inline_module.h) are copied. */
     uint32_t totalStages = 0;
-    for (uint32_t i = 0; i < count; i++) totalStages += infos[i].stageCount;
+    for (uint32_t i = 0; i < count; i++) totalStages += copy[i].stageCount;
     VkPipelineShaderStageCreateInfo* stageCopies = totalStages ? calloc(totalStages, sizeof(*stageCopies)) : NULL;
     VkShaderModuleCreateInfo* moduleCopies = totalStages ? calloc(totalStages, sizeof(*moduleCopies)) : NULL;
     uint32_t** codes = totalStages ? calloc(totalStages, sizeof(*codes)) : NULL;
     DdStageChain* chains = totalStages ? calloc(totalStages, sizeof(*chains)) : NULL;
     uint32_t used = 0;
     for (uint32_t i = 0; i < count; i++) {
-        const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
-        if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
-        dropIgnoredLibraryState(&copy[i]);
         if (!stageCopies || !moduleCopies || !codes || !chains) continue;
         bool rewritten = false;
         uint32_t base = used;
-        for (uint32_t s = 0; s < infos[i].stageCount; s++, used++) {
-            stageCopies[used] = infos[i].pStages[s];
-            const VkShaderModuleCreateInfo* inl = dd_inline_module(infos[i].pStages[s].pNext);
+        const VkPipelineShaderStageCreateInfo* stages = copy[i].pStages;
+        for (uint32_t s = 0; s < copy[i].stageCount; s++, used++) {
+            stageCopies[used] = stages[s];
+            const VkShaderModuleCreateInfo* inl = dd_inline_module(stages[s].pNext);
             if (inl && rewriteShader(inl, &moduleCopies[used], &codes[used])) {
-                const void* head = dd_replace_inline_module(infos[i].pStages[s].pNext, inl, &moduleCopies[used], &chains[used]);
+                const void* head = dd_replace_inline_module(stages[s].pNext, inl, &moduleCopies[used], &chains[used]);
                 if (head) {
                     stageCopies[used].pNext = head;
                     rewritten = true;
@@ -621,7 +627,7 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
         if (r) trace("  rendering colors %u fmt0 %d depth %d stencil %d viewMask %u", r->colorAttachmentCount, r->colorAttachmentCount ? r->pColorAttachmentFormats[0] : 0, r->depthAttachmentFormat, r->stencilAttachmentFormat, r->viewMask);
     }
     VkResult result = vt_call_vkCreateGraphicsPipelines(device, cache, count, copy, alloc, pipelines);
-    if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, infos, pipelines);
+    if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, copy, pipelines);
     for (uint32_t i = 0; codes && i < used; i++) free(codes[i]);
     free(codes);
     free(chains);
