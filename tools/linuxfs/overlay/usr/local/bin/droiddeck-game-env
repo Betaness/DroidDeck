@@ -38,12 +38,14 @@ DOTNET_FEX = {
 
 
 def game_files(exe):
-    """Lower-cased names of the files next to the game's executable and one directory below."""
-    names = set()
+    """Lower-cased names of the files next to the game's executable, and those plus the ones one
+    directory below."""
+    beside, names = set(), set()
     folder = os.path.dirname(exe)
     try:
         with os.scandir(folder) as top:
             for entry in top:
+                beside.add(entry.name.lower())
                 names.add(entry.name.lower())
                 if entry.is_dir(follow_symlinks=False):
                     try:
@@ -53,7 +55,7 @@ def game_files(exe):
                         pass
     except OSError:
         pass
-    return names
+    return beside, names
 
 
 class Game:
@@ -63,7 +65,7 @@ class Game:
         self.exe = exe
         self.args = args
         self.stem = os.path.splitext(os.path.basename(exe))[0].lower()
-        self.files = game_files(exe)
+        self.beside, self.files = game_files(exe)
 
     def has_arg(self, name):
         return any(a == name or a.startswith(name + "=") for a in self.args)
@@ -79,6 +81,19 @@ def fix(function):
 
 def is_godot(game):
     return game.stem + ".pck" in game.files or "godotsharp.dll" in game.files
+
+
+def is_unity_mono(game):
+    """A Windows Unity build that runs its scripts on Mono: UnityPlayer.dll beside the executable and Mono's
+    runtime (the MonoBleedingEdge folder beside it, or mono-2.0-bdwgc.dll). IL2CPP builds compile the
+    scripts ahead of time into GameAssembly.dll and are left out."""
+    return ("unityplayer.dll" in game.beside
+            and ("monobleedingedge" in game.beside or "mono-2.0-bdwgc.dll" in game.files)
+            and "gameassembly.dll" not in game.files)
+
+
+def is_duckov(game):
+    return game.stem == "duckov" and "unityplayer.dll" in game.files
 
 
 @fix
@@ -97,15 +112,18 @@ def unity_memory_ordering(game):
 
 
 @fix
-def duckov_lookup_cache(game):
-    """Escape from Duckov (Unity, Mono) is bound by its main thread at low resolution. FEX's default dynamic
-    L1 block cache without the L2 cache sends about 17,000 lookups a second from that thread down the slow
-    C++ path (about 2% of its time); with the L2 cache on and a fixed L1 there are none. On a Xring O3 that
-    was +2.2 +- 0.9 fps at matched clocks (+3.7 at about 2.5 GHz, 99 against 95 fps) and 25.4 -> 24.9 million
-    main-thread cycles a frame, for about 80 MiB more memory. The settings do not change generated code.
-    A per-game FEX_DISABLEL2CACHE=1 or FEX_DYNAMICL1CACHE=1 turns it back."""
-    if game.stem == "duckov" and "unityplayer.dll" in game.files:
-        return {"FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0"}, [], "Escape from Duckov: FEX L2 lookup cache on, fixed L1"
+def unity_mono_lookup_cache(game):
+    """A Unity game on Mono gets FEX's L2 block lookup cache with a fixed-size L1. Escape from Duckov is
+    bound by its main thread at low resolution, and FEX's default dynamic L1 without the L2 cache sent about
+    17,000 lookups a second from that thread down the slow C++ path (about 2% of its time); with the L2 cache
+    on and a fixed L1 there were none. On a Xring O3 that was +2.2 +- 0.9 fps at matched clocks (+3.7 at about
+    2.5 GHz, 99 against 95 fps) and 25.4 -> 24.9 million main-thread cycles a frame, for about 80 MiB more
+    memory. FEX documents that these settings only change how it finds code it already translated, not the
+    code it generates, so other Mono games get them too (each pays the memory; only Duckov was measured).
+    IL2CPP games (GameAssembly.dll) were not measured and are left alone. Duckov keeps them whatever its
+    files look like. A per-game FEX_DISABLEL2CACHE=1 or FEX_DYNAMICL1CACHE=1 turns either back."""
+    if is_unity_mono(game) or is_duckov(game):
+        return {"FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0"}, [], "Unity (Mono): FEX L2 lookup cache on, fixed L1"
 
 
 @fix
@@ -113,8 +131,10 @@ def duckov_mono_hacks(game):
     """FEX's MonoHacks (on by default) special-case the code Mono's JIT writes. Without them Escape from
     Duckov's main thread needs about 2.2 million fewer cycles a frame: on a Xring O3 at low resolution under
     Proton Experimental 11.0-20261027b that was +8.6 +- 0.7 fps at matched clocks (105.5 against 96.8 fps,
-    n=4 each), with no crash or hang in a 25-minute run at 105 fps. A per-game FEX_MONOHACKS=1 turns it back."""
-    if game.stem == "duckov" and "unityplayer.dll" in game.files:
+    n=4 each), with no crash or hang in a 25-minute run at 105 fps. Unlike the lookup caches this changes the
+    code FEX generates for Mono's JIT output, so it stays Duckov's alone. A per-game FEX_MONOHACKS=1 turns it
+    back."""
+    if is_duckov(game):
         return {"FEX_MONOHACKS": "0"}, [], "Escape from Duckov: FEX MonoHacks off"
 
 

@@ -58,20 +58,30 @@ A Unity game under FEX (`UnityPlayer.dll` for Windows builds under Proton,
 turns it off: without TSO such games can deadlock or crash (seen with Megabonk
 and Crab Game). A FEX preset chosen for the game itself still applies.
 
-Escape from Duckov (`Duckov.exe` beside `UnityPlayer.dll`) also gets FEX's L2
-lookup cache with a fixed-size L1 (`FEX_DISABLEL2CACHE=0`,
-`FEX_DYNAMICL1CACHE=0`). Its main thread limits it at low resolution, and FEX's
-default caches sent about 17,000 block lookups a second from that thread down
-the slow path; with the L2 cache there were none. On a Xring O3 this measured
-+2.2 ± 0.9 fps at matched clocks (99 against 95 fps at about 2.5 GHz) for about
-80 MiB more memory. The settings do not change generated code. Set either
-variable to `1` in the game's own environment to turn it back.
+A Windows Unity game that runs its scripts on Mono (`UnityPlayer.dll` beside
+the executable, plus the `MonoBleedingEdge` folder beside it or
+`mono-2.0-bdwgc.dll`) also gets FEX's L2 lookup cache with a fixed-size L1
+(`FEX_DISABLEL2CACHE=0`, `FEX_DYNAMICL1CACHE=0`). IL2CPP builds (with
+`GameAssembly.dll`) and native Linux builds keep FEX's defaults. This was
+measured on Escape from Duckov, whose main thread limits it at low resolution:
+FEX's default caches sent about 17,000 block lookups a second from that thread
+down the slow path, and with the L2 cache there were none. On a Xring O3 this
+measured +2.2 ± 0.9 fps at matched clocks (99 against 95 fps at about 2.5 GHz)
+for about 80 MiB more memory per game. FEX documents that these settings do not
+change generated code, only how already translated code is found. Like every
+built-in fix they override the Default profile's FEX preset and shared edits.
+To opt a game out, set `FEX_DISABLEL2CACHE=1` or `FEX_DYNAMICL1CACHE=1` (either
+or both) in that game's own environment; its setting wins and other games keep
+the fix. Escape from Duckov (`Duckov.exe` beside `UnityPlayer.dll`) keeps these
+values even without the Mono files.
 
-It also runs with FEX's MonoHacks off (`FEX_MONOHACKS=0`; by default FEX
-special-cases the code Mono's JIT writes). That took about 2.2 million cycles a
-frame off the main thread: +8.6 ± 0.7 fps at matched clocks at low resolution
-(105.5 against 96.8 fps), with no crash or hang in a 25-minute run. Set
-`FEX_MONOHACKS=1` in the game's own environment to turn it back.
+Escape from Duckov alone also runs with FEX's MonoHacks off
+(`FEX_MONOHACKS=0`; by default FEX special-cases the code Mono's JIT writes).
+That took about 2.2 million cycles a frame off the main thread: +8.6 ± 0.7 fps at matched clocks at low resolution
+(105.5 against 96.8 fps), with no crash or hang in a 25-minute run. Unlike
+the lookup caches this changes the code FEX generates for Mono's JIT output, so
+other Mono games keep MonoHacks on. Set `FEX_MONOHACKS=1` in the game's own
+environment to turn it back.
 
 ## Defaults and available suggestions
 

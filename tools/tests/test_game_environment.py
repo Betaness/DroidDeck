@@ -459,8 +459,7 @@ class GameEnvironmentTest(unittest.TestCase):
             il2cpp = game("Megabonk/Megabonk.x86_64", "Megabonk/UnityPlayer.so", "Megabonk/GameAssembly.so")
             mono = game("Mono/Game.x86_64", "Mono/UnityPlayer.so")
             windows = game("Crab Game/Crab Game.exe", "Crab Game/UnityPlayer.dll", "Crab Game/GameAssembly.dll")
-            windows_mono = game("RoR2/Risk of Rain 2.exe", "RoR2/UnityPlayer.dll", "RoR2/MonoBleedingEdge/mono-2.0-bdwgc.dll")
-            for exe in (il2cpp, mono, windows, windows_mono):
+            for exe in (il2cpp, mono, windows):
                 env, extra, notes = MODULE["engine_fixes"](exe, [])
                 self.assertEqual((env, extra, notes), ({"FEX_TSOENABLED": "1"}, [], ["Unity: FEX with TSO"]))
             performance = {"version": 1, "shared": {"FEX_TSOENABLED": "0", "FEX_VECTORTSOENABLED": "0"}}
@@ -469,30 +468,115 @@ class GameEnvironmentTest(unittest.TestCase):
             performance["games"] = {"3405340": {"FEX_TSOENABLED": "0"}}
             self.assertEqual(MODULE["apply_config"]({}, performance, "3405340", env)["FEX_TSOENABLED"], "0")
 
-    def test_duckov_alone_gets_the_fex_lookup_caches_and_monohacks_off(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            def game(*names):
-                for name in names:
-                    (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
-                    (Path(tmp) / name).touch()
-                return str(Path(tmp) / names[0])
+    LOOKUP_CACHE = {"FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0"}
+    UNITY_NOTES = ["Unity: FEX with TSO", "Unity (Mono): FEX L2 lookup cache on, fixed L1"]
 
+    def unity_game(self, tmp):
+        def game(*names):
+            for name in names:
+                path = Path(tmp) / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if name.endswith("/"):
+                    path.mkdir(exist_ok=True)
+                else:
+                    path.touch()
+            return str(Path(tmp) / names[0])
+        return game
+
+    def test_unity_mono_games_get_the_fex_lookup_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
+            ror2 = game("RoR2/Risk of Rain 2.exe", "RoR2/UnityPlayer.dll", "RoR2/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
+            empty_mbe = game("Bare/Bare.exe", "Bare/UnityPlayer.dll", "Bare/MonoBleedingEdge/")
+            runtime_only = game("Flat/Flat.exe", "Flat/UnityPlayer.dll", "Flat/Mono/mono-2.0-bdwgc.dll")
+            for exe in (ror2, empty_mbe, runtime_only):
+                env, extra, notes = MODULE["engine_fixes"](exe, [])
+                self.assertEqual((env, extra, notes), ({"FEX_TSOENABLED": "1", **self.LOOKUP_CACHE}, [], self.UNITY_NOTES), exe)
+                self.assertNotIn("FEX_MONOHACKS", env)
+
+    def test_il2cpp_and_other_games_keep_the_default_lookup_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
+            il2cpp = game("Crab Game/Crab Game.exe", "Crab Game/UnityPlayer.dll", "Crab Game/GameAssembly.dll")
+            # IL2CPP builds can still carry a MonoBleedingEdge folder; GameAssembly.dll decides.
+            il2cpp_mbe = game("Mixed/Mixed.exe", "Mixed/UnityPlayer.dll", "Mixed/GameAssembly.dll",
+                              "Mixed/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
+            linux_mono = game("Mono/Game.x86_64", "Mono/UnityPlayer.so", "Mono/MonoBleedingEdge/")
+            no_mono = game("Old/Old.exe", "Old/UnityPlayer.dll")
+            # Mono without a Unity player beside the executable: a launcher one folder above the game.
+            launcher = game("Launcher/Launcher.exe", "Launcher/Game/UnityPlayer.dll", "Launcher/MonoBleedingEdge/")
+            for exe in (il2cpp, il2cpp_mbe, linux_mono, no_mono):
+                env, extra, notes = MODULE["engine_fixes"](exe, [])
+                self.assertEqual((env, extra, notes), ({"FEX_TSOENABLED": "1"}, [], ["Unity: FEX with TSO"]), exe)
+            self.assertEqual(MODULE["engine_fixes"](launcher, [])[0], {"FEX_TSOENABLED": "1"})
+            mono_not_unity = game("Tool/Tool.exe", "Tool/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll", "Tool/mono-2.0-bdwgc.dll")
+            ava = game("AVA/AVA.exe", "AVA/AVA.ini")
+            godot = game("Godot/Godot.exe", "Godot/Godot.pck", "Godot/GodotSharp.dll")
+            self.assertEqual(MODULE["engine_fixes"](mono_not_unity, []), ({}, [], []))
+            self.assertEqual(MODULE["engine_fixes"](ava, []), ({}, [], []))
+            self.assertFalse({"FEX_DISABLEL2CACHE", "FEX_DYNAMICL1CACHE"} & set(MODULE["engine_fixes"](godot, [])[0]))
+
+    def test_a_unity_mono_game_can_turn_either_lookup_cache_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
+            env = MODULE["engine_fixes"](game("RoR2/Risk of Rain 2.exe", "RoR2/UnityPlayer.dll", "RoR2/MonoBleedingEdge/"), [])[0]
+            preset = {"version": 1, "shared": {"FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1"}}
+            result = MODULE["apply_config"]({"FEX_DISABLEL2CACHE": "1"}, preset, "632360", env)
+            self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"]), ("0", "0"))
+            for name in ("FEX_DISABLEL2CACHE", "FEX_DYNAMICL1CACHE"):
+                preset["games"] = {"632360": {name: "1"}}
+                result = MODULE["apply_config"]({}, preset, "632360", env)
+                other = ({"FEX_DISABLEL2CACHE", "FEX_DYNAMICL1CACHE"} - {name}).pop()
+                self.assertEqual((result[name], result[other]), ("1", "0"))
+            preset["games"] = {"632360": {"FEX_DISABLEL2CACHE": None}}
+            self.assertNotIn("FEX_DISABLEL2CACHE", MODULE["apply_config"]({}, preset, "632360", env))
+            # Another game's opt-out does not reach this one.
+            preset["games"] = {"1": {"FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1"}}
+            result = MODULE["apply_config"]({}, preset, "632360", env)
+            self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"]), ("0", "0"))
+
+    def test_unity_mono_lookup_caches_and_tso_fix_stand_apart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
+            env = MODULE["engine_fixes"](game("RoR2/Risk of Rain 2.exe", "RoR2/UnityPlayer.dll", "RoR2/MonoBleedingEdge/"), [])[0]
+            fixes = [f.__name__ for f in MODULE["FIXES"]]
+            self.assertLess(fixes.index("unity_memory_ordering"), fixes.index("unity_mono_lookup_cache"))
+            performance = {"version": 1, "shared": {"FEX_TSOENABLED": "0", "FEX_VECTORTSOENABLED": "0",
+                                                     "FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1"}}
+            result = MODULE["apply_config"]({}, performance, "632360", env)
+            self.assertEqual([result[k] for k in ("FEX_TSOENABLED", "FEX_VECTORTSOENABLED", "FEX_DISABLEL2CACHE", "FEX_DYNAMICL1CACHE")],
+                             ["1", "0", "0", "0"])
+            performance["games"] = {"632360": {"FEX_TSOENABLED": "0"}}
+            result = MODULE["apply_config"]({}, performance, "632360", env)
+            self.assertEqual([result[k] for k in ("FEX_TSOENABLED", "FEX_DISABLEL2CACHE", "FEX_DYNAMICL1CACHE")], ["0", "0", "0"])
+            performance["games"] = {"632360": {"FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1"}}
+            result = MODULE["apply_config"]({}, performance, "632360", env)
+            self.assertEqual([result[k] for k in ("FEX_TSOENABLED", "FEX_DISABLEL2CACHE", "FEX_DYNAMICL1CACHE")], ["1", "1", "1"])
+
+    def test_duckov_keeps_its_fex_lookup_caches_and_alone_gets_monohacks_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
             duckov = game("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll",
                           "Escape from Duckov/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
-            env, extra, notes = MODULE["engine_fixes"](duckov, [])
-            self.assertEqual(env, {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0",
-                                   "FEX_MONOHACKS": "0"})
-            self.assertEqual((extra, notes), ([], ["Unity: FEX with TSO", "Escape from Duckov: FEX L2 lookup cache on, fixed L1",
-                                                   "Escape from Duckov: FEX MonoHacks off"]))
+            # Duckov.exe beside UnityPlayer.dll was enough before Mono detection; it still is.
+            bare_duckov = game("Bare Duckov/Duckov.exe", "Bare Duckov/UnityPlayer.dll")
+            expected = {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "0", "FEX_DYNAMICL1CACHE": "0", "FEX_MONOHACKS": "0"}
+            for exe in (duckov, bare_duckov):
+                env, extra, notes = MODULE["engine_fixes"](exe, [])
+                self.assertEqual(env, expected, exe)
+                self.assertEqual((extra, notes), ([], self.UNITY_NOTES + ["Escape from Duckov: FEX MonoHacks off"]))
+            env = MODULE["engine_fixes"](duckov, [])[0]
             preset = {"version": 1, "shared": {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "1", "FEX_MONOHACKS": "1"}}
             result = MODULE["apply_config"]({"FEX_DYNAMICL1CACHE": "1"}, preset, "3167020", env)
             self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"], result["FEX_MONOHACKS"]), ("0", "0", "0"))
             preset["games"] = {"3167020": {"FEX_DISABLEL2CACHE": "1", "FEX_DYNAMICL1CACHE": "1", "FEX_MONOHACKS": "1"}}
             result = MODULE["apply_config"]({}, preset, "3167020", env)
             self.assertEqual((result["FEX_DISABLEL2CACHE"], result["FEX_DYNAMICL1CACHE"], result["FEX_MONOHACKS"]), ("1", "1", "1"))
-            other_unity = game("Other/Other.exe", "Other/UnityPlayer.dll")
+            other_mono = game("Other/Other.exe", "Other/UnityPlayer.dll", "Other/MonoBleedingEdge/")
+            other_unity = game("Plain/Plain.exe", "Plain/UnityPlayer.dll")
             other_duckov = game("Not Unity/Duckov.exe")
             ava = game("AVA/AVA.exe", "AVA/AVA.ini")
+            self.assertEqual(MODULE["engine_fixes"](other_mono, [])[0], {"FEX_TSOENABLED": "1", **self.LOOKUP_CACHE})
             self.assertEqual(MODULE["engine_fixes"](other_unity, [])[0], {"FEX_TSOENABLED": "1"})
             self.assertEqual(MODULE["engine_fixes"](other_duckov, []), ({}, [], []))
             self.assertEqual(MODULE["engine_fixes"](ava, []), ({}, [], []))
