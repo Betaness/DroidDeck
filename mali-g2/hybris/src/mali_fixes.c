@@ -24,6 +24,10 @@
  *     and shaderClipDistance / shaderCullDistance while their writes are removed from shaders.
  *     Without them DXVK finds no adapter ("Device does not support required feature
  *     'fillModeNonSolid'").
+ *   - Graphics pipeline library parts and links: the state of the subsets a call does not provide
+ *     may dangle (the spec ignores it), so it is dropped from copies of the create infos before
+ *     the wrappers here read pStages (../vortek/src/gpl_library_state.h, shared with the Vortek
+ *     client), and the driver gets the copies (tests/gpl_test.sh).
  *   - Pipelines the application creates without a VkPipelineCache of its own (DXVK) use the
  *     device's persistent implicit cache (pipeline_cache_hybris.c, the Vortek server's code).
  *   - Command pool and command buffer resets add RELEASE_RESOURCES as the Vortek server's do
@@ -62,6 +66,7 @@
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
 #include "stage_inline_module.h"
+#include "gpl_library_state.h"
 #include "linear_row_pitch.h"
 #include "pipeline_cache.h"
 #define CMDMEM_LOG(fmt, ...) fprintf(stderr, "hybris-icd: " fmt "\n", ##__VA_ARGS__)
@@ -283,30 +288,43 @@ static uint64_t nowNs(void) {
 
 /* Inline stage code (DXVK 3.x, pipeline libraries): stages with a VkShaderModuleCreateInfo in their
  * pNext chain are copied with the rewritten code. Without a cache of the application's, pipelines
- * go through the persistent one (pipeline_cache_hybris.c). */
+ * go through the persistent one (pipeline_cache_hybris.c).
+ * The state a library part or a link does not provide may dangle (pStages of a vertex input or
+ * fragment output part, of a fast link): when the call has such a part, the create infos are
+ * copied with that state dropped first (dd_gpl_drop_ignored_state, as the Vortek client does),
+ * and the stage rewrites, the cache choice, the xfb statistics and the driver get the copies;
+ * infos[i].pStages is never read. Calls with complete pipelines only are passed on as before. */
 static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice handle, VkPipelineCache cache, uint32_t count,
                                                    const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator,
                                                    VkPipeline* pipelines) {
     Device* device = icd_device(handle);
     if (!device) return VK_ERROR_DEVICE_LOST;
-    VkPipelineCache use = PipelineCache_forGraphics(handle, cache, infos, count);
+    bool partial = false;
+    uint32_t libraryCount;
+    for (uint32_t i = 0; i < count && !partial; i++)
+        partial = (dd_gpl_parts(&infos[i], &libraryCount) & DD_GPL_ALL_PARTS) != DD_GPL_ALL_PARTS;
+    VkGraphicsPipelineCreateInfo* copy = NULL;
+    if (partial) {
+        if (!(copy = malloc(count * sizeof(*copy)))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        memcpy(copy, infos, count * sizeof(*copy));
+        for (uint32_t i = 0; i < count; i++) dd_gpl_drop_ignored_state(&copy[i]);
+    }
+    const VkGraphicsPipelineCreateInfo* view = copy ? copy : infos; /* pStages safe to read */
+    VkPipelineCache use = PipelineCache_forGraphics(handle, cache, view, count);
     uint64_t start = nowNs();
     bool inline_ = false;
-    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = anyInline(infos[i].pStages, infos[i].stageCount);
-    VkGraphicsPipelineCreateInfo* copy = inline_ ? malloc(count * sizeof(*copy)) : NULL;
-    StagesRewrite* rewrites = inline_ ? calloc(count, sizeof(*rewrites)) : NULL;
-    bool any = false;
-    if (copy && rewrites) {
-        memcpy(copy, infos, count * sizeof(*copy));
-        for (uint32_t i = 0; i < count; i++) {
-            if (!rewriteStages(infos[i].pStages, infos[i].stageCount, &rewrites[i])) continue;
-            copy[i].pStages = rewrites[i].stages;
-            any = true;
-        }
+    for (uint32_t i = 0; i < count && rewritesOn() && !inline_; i++) inline_ = anyInline(view[i].pStages, view[i].stageCount);
+    if (inline_ && !copy && (copy = malloc(count * sizeof(*copy)))) memcpy(copy, infos, count * sizeof(*copy));
+    StagesRewrite* rewrites = inline_ && copy ? calloc(count, sizeof(*rewrites)) : NULL;
+    bool any = partial;
+    for (uint32_t i = 0; rewrites && i < count; i++) {
+        if (!rewriteStages(copy[i].pStages, copy[i].stageCount, &rewrites[i])) continue;
+        copy[i].pStages = rewrites[i].stages;
+        any = true;
     }
     VkResult result = device->CreateGraphicsPipelines(handle, use, count, any ? copy : infos, allocator, pipelines);
     if (result == VK_SUCCESS) PipelineCache_noteCreated(handle, count, nowNs() - start, use && use != cache);
-    if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, infos, pipelines);
+    if (result >= 0) xfb_stats_pipelines_created(XFB_TAG, count, view, pipelines);
     for (uint32_t i = 0; rewrites && i < count; i++) freeStages(&rewrites[i]);
     free(rewrites);
     free(copy);

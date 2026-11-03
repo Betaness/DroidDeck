@@ -378,7 +378,8 @@ static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, V
 /* ---- VK_EXT_graphics_pipeline_library ---- */
 
 /* The spec ignores the state of a subset that a library or linking call does not provide, so
- * those pointers/handles may dangle; the serializer would follow them. Drop them.
+ * those pointers/handles may dangle; the serializer would follow them. They are dropped
+ * (dd_gpl_drop_ignored_state, gpl_library_state.h, shared with the libhybris path).
  *
  * Known gap on the server (ShaderInspector, shader_inspector.c): its SPIR-V fixes only apply
  * to VkShaderModule objects and only see the stages of one create call, and a module is
@@ -386,42 +387,7 @@ static void dd_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, V
  * (USCALED/SSCALED vertex formats, VS/FS varying sizes) are skipped for library parts, and once
  * a module has been used in a library, later monolithic pipelines with that module do not get
  * them either. Inline SPIR-V (DXVK) is never inspected; zink is not offered GPL. */
-static void dropIgnoredLibraryState(VkGraphicsPipelineCreateInfo* info) {
-    const VkGraphicsPipelineLibraryCreateInfoEXT* gpl = findInChain(info->pNext, VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT);
-    const VkPipelineLibraryCreateInfoKHR* libs = findInChain(info->pNext, VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR);
-    uint32_t libraryCount = libs ? libs->libraryCount : 0;
-    VkGraphicsPipelineLibraryFlagsEXT parts;
-    if (gpl) parts = gpl->flags;
-    else if ((info->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) || libraryCount) parts = 0;
-    else return; /* a complete pipeline */
-
-    bool vertexInput = parts & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
-    bool preRaster = parts & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
-    bool fragmentShader = parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
-    bool fragmentOutput = parts & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
-    if (!vertexInput) {
-        info->pVertexInputState = NULL;
-        info->pInputAssemblyState = NULL;
-    }
-    if (!preRaster) {
-        info->pTessellationState = NULL;
-        info->pViewportState = NULL;
-        info->pRasterizationState = NULL;
-    }
-    if (!preRaster && !fragmentShader) {
-        info->stageCount = 0;
-        info->pStages = NULL;
-        if (!libraryCount) info->layout = VK_NULL_HANDLE; /* a linked pipeline still uses its layout */
-    }
-    if (!fragmentShader) info->pDepthStencilState = NULL;
-    if (!fragmentShader && !fragmentOutput) info->pMultisampleState = NULL;
-    if (!fragmentOutput) info->pColorBlendState = NULL;
-    if (!preRaster && !fragmentShader && !fragmentOutput) {
-        /* VUID-VkGraphicsPipelineCreateInfo-flags-06643: renderPass only matters for those three */
-        info->renderPass = VK_NULL_HANDLE;
-        info->subpass = 0;
-    }
-}
+#include "gpl_library_state.h"
 
 /* ---- 64-bit flag structs folded into the legacy fields ---- */
 
@@ -571,7 +537,7 @@ static VkResult dd_vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache ca
     for (uint32_t i = 0; i < count; i++) {
         const VkPipelineCreateFlags2CreateInfoKHR* f2 = findInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
         if (f2) copy[i].flags = (VkPipelineCreateFlags)(f2->flags & 0xffffffffull);
-        dropIgnoredLibraryState(&copy[i]);
+        dd_gpl_drop_ignored_state(&copy[i]);
     }
     for (uint32_t i = 0; dumpDir() && i < count; i++) dumpPipeline("graphics", copy[i].pStages, copy[i].stageCount, copy[i].flags);
     /* Inline stage code (DXVK 3.x, pipeline libraries) gets the same rewrites as modules: the stage
