@@ -89,8 +89,12 @@ class SessionLocaleTest(unittest.TestCase):
         (self.root / "usr/share/i18n/locales/ko_KR").unlink()
         out, calls = self.prepare()
         self.assertNotIn("ko_KR", "\n".join(calls))
-        self.assertIn("(could not build: ko_KR.UTF-8", out)
+        self.assertIn("(no source for: ko_KR.UTF-8)", out)
+        self.assertNotIn("could not build", out)
         self.assertNotIn("ko_KR", self.stamp())
+        # Not tried again at every start: the runtime ships no source for it (Ubuntu's locales package).
+        os.utime(self.root / "usr/lib/locale/locale-archive", (1, 1))
+        self.assertEqual(("", []), self.prepare())
 
 
 if __name__ == "__main__":

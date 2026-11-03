@@ -287,24 +287,48 @@ object WirelessAdbFix {
     }
 
     fun setUsingSavedPairing(context: Context, enabled: Boolean) {
+        withSavedPairing(context) { appContext, host, port -> setChildProcessLimit(appContext, host, port, enabled) }
+    }
+
+    fun hasSavedPairing(context: Context): Boolean = savedConnection(context.applicationContext) != null
+
+    fun clearCachedApps(context: Context) {
+        shell(context, "am kill-all")
+    }
+
+    fun shell(context: Context, command: String): String {
+        var output = ""
+        withSavedPairing(context) { appContext, host, port ->
+            loadOrCreateIdentity(appContext)
+            Kadb.create(host, port).use { adb ->
+                val result = adb.shell(command)
+                check(result.exitCode == 0) { result.allOutput.ifBlank { appContext.getString(R.string.adbfix_command_failed, result.exitCode) } }
+                output = result.output
+            }
+            saveConnection(appContext, host, port)
+        }
+        return output
+    }
+
+    private fun withSavedPairing(context: Context, action: (Context, String, Int) -> Unit) {
         val appContext = context.applicationContext
         val saved = savedConnection(appContext)
             ?: error(appContext.getString(R.string.adbfix_no_pairing))
         val cachedPort = saved.port
         val cachedResult = cachedPort?.let { port ->
-            runCatching { setChildProcessLimit(appContext, saved.host, port, enabled) }.also { if (it.isSuccess) return }
+            runCatching { action(appContext, saved.host, port) }.also { if (it.isSuccess) return }
         }
         // Asked for by the user: looked up even when a lookup just found nothing.
         val done = lookups.exclusive {
             val discoveredPort = findConnectPort(appContext, saved.host)
             if (discoveredPort != null && discoveredPort != cachedPort) {
-                setChildProcessLimit(appContext, saved.host, discoveredPort, enabled)
+                action(appContext, saved.host, discoveredPort)
                 return@exclusive true
             }
             loadOrCreateIdentity(appContext)
             val scanned = scanLoopback(appContext, setOfNotNull(cachedPort)) ?: return@exclusive false
             scanned.second.close()
-            setChildProcessLimit(appContext, LOOPBACK, scanned.first, enabled)
+            action(appContext, LOOPBACK, scanned.first)
             true
         }
         if (done) return

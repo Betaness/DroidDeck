@@ -14,9 +14,19 @@ class SyncBackendTest {
 
     @Test
     fun aFreshInstallStartsOnEsync() {
-        // [mali-g2] Esync with the semaphore pool stays the default here (SessionPrefs.fastSync).
+        // [mali-g2] Esync with the semaphore pool stays the default here (SessionPrefs.fastSync), and
+        // upstream's one-time move to ntsync (applyNtsyncDefault) is not carried.
         assertEquals(SessionPrefs.SYNC_ESYNC, SessionPrefs.syncBackend(context))
         assertEquals(false, SessionPrefs.fsyncFirst(context))
+        assertEquals(false, SessionPrefs.fastSync(context))
+    }
+
+    @Test
+    fun anEarlierEsyncChoiceIsKept() {
+        SessionPrefs.setSyncBackend(context, SessionPrefs.SYNC_ESYNC)
+        assertEquals(SessionPrefs.SYNC_ESYNC, SessionPrefs.syncBackend(context))
+        SessionPrefs.setSyncBackend(context, SessionPrefs.SYNC_NTSYNC)
+        assertEquals(SessionPrefs.SYNC_NTSYNC, SessionPrefs.syncBackend(context))
     }
 
     @Test
