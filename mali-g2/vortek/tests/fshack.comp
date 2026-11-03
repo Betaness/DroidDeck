@@ -1,0 +1,9 @@
+// Proton's fullscreen-hack blit (dlls/win32u/vulkan.c, blit_comp_spv) reduced to its writes: an image
+// without format qualifier (shaderStorageImageWriteWithoutFormat) written over the whole dispatch,
+// ceil(size / 8) groups of 8x8 like Wine's, with fshack_test.c's frame marker instead of the game's
+// scaled frame. glslangValidator -V --vn fshack_comp -o fshack_spv.h fshack.comp
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0) uniform writeonly image2D outImage;
+layout(push_constant) uniform Push { vec4 color; } p;
+void main() { imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), p.color); }

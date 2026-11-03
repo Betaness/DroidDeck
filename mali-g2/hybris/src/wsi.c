@@ -20,6 +20,9 @@
  *   VORTEK_RELEASE_WAIT    import (default) / batch / cpu: how acquire waits for a release fence
  *   VORTEK_X11_SHM=0       PutImage instead of MIT-SHM for copies
  *   VORTEK_X11_STATS=N     frames and fps per swapchain every N seconds
+ *   VORTEK_RECREATE_LIMIT  swapchains per second with the same parameters for a window before a size
+ *                          mismatch stops being reported as VK_SUBOPTIMAL_KHR (default 10, 0: never;
+ *                          ../vortek/src/swapchain_loop.h)
  *
  * Copyright (C) 2026 mali-v15-bringup contributors.
  * Based on Vortek and Winlator's vortekrenderer (C) brunodev85, LGPL-2.1.
@@ -40,6 +43,7 @@
 #include <unistd.h>
 #include <xcb/shm.h>
 
+#include "swapchain_loop.h"
 #include "zero_copy.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -149,7 +153,11 @@ static VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDev
     caps->minImageCount = minImageCount();
     caps->maxImageCount = MAX_IMAGES;
     caps->currentExtent = (VkExtent2D){width, height};
-    caps->minImageExtent = (VkExtent2D){1, 1};
+    /* The window's size, as Mesa's X11 WSI and Winlator's vortekrenderer report it: Proton's fullscreen
+     * hack (a game's emulated display mode) creates its host swapchain with minImageExtent and scales
+     * the game's frames into it. With {1, 1} that was a 1x1 swapchain, every present of it SUBOPTIMAL
+     * (the window is larger) and DXVK recreated it every frame. */
+    caps->minImageExtent = caps->currentExtent;
     caps->maxImageExtent = (VkExtent2D){MAX(width, 16384), MAX(height, 16384)};
     caps->maxImageArrayLayers = 1;
     caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
@@ -320,6 +328,11 @@ typedef struct Swapchain {
     int lastPath;
     const char* x11Why;
     bool suboptimalLogged;
+    /* Recreated in a loop with the same parameters (swapchain_loop.h): a size mismatch is not reported
+     * while the window stays quietW x quietH. */
+    uint64_t loopKey;
+    bool quiet;
+    uint32_t quietW, quietH;
     uint64_t stackKey;         /* X stacking position, root level first: each level's index among its siblings + 1 */
     /* What other swapchains of this process may read, under registryLock. */
     struct {
@@ -1503,6 +1516,17 @@ static VkResult presentCovered(Swapchain* sc, VkQueue queue, const VkPresentInfo
     return result;
 }
 
+/* Whether a present to a w x h window reports VK_SUBOPTIMAL_KHR (swapchain_loop.h). */
+static bool reportSuboptimal(Swapchain* sc, uint32_t w, uint32_t h) {
+    int report = swapchain_loop_suboptimal(&sc->quiet, &sc->quietW, &sc->quietH, sc->extent, w, h);
+    if (report < 0) {
+        swapchain_loop_reset(sc->surface->window, sc->loopKey);
+        fprintf(stderr, "hybris-wsi: window 0x%x is now %ux%u (was %ux%u): swapchain %ux%u reports VK_SUBOPTIMAL_KHR again\n",
+                sc->surface->window, w, h, sc->quietW, sc->quietH, sc->extent.width, sc->extent.height);
+    }
+    return report != 0;
+}
+
 /* VK_ERROR_FEATURE_NOT_PRESENT (never again for this swapchain) or VK_NOT_READY (not this frame):
  * the frame must take the X11 path, the semaphores are untouched. */
 static VkResult presentZeroCopyLocked(Swapchain* sc, VkQueue queue, uint32_t imageIndex, const VkSemaphore* waits, uint32_t waitCount,
@@ -1542,7 +1566,7 @@ static VkResult presentZeroCopyLocked(Swapchain* sc, VkQueue queue, uint32_t ima
         return result;
     }
     int x = pos->dst_x, y = pos->dst_y, w = geo->width, h = geo->height;
-    *suboptimal = geo->width != sc->extent.width || geo->height != sc->extent.height;
+    *suboptimal = reportSuboptimal(sc, geo->width, geo->height);
     xcb_window_t root = geo->root;
     free(pos);
     free(geo);
@@ -1765,7 +1789,7 @@ static VkResult presentOne(Swapchain* sc, VkQueue queue, uint32_t family, const 
         }
         putFrame(sc, geometry->depth);
         notePath(sc, sc->zeroCopy >= 0 && sc->occluded ? PATH_OCCLUDED : PATH_X11, geometry->depth);
-        if (geometry->width != sc->extent.width || geometry->height != sc->extent.height) {
+        if (reportSuboptimal(sc, geometry->width, geometry->height)) {
             result = VK_SUBOPTIMAL_KHR;
             if (!sc->suboptimalLogged) {
                 sc->suboptimalLogged = true;
@@ -1805,6 +1829,15 @@ static void destroySwapchain(Swapchain* sc) {
     free(sc->memories);
     free(sc->hardwareBuffers);
     free(sc);
+}
+
+static int recreateLimit(void) {
+    static int limit = -1;
+    if (limit < 0) {
+        int value = icd_env_int("VORTEK_RECREATE_LIMIT", 10);
+        limit = value < 0 ? 0 : value;
+    }
+    return limit;
 }
 
 static VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice handle, const VkSwapchainCreateInfoKHR* info, const VkAllocationCallbacks* allocator,
@@ -1861,9 +1894,19 @@ static VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice handle, const VkSwapchain
     }
     registerZeroCopy(sc);
     registryAdd(sc);
-    fprintf(stderr, "hybris-wsi: swapchain %ux%u format %d, %u images, window 0x%x%s, present mode %d\n", sc->extent.width,
-            sc->extent.height, sc->format, sc->imageCount, sc->surface->window,
-            sc->zcUsable ? " (zero-copy)" : sc->hardwareBuffers[0] ? " (AHardwareBuffer)" : "", info->presentMode);
+    uint32_t loopCount;
+    bool justQuiet;
+    sc->loopKey = swapchain_loop_key(info);
+    sc->quiet = swapchain_loop_created(sc->surface->window, sc->loopKey, nowSeconds(), recreateLimit(), &loopCount, &justQuiet);
+    /* A swapchain recreated in a loop is logged once, not each time. */
+    if (!sc->quiet || justQuiet)
+        fprintf(stderr, "hybris-wsi: swapchain %ux%u format %d, %u images, window 0x%x%s, present mode %d\n", sc->extent.width,
+                sc->extent.height, sc->format, sc->imageCount, sc->surface->window,
+                sc->zcUsable ? " (zero-copy)" : sc->hardwareBuffers[0] ? " (AHardwareBuffer)" : "", info->presentMode);
+    if (justQuiet)
+        fprintf(stderr, "hybris-wsi: swapchain %ux%u for window 0x%x created %u times within a second with the same parameters: "
+                "its size mismatch is no longer reported as VK_SUBOPTIMAL_KHR while the window keeps its size\n",
+                sc->extent.width, sc->extent.height, sc->surface->window, loopCount);
     *out = (VkSwapchainKHR)(uintptr_t)sc;
     return VK_SUCCESS;
 }

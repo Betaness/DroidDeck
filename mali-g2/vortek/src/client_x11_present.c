@@ -18,6 +18,9 @@
  * Environment:
  *   VORTEK_X11_SHM=0     disable MIT-SHM (use PutImage)
  *   VORTEK_X11_STATS=N   print presented frames / fps every N seconds to stderr
+ *   VORTEK_RECREATE_LIMIT=N  [mali-g2] swapchains per second with the same parameters for a window
+ *                        before a size mismatch stops being reported as VK_SUBOPTIMAL_KHR (default 10,
+ *                        0: never; swapchain_loop.h)
  *
  * [mali-g2] Zero-copy: when the server backs the swapchain with AHardwareBuffers and DroidDeck's
  * compositor is reachable, a present that no other X window covers is handed to the server
@@ -46,6 +49,7 @@
 #include "vortek.h"
 #include "client_x11_present.h"
 #include "droiddeck_requests.h"
+#include "swapchain_loop.h"
 
 extern int droiddeck_request(int requestCode, const void* payload, int size);
 
@@ -118,6 +122,11 @@ typedef struct X11Swapchain {
     int lastPath;
     const char* x11Why;        /* why frames take the X11 path while the layer is not available */
     bool suboptimalLogged;
+    /* Recreated in a loop with the same parameters (swapchain_loop.h): a size mismatch is not reported
+     * while the window stays quietW x quietH. */
+    uint64_t loopKey;
+    bool quiet;
+    uint32_t quietW, quietH;
     /* X stacking position, root level first: each level's index among its siblings + 1 */
     uint64_t stackKey;
     /* What other swapchains of this process may read, under registryLock: whether this window's
@@ -296,8 +305,12 @@ void X11Present_fixSurfaceCapabilities(VkSurfaceKHR surface, VkSurfaceCapabiliti
     if (!x11Surface || !getWindowGeometry(x11Surface, &width, &height, NULL)) return;
     capabilities->currentExtent.width = width;
     capabilities->currentExtent.height = height;
-    capabilities->minImageExtent.width = 1;
-    capabilities->minImageExtent.height = 1;
+    /* [mali-g2] The window's size, as Mesa's X11 WSI and Winlator's vortekrenderer report it: Proton's
+     * fullscreen hack (a game's emulated display mode) creates its host swapchain with minImageExtent
+     * and scales the game's frames into it. With 1x1 that was a 1x1 swapchain, every present of it
+     * SUBOPTIMAL (the window is larger) and DXVK recreated it every frame. */
+    capabilities->minImageExtent.width = width;
+    capabilities->minImageExtent.height = height;
     capabilities->maxImageExtent.width = MAX(width, 16384);
     capabilities->maxImageExtent.height = MAX(height, 16384);
     capabilities->supportedCompositeAlpha |= VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -331,6 +344,19 @@ void X11Present_onCreateSwapchain(VkDevice device, const VkSwapchainCreateInfoKH
     for (int i = 0; i < SHM_BUFFER_COUNT; i++) sc->shm[i].shmId = -1;
     pthread_mutex_init(&sc->presentLock, NULL);
     registryAdd(sc);
+    uint32_t loopCount;
+    bool justQuiet;
+    static int recreateLimit = -1;
+    if (recreateLimit < 0) {
+        int value = envInt("VORTEK_RECREATE_LIMIT", 10);
+        recreateLimit = value < 0 ? 0 : value;
+    }
+    sc->loopKey = swapchain_loop_key(createInfo);
+    sc->quiet = swapchain_loop_created(surface->window, sc->loopKey, nowSeconds(), recreateLimit, &loopCount, &justQuiet);
+    if (justQuiet)
+        fprintf(stderr, "vortek-x11: swapchain %ux%u for window 0x%x created %u times within a second with the same parameters: "
+                "its size mismatch is no longer reported as VK_SUBOPTIMAL_KHR while the window keeps its size\n",
+                createInfo->imageExtent.width, createInfo->imageExtent.height, surface->window, loopCount);
     /* Chromium (zink kopper) recreates its swapchain on resizes, swap-interval changes and
      * SUBOPTIMAL presents: say which, recreation costs a frame or two. */
     if (envInt("VORTEK_X11_STATS", 0) > 0)
@@ -908,6 +934,17 @@ static VkResult presentCovered(X11Swapchain* sc, VkQueue queue, const VkPresentI
     return result;
 }
 
+/* Whether a present to a w x h window reports VK_SUBOPTIMAL_KHR (swapchain_loop.h). */
+static bool reportSuboptimal(X11Swapchain* sc, uint32_t w, uint32_t h) {
+    int report = swapchain_loop_suboptimal(&sc->quiet, &sc->quietW, &sc->quietH, sc->extent, w, h);
+    if (report < 0) {
+        swapchain_loop_reset(sc->surface->window, sc->loopKey);
+        fprintf(stderr, "vortek-x11: window 0x%x is now %ux%u (was %ux%u): swapchain %ux%u reports VK_SUBOPTIMAL_KHR again\n",
+                sc->surface->window, w, h, sc->quietW, sc->quietH, sc->extent.width, sc->extent.height);
+    }
+    return report != 0;
+}
+
 /* VK_ERROR_FEATURE_NOT_PRESENT (never again for this swapchain) or VK_NOT_READY (not this frame):
  * the frame must take the X11 path, the semaphores are untouched. */
 static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain, uint32_t imageIndex,
@@ -938,7 +975,7 @@ static VkResult presentZeroCopyLocked(X11Swapchain* sc, VkSwapchainKHR swapchain
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     int x = pos->dst_x, y = pos->dst_y, w = geo->width, h = geo->height;
-    *suboptimal = geo->width != sc->extent.width || geo->height != sc->extent.height;
+    *suboptimal = reportSuboptimal(sc, geo->width, geo->height);
     xcb_window_t root = geo->root;
     free(pos);
     free(geo);
@@ -1216,7 +1253,7 @@ VkResult X11Present_present(VkQueue queue, const VkPresentInfoKHR* presentInfo, 
                 }
                 putFrame(sc, geometry->depth);
                 notePath(sc, sc->zeroCopy >= 0 && sc->occluded ? PATH_OCCLUDED : PATH_X11, geometry->depth);
-                if (geometry->width != sc->extent.width || geometry->height != sc->extent.height) {
+                if (reportSuboptimal(sc, geometry->width, geometry->height)) {
                     result = VK_SUBOPTIMAL_KHR;
                     if (!sc->suboptimalLogged) {
                         sc->suboptimalLogged = true;
