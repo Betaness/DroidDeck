@@ -18,6 +18,9 @@
  * a shader module identifier with FAIL_ON_PIPELINE_COMPILE_REQUIRED (DXVK's second-compile
  * path). Prints GPL-PASS.
  *
+ * The dangling state is dropped by gpl_library_state.h (the client here, mali_fixes.c in process).
+ * Through the libhybris ICD: ../../hybris/tests/gpl_test.sh (with GPL_KEEP_LIBS=1).
+ *
  * Build: cc -O2 -o gpl_test gpl_test.c -lvulkan   (shaders: gpl.vert/gpl.frag -> gpl_spv.h) */
 #include <stdio.h>
 #include <stdlib.h>
