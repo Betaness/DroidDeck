@@ -696,7 +696,9 @@ def frame_rate_limit(command, env):
     """[mali-g2] Vortek runs without gamescope, which held games to the app's frame rate limit (BL_FPS),
     and the compositor only paces wl_shm buffers, not zero-copy layers: DXVK and vkd3d-proton keep to
     it instead, sleeping in their own present thread. Games only (Steam's web views never come here);
-    a limit the game already has is kept."""
+    a limit the game already has is kept. Since upstream 0.6.9 (#1616) the app no longer sets BL_FPS
+    (Steam's own Frame Limit needs gamescope, and the drawer's limit only paces the compositor), so
+    BL_FPS=<fps> in droiddeck-env is the way to cap Vortek and libhybris games."""
     if env.get("BL_GPU_MODE") != "vortek" or len(command) < 3 or command[1] != "waitforexitandrun":
         return env
     fps = env.get("BL_FPS", "")

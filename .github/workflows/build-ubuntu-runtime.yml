@@ -18,6 +18,8 @@ permissions:
 jobs:
   debs:
     runs-on: ubuntu-24.04-arm
+    # [mali-g2] Pushes to forks (the G2 branches) do not rebuild upstream's components; run it by hand there.
+    if: github.repository == 'Droid-Deck/DroidDeck' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
