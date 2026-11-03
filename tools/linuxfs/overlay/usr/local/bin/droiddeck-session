@@ -198,6 +198,37 @@ if [ -n "${BL_VK_DRIVER:-}" ]; then
 fi
 export GAMESCOPE_FORCE_VULKAN_REALTIME=${BL_GAMESCOPE_REALTIME:-0}
 
+# [mali-g2] The OpenGL renderer of a surfaceless EGL context, as "eglinfo -B -p surfaceless" prints it.
+bl_egl_probe='
+import ctypes
+vp, i32 = ctypes.c_void_p, ctypes.c_int32
+egl = ctypes.CDLL("libEGL.so.1")
+egl.eglGetProcAddress.restype = vp
+egl.eglGetProcAddress.argtypes = [ctypes.c_char_p]
+address = egl.eglGetProcAddress(b"eglGetPlatformDisplayEXT")
+if not address:
+    raise SystemExit("no eglGetPlatformDisplayEXT")
+dpy = ctypes.CFUNCTYPE(vp, ctypes.c_uint, vp, vp)(address)(0x31DD, None, None)  # EGL_PLATFORM_SURFACELESS_MESA
+egl.eglInitialize.argtypes = [vp, vp, vp]
+if not dpy or not egl.eglInitialize(dpy, None, None):
+    raise SystemExit("eglInitialize failed")
+egl.eglBindAPI(0x30A2)  # EGL_OPENGL_API
+config, count = vp(), i32()
+egl.eglChooseConfig.argtypes = [vp, vp, ctypes.POINTER(vp), i32, ctypes.POINTER(i32)]
+if not egl.eglChooseConfig(dpy, (i32 * 3)(0x3040, 0x8, 0x3038), ctypes.byref(config), 1, ctypes.byref(count)) or count.value < 1:
+    config = vp()  # EGL_NO_CONFIG_KHR
+egl.eglCreateContext.restype = vp
+egl.eglCreateContext.argtypes = [vp, vp, vp, vp]
+context = egl.eglCreateContext(dpy, config, None, (i32 * 1)(0x3038))
+egl.eglMakeCurrent.argtypes = [vp, vp, vp, vp]
+if not context or not egl.eglMakeCurrent(dpy, None, None, context):
+    raise SystemExit("no surfaceless OpenGL context")
+gl = ctypes.CDLL("libOpenGL.so.0")
+gl.glGetString.restype = ctypes.c_char_p
+gl.glGetString.argtypes = [ctypes.c_uint]
+print("OpenGL renderer string: " + (gl.glGetString(0x1F01) or b"?").decode(errors="replace"))
+'
+
 # [mali-g2] Mali (BL_GPU_MODE=vortek): the guest's Vulkan driver is Vortek, which the app forwards to
 # the vendor driver (VortekServerComponent, socket $VORTEK_SERVER_PATH). The session's program runs on
 # a rootful Xwayland drawing into the app's compositor with wl_shm (-shm: no glamor, there is no render
@@ -419,12 +450,15 @@ if [ -z "${BL_INSIDE:-}" ]; then
     _bl_gl=${BL_VORTEK_GL:-auto} _bl_gl_why="BL_VORTEK_GL=${BL_VORTEK_GL:-}"
     if [ "$_bl_gl" = auto ]; then
       # Probe the path Steam's own window takes (GLX on this X server), else surfaceless EGL.
-      _bl_gl=llvmpipe _bl_gl_why="no glxinfo or eglinfo to probe zink with"
+      _bl_gl=llvmpipe _bl_gl_why="no glxinfo, eglinfo or python3 to probe zink with"
       _bl_probe=(env -u LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER=zink MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_KOPPER_DRI2=true timeout 20)
       if command -v glxinfo >/dev/null 2>&1; then
         _bl_out=$("${_bl_probe[@]}" glxinfo -B 2>&1)
       elif command -v eglinfo >/dev/null 2>&1; then
         _bl_out=$("${_bl_probe[@]}" eglinfo -B -p surfaceless 2>&1)
+      elif command -v python3 >/dev/null 2>&1; then
+        # The Ubuntu runtime ships neither mesa-utils nor eglinfo: the same surfaceless EGL probe through ctypes.
+        _bl_out=$("${_bl_probe[@]}" python3 -I -c "$bl_egl_probe" 2>&1)
       else
         _bl_out=
       fi
