@@ -2750,7 +2750,7 @@ class FrontEndActivity : ComponentActivity() {
         val release = LinuxRuntimeInstaller.fetchRelease()
         Log.i(TAG, "catalog: " + (release?.version ?: "unreachable"))
         ui.post {
-            if (release == null) return@post
+            if (release == null || LinuxRuntimeInstaller.wouldDowngrade(release, installed)) return@post
             available = release
             catalogFresh = true
             autoUpdateRuntime()

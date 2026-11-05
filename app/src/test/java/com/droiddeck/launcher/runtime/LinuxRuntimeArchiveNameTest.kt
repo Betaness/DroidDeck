@@ -18,6 +18,15 @@ class LinuxRuntimeArchiveNameTest {
         assertTrue(LinuxRuntimeInstaller.archiveName(pinned).startsWith("linuxfs-${pinned.version}-"))
     }
 
+    @Test fun thePinnedReleaseNeverReplacesALaterUbuntuRelease() {
+        val pinned = LinuxRuntimeInstaller.PINNED
+        assertTrue(LinuxRuntimeInstaller.wouldDowngrade(pinned, "ubuntu-r2"))
+        assertFalse(LinuxRuntimeInstaller.wouldDowngrade(pinned, pinned.version))
+        assertFalse(LinuxRuntimeInstaller.wouldDowngrade(pinned, "r9"))
+        assertFalse(LinuxRuntimeInstaller.wouldDowngrade(pinned, null))
+        assertFalse(LinuxRuntimeInstaller.wouldDowngrade(release("ubuntu-r3", "ab".repeat(32)), "ubuntu-r2"))
+    }
+
     @Test fun sameReleaseKeepsTheSameName() {
         val a = LinuxRuntimeInstaller.archiveName(release("r9", "ab".repeat(32)))
         val b = LinuxRuntimeInstaller.archiveName(release("r9", "ab".repeat(32)))

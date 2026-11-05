@@ -110,6 +110,11 @@ public final class LinuxRuntimeInstaller {
             "https://github.com/Droid-Deck/DroidDeck-Components/releases/download/ubuntu-r1-rc4/ubuntu-r1-rc4.tar.zst",
             "a90882efc4b0fc308887f8719c21825f0d17d51698296cd3047b6da2491c4396", 291531733L);
 
+    /** [mali-g2] The pin only moves a device off the old runtime; a later Ubuntu release the catalog gave stays. */
+    public static boolean wouldDowngrade(Release release, String installed) {
+        return release == PINNED && installed != null && installed.startsWith("ubuntu-") && !installed.equals(PINNED.version);
+    }
+
     public static Release fetchRelease() {
         String body = Downloader.downloadString(catalogUrl());
         if (body == null || body.isEmpty()) {
