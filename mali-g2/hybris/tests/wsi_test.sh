@@ -15,6 +15,15 @@
 #   cover-partly, cover-fully  another window over the window: X11 copies, paced frames, back
 #   vkcube      vkcube zero-copy, its last frame in out/tests/vkcube.ppm
 #   resize      the window shrinks halfway: VK_SUBOPTIMAL_KHR, swapchain recreated
+#   fshack, fshack-copy  ../vortek/tests/fshack_test.c: Proton's fullscreen hack (an emulated display
+#               mode) sizes its host swapchain from minImageExtent and writes it with a compute shader;
+#               the swapchain must be the client window's size and never recreated (zero-copy with the
+#               mock checking the pixels, and copied into the window)
+#   fshack-plain, fshack-windowed  no fullscreen hack: the window's size; and A.V.A.'s windowed layout
+#               (the client window in a 1x1 parent, copied)
+#   recreate-loop  an application recreating a mismatched swapchain with the same parameters on every
+#               SUBOPTIMAL: the loop stops after VORTEK_RECREATE_LIMIT, and again after the window
+#               changes size
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
@@ -24,6 +33,7 @@ BIN=$ROOT/out/tests
 mkdir -p "$BIN"
 STAGE_INC=$ROOT/work/stage$GUEST_DIR/include
 cc -O2 -Wall -o "$BIN/swapchain_test" "$HERE/swapchain_test.c" -lvulkan -lxcb -lpthread || exit 1
+cc -O2 -Wall -I"$ROOT/../vortek/tests" -o "$BIN/fshack_test" "$ROOT/../vortek/tests/fshack_test.c" -lvulkan -lxcb || exit 1
 cc -O2 -Wall -I"$ROOT/src/compat" -I"$STAGE_INC" -o "$BIN/mock_compositor" "$HERE/mock_compositor.c" "$ROOT/src/ahb.c" \
     "$OUT$GUEST_DIR/lib/libhybris-common.so.1" -lpthread || exit 1
 
@@ -41,9 +51,15 @@ run() { # name, then environment assignments for the test
     name=$1
     shift
     echo "=== $name"
-    env "$@" timeout 120 sh "$HERE/run.sh" "$BIN/swapchain_test" >"$TMP/$name.log" 2>&1
+    env "$@" timeout 120 sh "$HERE/run.sh" "$BIN/${TEST:-swapchain_test}" >"$TMP/$name.log" 2>&1
     rc=$?
-    grep -v -E '^WARNING: linker|normalize_path|library "lib(binder_ndk|nativewindow|sync).so" not found|MEMPROF' "$TMP/$name.log"
+    if [ "${TEST:-}" = fshack_test ]; then
+        # one line per swapchain otherwise (thousands when the recreation loop is not stopped)
+        grep -E '^(screen|window [0-9]|B8G8|frame |[0-9]+ frames|FS-)|times within a second|again|failed' "$TMP/$name.log"
+        echo "($(grep -c '^hybris-wsi: swapchain [0-9]*x[0-9]* format' "$TMP/$name.log") swapchains logged)"
+    else
+        grep -v -E '^WARNING: linker|normalize_path|library "lib(binder_ndk|nativewindow|sync).so" not found|MEMPROF' "$TMP/$name.log"
+    fi
     [ $rc -eq 0 ] || failed="$failed $name"
 }
 
@@ -79,6 +95,15 @@ grep -q 'now through X11, partly covered by' "$TMP/cover-partly.log" || failed="
 run_zc cover-fully early SC_COVER=fully SC_FRAMES=180 DROIDDECK_HYBRIS_AHB_CPU_READ=1
 grep -q 'now hidden, frames paced' "$TMP/cover-fully.log" || failed="$failed cover-fully(not-paced)"
 unset MOCK_GAPS
+export TEST=fshack_test
+run_zc fshack early DROIDDECK_HYBRIS_AHB_CPU_READ=1 FS_MODE=fshack
+run fshack-copy FS_MODE=fshack
+run_zc fshack-plain early DROIDDECK_HYBRIS_AHB_CPU_READ=1 FS_MODE=plain
+run fshack-windowed FS_MODE=plain FS_LAYOUT=offscreen FS_APP=1024x768
+run recreate-loop FS_MODE=fixed FS_RESIZE=1 FS_FRAMES=300
+grep -q 'created 11 times within a second with the same parameters' "$TMP/recreate-loop.log" || failed="$failed recreate-loop(not-logged)"
+grep -q 'reports VK_SUBOPTIMAL_KHR again' "$TMP/recreate-loop.log" || failed="$failed recreate-loop(no-again)"
+unset TEST
 if command -v vkcube >/dev/null; then
     # A real application (textures, depth, its own swapchain handling); its last frame goes to vkcube.ppm.
     sock=$TMP/present-vkcube.sock
