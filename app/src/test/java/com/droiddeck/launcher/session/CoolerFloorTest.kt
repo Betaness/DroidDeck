@@ -1,5 +1,6 @@
 package com.droiddeck.launcher.session
 
+import com.droiddeck.launcher.session.MiBridgeBoost.Hold
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -44,6 +45,11 @@ class CoolerFloorTest {
         val t = mapOf("quiet_therm" to 41.5, "soc-thermal" to 85.0, "gpu-ss-max" to 80.0)
         assertNull(CoolerFloor.tooHot(t))
         assertEquals("quiet_therm 41.5", CoolerFloor.tooHot(t, CoolerFloor.RESUME_MARGIN_C))
+    }
+
+    @Test fun `MiBridge keeps the CPU floor with the cooler`() {
+        assertEquals(listOf(Hold("cpu", 1), Hold("gpu", 1), Hold("ddr", 1)), MiBridgeBoost.parse(CoolerFloor.MIBRIDGE_SPEC))
+        assertEquals(MiBridgeBoost.DEFAULT_SPEC, CoolerFloor.MIBRIDGE_SPEC)
     }
 
     @Test fun `the reply gives the handle, a refusal gives none`() {
