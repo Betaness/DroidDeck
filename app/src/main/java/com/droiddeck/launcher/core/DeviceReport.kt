@@ -205,6 +205,11 @@ object DeviceReport {
         }
         k("peak_refresh_rate", runCatching { Settings.System.getString(context.contentResolver, "peak_refresh_rate") }.getOrNull() ?: "not set")
         k("refresh_rate_mode", runCatching { Settings.Secure.getString(context.contentResolver, "refresh_rate_mode") }.getOrNull() ?: "not set")
+        // [mali-g2] HyperOS: the refresh rate chosen for apps, the cap for the foreground app, and smart refresh; left out when unreadable.
+        for (name in listOf("user_refresh_rate", "miui_refresh_rate")) {
+            runCatching { Settings.Secure.getString(context.contentResolver, name) }.onSuccess { k(name, it ?: "not set") }
+        }
+        runCatching { Settings.System.getString(context.contentResolver, "is_smart_fps") }.onSuccess { k("is_smart_fps", it ?: "not set") }
         val panelSize = com.droiddeck.launcher.session.SessionDisplay.panelSize(context)
         for ((label, mode) in listOf("Resolution (Steam)" to SessionService.MODE_STEAM, "Resolution (Desktop)" to SessionService.MODE_DESKTOP)) {
             val choice = SessionPrefs.resolutionChoice(context, mode, panelSize)

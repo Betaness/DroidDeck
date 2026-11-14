@@ -2838,6 +2838,8 @@
     <string name="setup_group_device">This device</string>
     <string name="setup_cooler_mode">Water cooler mode</string>
     <string name="setup_cooler_mode_hint">With a cooler attached: steadier frame rates in long sessions, by holding the GPU clock up and leaving the CPU boost off. Needs the wireless debugging pairing; stops by itself when the device gets too hot. Applies from the next session.</string>
+    <string name="setup_refresh_lift">144 Hz screen during games</string>
+    <string name="setup_refresh_lift_hint">HyperOS holds apps to the refresh rate chosen in the system settings. While a session is on screen, that choice is raised to the panel\'s top rate and put back afterwards. Needs the wireless debugging pairing.</string>
     <string name="setup_group_art">Library art</string>
     <string name="setup_group_download">Downloads</string>
     <string name="setup_download_source">Source</string>

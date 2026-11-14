@@ -563,6 +563,7 @@ class SessionService : Service() {
         Log.i(TAG, journal.fact("joyose", HyperOsGameMode.start(this)))
         Log.i(TAG, journal.fact("mibridge", MiBridgeBoost.start(this)))
         Log.i(TAG, journal.fact("cooler", CoolerFloor.start(this)))
+        Log.i(TAG, RefreshRateLift.sessionStarted(this))
         Log.i(TAG, journal.fact("colocation", WineServerColocation.start(this)))
 
         val size = SessionState.outputSize
@@ -2146,6 +2147,7 @@ class SessionService : Service() {
         HyperOsGameMode.stop()
         MiBridgeBoost.stop()
         CoolerFloor.stop()
+        RefreshRateLift.sessionEnded(this)
         WineServerColocation.stop()
         suspendOperationPending = false
         freezePending = false

@@ -4758,6 +4758,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         for (name in arrayOf("peak_refresh_rate", "min_refresh_rate")) {
             contentResolver.registerContentObserver(android.provider.Settings.System.getUriFor(name), false, refreshSettingObserver)
         }
+        // [mali-g2] HyperOS's refresh choice for apps and its per-app cap (Secure); the panel's mode changes come through onDisplayChanged.
+        com.droiddeck.launcher.session.RefreshRateLift.watch(this, refreshSettingObserver)
         reconcileDock(shownOnDisplayId)
         settleDualScreenControls()
         refreshSecondScreenDisplays()
@@ -4765,6 +4767,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         else openDualScreenControls()
         startedScreens++
         SessionService.setActivityVisible(this, true, sessionActivityDisplayId)
+        com.droiddeck.launcher.session.RefreshRateLift.shown(this)
         Glasses.rescan()
         updateGlassesScreen()
         updateBottomGame()
@@ -4783,7 +4786,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         startedScreens = (startedScreens - 1).coerceAtLeast(0)
         updateGlassesScreen()
         updateBottomGame()
-        if (startedScreens == 0) SessionService.setActivityVisible(this, false, sessionActivityDisplayId)
+        if (startedScreens == 0) {
+            SessionService.setActivityVisible(this, false, sessionActivityDisplayId)
+            com.droiddeck.launcher.session.RefreshRateLift.hidden(this)
+        }
         super.onStop()
     }
 

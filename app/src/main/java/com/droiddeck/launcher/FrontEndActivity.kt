@@ -205,6 +205,7 @@ class FrontEndActivity : ComponentActivity() {
     private var launcherIcon by mutableStateOf(LauncherIcon.DARK)
     private var gameStoresEnabled by mutableStateOf(true)
     private var coolerMode by mutableStateOf(false)
+    private var refreshLift by mutableStateOf<Boolean?>(null)
     private var gameStoresSpeedTier by mutableStateOf("fast")
     private var navRequest by mutableStateOf<String?>(null)
     private val gameLaunchRequest = java.util.concurrent.atomic.AtomicLong()
@@ -1131,6 +1132,7 @@ class FrontEndActivity : ComponentActivity() {
         launcherIcon = LauncherIcon.current(this)
         gameStoresEnabled = SessionPrefs.gameStoresEnabled(this)
         coolerMode = SessionPrefs.coolerMode(this)
+        refreshLift = com.droiddeck.launcher.session.RefreshRateLift.setting(this)
         gameStoresSpeedTier = SessionPrefs.gameStoresSpeedTier(this)
         storesShowMature = SessionPrefs.storesShowMature(this)
         storesSort = SessionPrefs.storesSort(this)
@@ -1225,6 +1227,7 @@ class FrontEndActivity : ComponentActivity() {
                         launcherIcon = launcherIcon,
                         gameStoresEnabled = gameStoresEnabled,
                         coolerMode = coolerMode,
+                        refreshLift = refreshLift,
                         gameStoresSpeedTier = gameStoresSpeedTier,
                         navigate = navRequest,
                         addedGamesArt = addedGamesArt,
@@ -1488,6 +1491,7 @@ class FrontEndActivity : ComponentActivity() {
                         onPageBack = { showPerformance = false; showComponents = false; showMapping = false },
                         onGameStoresEnabled = { on -> SessionPrefs.setGameStoresEnabled(this, on); gameStoresEnabled = on },
                         onCoolerMode = { on -> SessionPrefs.setCoolerMode(this, on); coolerMode = on },
+                        onRefreshLift = { on -> com.droiddeck.launcher.session.RefreshRateLift.setEnabled(this, on); refreshLift = on },
                         onTheme = { id -> SessionPrefs.setTheme(this, id); theme = id },
                         onLauncherIcon = { style -> switchLauncherIcon(style) },
                         onLanguage = { tag ->
@@ -1909,6 +1913,7 @@ class FrontEndActivity : ComponentActivity() {
         com.droiddeck.launcher.ui.DualScreenPanel.yieldTo(taskId, false)
         com.droiddeck.launcher.ui.DualScreenPanel.ownerPaused(taskId, false)
         orientation = SessionPrefs.orientation(this)
+        refreshLift = com.droiddeck.launcher.session.RefreshRateLift.setting(this)
         launcherOrientation = com.droiddeck.launcher.core.AppUiPrefs.orientation(this)
         requestedOrientation = launcherOrientation
         SteamIntegration.syncShortcutsListing(this)

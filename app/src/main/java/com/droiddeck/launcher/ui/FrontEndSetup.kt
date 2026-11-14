@@ -482,6 +482,9 @@ internal fun SetupPanel(
                                 if (com.droiddeck.launcher.session.CoolerFloor.available) {
                                     ToggleRow(host, "cooler-mode", stringResource(R.string.setup_cooler_mode), stringResource(R.string.setup_cooler_mode_hint), s.coolerMode, onChange = a.onCoolerMode)
                                 }
+                                s.refreshLift?.let { on ->
+                                    ToggleRow(host, "refresh-lift", stringResource(R.string.setup_refresh_lift), stringResource(R.string.setup_refresh_lift_hint), on, onChange = a.onRefreshLift)
+                                }
                                 ChoiceRow(
                                     host, "launcher-orientation", stringResource(R.string.setup_launcher_orientation), null,
                                     com.droiddeck.launcher.core.AppUiPrefs.orientationOptions.map { (value, label) -> value to stringResource(label) },

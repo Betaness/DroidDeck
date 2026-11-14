@@ -2571,6 +2571,8 @@
     <string name="setup_group_device">此设备</string>
     <string name="setup_cooler_mode">水冷模式</string>
     <string name="setup_cooler_mode_hint">接上散热器时打开：拉住 GPU 频率、不要 CPU 提频，长时间游戏帧率更稳。需要无线调试配对，设备过热时自动暂停。下次启动会话生效。</string>
+    <string name="setup_refresh_lift">游戏时屏幕 144 Hz</string>
+    <string name="setup_refresh_lift_hint">HyperOS 把应用限制在系统设置里选的刷新率。会话在屏幕上时把它调到屏幕的最高刷新率，离开后改回。需要无线调试配对。</string>
     <string name="setup_group_art">游戏库美术图</string>
     <string name="flathub_eyebrow">LINUX 应用</string>
     <string name="flathub_name">Flathub</string>

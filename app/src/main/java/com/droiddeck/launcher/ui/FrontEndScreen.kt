@@ -178,6 +178,8 @@ class FrontEndState(
     val launcherIcon: String = com.droiddeck.launcher.LauncherIcon.DARK,
     val gameStoresEnabled: Boolean = true,
     val coolerMode: Boolean = false,
+    /** Null where the setting is not offered. */
+    val refreshLift: Boolean? = null,
     val gameStoresSpeedTier: String = "fast",
     val navigate: String? = null,
     val addedGamesArt: Boolean = true,
@@ -281,6 +283,7 @@ class FrontEndActions(
     val onDownloadProxy: (String) -> Unit = {},
     val onGameStoresEnabled: (Boolean) -> Unit = {},
     val onCoolerMode: (Boolean) -> Unit = {},
+    val onRefreshLift: (Boolean) -> Unit = {},
     val onGameStoresSpeedTier: (String) -> Unit = {},
     val onNavigated: () -> Unit = {},
     val onStoresShowMature: (Boolean) -> Unit = {},

@@ -779,6 +779,13 @@ object SessionPrefs {
         prefs(context).edit().putBoolean("coolerMode", on).apply()
     }
 
+    /** [mali-g2] Whether HyperOS's refresh rate for apps is raised to the panel's top rate while a session is on screen (RefreshRateLift); on by default. */
+    fun refreshLift(context: Context): Boolean = prefs(context).getBoolean("refreshLift", true)
+
+    fun setRefreshLift(context: Context, on: Boolean) {
+        prefs(context).edit().putBoolean("refreshLift", on).apply()
+    }
+
     /** [mali-g2] Whether the session sees the Android system tree (/system, /vendor, /apex...), for libhybris. */
     fun androidSystemBinds(context: Context): Boolean = prefs(context).getBoolean("androidSystemBinds", false)
 
