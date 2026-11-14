@@ -574,6 +574,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var secondScreenDisplays by mutableStateOf<List<SecondScreenDisplay>>(emptyList())
     private var selectedSecondScreenDisplay by mutableStateOf(SessionState.secondScreenDisplay)
     private var started = false
+    /** [mali-g2] Counted in frontScreens (updateRefreshLift). */
+    private var liftFront = false
     private var dualControlsProvisional: Boolean
         get() = SessionState.secondScreenProvisional
         set(value) { SessionState.secondScreenProvisional = value }
@@ -4734,6 +4736,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         super.onPictureInPictureModeChanged(inPip, newConfig)
         if (::pip.isInitialized) pip.changed(inPip)
         if (!inPip && surfaceW > 0) resizeOutputForWindow(surfaceW, surfaceH)
+        // Expanded from picture-in-picture, the activity is resumed (now or in onResume); closed, it is stopped next.
+        if (inPip || resumed) updateRefreshLift()
         applyUnfoldedControls()
         updateGlassesScreen()
         updateBottomGame()
@@ -4767,7 +4771,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         else openDualScreenControls()
         startedScreens++
         SessionService.setActivityVisible(this, true, sessionActivityDisplayId)
-        com.droiddeck.launcher.session.RefreshRateLift.shown(this)
+        updateRefreshLift()
         Glasses.rescan()
         updateGlassesScreen()
         updateBottomGame()
@@ -4786,11 +4790,22 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         startedScreens = (startedScreens - 1).coerceAtLeast(0)
         updateGlassesScreen()
         updateBottomGame()
-        if (startedScreens == 0) {
-            SessionService.setActivityVisible(this, false, sessionActivityDisplayId)
-            com.droiddeck.launcher.session.RefreshRateLift.hidden(this)
-        }
+        if (startedScreens == 0) SessionService.setActivityVisible(this, false, sessionActivityDisplayId)
+        updateRefreshLift()
         super.onStop()
+    }
+
+    /**
+     * [mali-g2] RefreshRateLift raises the refresh rate while a session activity is started and not in picture-in-picture
+     * (a picture-in-picture activity stays started while other apps are in front).
+     */
+    private fun updateRefreshLift() {
+        val front = started && !isInPictureInPictureMode
+        if (front == liftFront) return
+        liftFront = front
+        frontScreens = (frontScreens + if (front) 1 else -1).coerceAtLeast(0)
+        if (front) com.droiddeck.launcher.session.RefreshRateLift.shown(this)
+        else if (frontScreens == 0) com.droiddeck.launcher.session.RefreshRateLift.hidden(this, grace = !isFinishing)
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -4865,6 +4880,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         refreshInputProfile()
         refreshControls()
         if (::pip.isInitialized) pip.resumed()
+        updateRefreshLift()
         if (CompositorHost.isStarted) applyFrameGen()
         SessionPrefs.sessionPrefs(this).registerOnSharedPreferenceChangeListener(cardboardPrefListener)
     }
@@ -5620,6 +5636,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         private const val BOTTOM_RECOVERY_TRIES = 3
         private const val TAG = "SessionActivity"
         private var startedScreens = 0
+        /** [mali-g2] Session activities started and not in picture-in-picture. */
+        private var frontScreens = 0
         @Volatile private var activeInstallWorker: Any? = null
         private const val FEX_MISSING = "droiddeck-fex: x86 Linux programs need"
         private const val UNBUFFERED_SOURCES = InputDevice.SOURCE_CLASS_JOYSTICK or InputDevice.SOURCE_CLASS_TRACKBALL or InputDevice.SOURCE_CLASS_POSITION
