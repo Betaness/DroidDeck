@@ -2,8 +2,8 @@
 #define ZEROFG_PACE_H
 #include <stdint.h>
 
-/* [mali-g2] Pacing arithmetic of ZeroFG on the zero-copy path (zerofg_zc.c). Times are CLOCK_MONOTONIC
- * nanoseconds. No Android or Vulkan: tests/zerofg_pace_test.c. */
+/* [mali-g2] Pacing arithmetic of ZeroFG on the zero-copy path (zerofg_zc.c), and the format it imports game
+ * buffers as. Times are CLOCK_MONOTONIC nanoseconds. No Android or Vulkan: tests/zerofg_pace_test.c. */
 
 #define ZFG_PERIOD_HIST 8
 #define ZFG_GAP_MIN_NS 250000000LL
@@ -66,9 +66,28 @@ int64_t zfg_apply_at(int64_t desired, int64_t latch, int64_t margin);
 /* The layer's frame-rate vote: the lowest of the panel's rates (`modes`, n of them; none given: the peak rate
  * over 1 .. 8) that is a whole multiple of twice the real rate within 3 %, so every output keeps the same
  * number of refreshes; where none is, the highest rate up to the peak (the smallest unevenness). The previous
- * vote (0: none) stays while it is still such a multiple within 5 %. Rates above the peak are not voted. 0
- * while the period or the peak rate is unknown. */
+ * vote (0: none) stays while twice the real rate is at most 5 % above or 8 % below a whole fraction of it
+ * (ZFG_VOTE_KEEP_*) and no lower rate fits within 3 %. Rates above the peak are not voted. 0 while the period
+ * or the peak rate is unknown. */
+#define ZFG_VOTE_FIT 0.03
+#define ZFG_VOTE_KEEP_ABOVE 0.05
+#define ZFG_VOTE_KEEP_BELOW 0.08
 float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev);
+
+/* The vote over the frames. The period is smoothed further (each frame's period moves it an eighth of the way:
+ * the period of a few uneven frames hardly moves it). The first vote is zfg_vote_pick's choice for it; then
+ * that choice (with `hz` as the previous vote) replaces the vote once zfg_vote_pick has chosen other rates for
+ * ZFG_VOTE_HOLD_NS without a break. */
+#define ZFG_VOTE_HOLD_NS 1000000000LL
+struct zfg_vote {
+    float hz;           /* the vote in force; 0: none */
+    int away;           /* zfg_vote_pick has chosen another rate since away_since */
+    int64_t away_since;
+    int64_t period;     /* smoothed; 0: none yet */
+};
+void zfg_vote_reset(struct zfg_vote *v);
+/* The vote for a real frame at `now`; 0 while there is none. */
+float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz);
 
 /* Twice the real rate is more than 5 % above the peak refresh rate; once it was (was_fast), until it is 3 %
  * above or less. 0 when either is unknown. */
@@ -86,5 +105,13 @@ struct zfg_fast {
     int64_t over_since; /* twice the real rate above the running refresh rate since then; 0: not */
 };
 int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refresh_hz, float peak_hz);
+
+/* The Vulkan format a game's AHardwareBuffer is imported as: the one the driver gives for it
+ * (vkGetAndroidHardwareBufferPropertiesANDROID; 0 = VK_FORMAT_UNDEFINED: none of its own); where that is none,
+ * VK_FORMAT_B8G8R8A8_UNORM for HAL_PIXEL_FORMAT_BGRA_8888, which the presenters (mali-g2/hybris wsi.c, the Vortek
+ * server) allocate for B8G8R8A8 swapchains and create their B8G8R8A8 images on; else 0. */
+#define ZFG_AHB_BGRA8 5u          /* HAL_PIXEL_FORMAT_BGRA_8888 */
+#define ZFG_VK_B8G8R8A8_UNORM 44u /* VK_FORMAT_B8G8R8A8_UNORM */
+uint32_t zfg_import_format(uint32_t ahb_format, uint32_t reported);
 
 #endif

@@ -27,6 +27,10 @@ fence is merged with the end of the last generation that read it (`zfg_release_f
 ZeroFG is off while a zero-copy scaling filter (SGSR, SGSR HQ, Sharpen, FSR with `DROIDDECK_ZC_FSR=1`) is
 selected; the log says so once. When it takes a layer's frames again, an upscaling pass still waiting there is
 dropped. Frames that are not 8-bit RGBA (HDR), and sizes outside 64x64 .. 16384x16384, are shown as they are.
+B8G8R8A8 swapchains (AHardwareBuffer format 5, HAL_PIXEL_FORMAT_BGRA_8888: DXVK's B8G8R8A8 swapchains through the
+hybris WSI, the Steam client's windows through the Vortek server) are imported as VK_FORMAT_B8G8R8A8_UNORM where
+the driver gives their buffers no Vulkan format of its own (`vkGetAndroidHardwareBufferPropertiesANDROID`:
+VK_FORMAT_UNDEFINED), as their presenters create their images on these buffers (`zfg_import_format`).
 A session whose games are not shown zero-copy (another `BL_GPU_MODE`, the upstream GPU path) gets no generated
 frames: the menu items are greyed out with that reason, and picking ZeroFG says so.
 
@@ -65,12 +69,14 @@ frames: the menu items are greyed out with that reason, and picking ZeroFG says 
   2 s, the panel having stayed below the peak after the vote (a power or thermal cap, the system's refresh
   policy, a peak the panel never reaches).
 - The layer votes the lowest of the panel's rates (modes of its current size up to the peak, from
-  `SessionActivity`; none known: the peak over 1 .. 8) that is a whole multiple of 2x the real rate within
-  3 %, so every output keeps the same number of refreshes; where none is, the highest rate up to the peak
-  (the smallest unevenness). The vote stays while it is still such a multiple within 5 %, changes at most once
-  a second and asks for seamless mode switches only. The peak rate is the requested mode, else the fastest
-  mode of the panel's size, after the caps (`FrameGen.apply`). While ZeroFG is selected the session's own vote
-  is that rate too, so the panel comes back up after ZeroFG's vote lowered it, and for 10 s after ZeroFG was
+  `SessionActivity`; none known: the peak over 1 .. 8) that is a whole multiple of 2x the real rate within 3 %, so
+  every output keeps the same number of refreshes; where none is, the highest rate up to the peak (the smallest
+  unevenness). The rate is judged on P smoothed further (each frame moves it an eighth of the way). The vote stays
+  while 2x the real rate is at most 5 % above or 8 % below a whole fraction of it and no lower rate fits within
+  3 %; it changes once another rate has been chosen for 1 s without a break, so a few uneven frames do not move it
+  (`zfg_vote_step`). It asks for seamless mode switches only. The peak rate is the requested mode, else the
+  fastest mode of the panel's size, after the caps (`FrameGen.apply`). While ZeroFG is selected the session's own
+  vote is that rate too, so the panel comes back up after ZeroFG's vote lowered it, and for 10 s after ZeroFG was
   turned off while the panel still runs below it; then the running rate, as without ZeroFG. Frames skipped as
   `fast`, `unsupported` or `error`, and a window that stops being the main one, drop the layer's vote.
 
@@ -139,8 +145,9 @@ picked.
     complete while a refresh before B's was left), `unsupported`, `error`, `prep` (engine being built).
 - `off: <why> (N frames generated)`; `off for this session: <why>`; `ZeroFG (<mode>) could not be built at WxH:
   <status>; frames of this size and mode are shown as they are`; `new session: ZeroFG may run again`;
-  `swapchain N (WxH, AHardwareBuffer format F) cannot be used: <why>; its frames are shown as they are`, once
-  per swapchain.
+  `swapchain N of presenter P (WxH, AHardwareBuffer format F) cannot be used: <why>; its frames are shown as
+  they are`, once per swapchain (N and P as in the `vortek` lines `zero-copy swapchain N of presenter P`);
+  `AHardwareBuffer format 0x5 has no Vulkan format of its own on this driver: imported as B8G8R8A8_UNORM`, once.
 
 Not counted: a frame SurfaceFlinger drops for a later one on the same refresh, and ZeroFG's own scene-cut
 handling (it then outputs B whole). `adb shell dumpsys SurfaceFlinger --latency <layer name>` lists actual

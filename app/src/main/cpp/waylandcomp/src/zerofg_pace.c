@@ -85,10 +85,15 @@ int64_t zfg_apply_at(int64_t desired, int64_t latch, int64_t margin) {
     return desired - (latch > 0 ? latch : 0) - (margin > 0 ? margin : 0);
 }
 
-static int vote_even(double c, double out, double tol) {
-    if (c < out * (1.0 - tol)) return 0;
-    const double m = floor(c / out + 0.5);
-    return m >= 1.0 && fabs(c - m * out) <= tol * c;
+/* Twice the real rate `out` is within (1 - below) .. (1 + above) of c / m for a whole m: c shows every output
+ * for m refreshes. */
+static int vote_fits(double c, double out, double below, double above) {
+    const double m0 = floor(c / out);
+    for (double m = m0 < 1.0 ? 1.0 : m0; m <= m0 + 1.0; m++) {
+        const double fit = c / m;
+        if (out >= fit * (1.0 - below) && out <= fit * (1.0 + above)) return 1;
+    }
+    return 0;
 }
 
 float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, float prev) {
@@ -104,11 +109,43 @@ float zfg_vote_pick(int64_t period, const float *modes, int n, float peak_hz, fl
     int kept = 0;
     for (int i = 0; i < nc; i++) {
         if (cand[i] > top) top = cand[i];
-        if (prev > 0.0f && fabs(cand[i] - prev) < 0.5 && vote_even(cand[i], out, 0.05)) kept = 1;
-        if (vote_even(cand[i], out, 0.03) && (best <= 0.0f || cand[i] < best)) best = cand[i];
+        if (prev > 0.0f && fabs(cand[i] - prev) < 0.5 &&
+            vote_fits(cand[i], out, ZFG_VOTE_KEEP_BELOW, ZFG_VOTE_KEEP_ABOVE))
+            kept = 1;
+        if (vote_fits(cand[i], out, ZFG_VOTE_FIT, ZFG_VOTE_FIT) && (best <= 0.0f || cand[i] < best)) best = cand[i];
     }
-    if (kept) return prev;
+    if (kept && !(best > 0.0f && best < prev)) return prev;
     return best > 0.0f ? best : top;
+}
+
+void zfg_vote_reset(struct zfg_vote *v) {
+    v->hz = 0.0f;
+    v->away = 0;
+    v->away_since = 0;
+    v->period = 0;
+}
+
+float zfg_vote_step(struct zfg_vote *v, int64_t now, int64_t period, const float *modes, int n, float peak_hz) {
+    if (period > 0) v->period = v->period > 0 ? v->period + (period - v->period) / 8 : period;
+    const float pick = zfg_vote_pick(v->period, modes, n, peak_hz, v->hz);
+    if (pick <= 0.0f || pick == v->hz) {
+        v->away = 0;
+        return v->hz;
+    }
+    if (v->hz <= 0.0f) {
+        v->hz = pick;
+        v->away = 0;
+        return pick;
+    }
+    if (!v->away) {
+        v->away = 1;
+        v->away_since = now;
+    }
+    if (now - v->away_since >= ZFG_VOTE_HOLD_NS) {
+        v->hz = pick;
+        v->away = 0;
+    }
+    return v->hz;
 }
 
 int zfg_too_fast(int64_t period, float peak_hz, int was_fast) {
@@ -131,4 +168,9 @@ int zfg_fast_update(struct zfg_fast *f, int64_t now, int64_t period, float refre
             (refresh_hz > 0.0f && real > (double)refresh_hz * (was ? 1.0 : 1.02)) ||
             (over_run && now - f->over_since >= ZFG_FAST_GRACE_NS);
     return f->on;
+}
+
+uint32_t zfg_import_format(uint32_t ahb_format, uint32_t reported) {
+    if (reported) return reported;
+    return ahb_format == ZFG_AHB_BGRA8 ? ZFG_VK_B8G8R8A8_UNORM : 0;
 }

@@ -170,6 +170,125 @@ static void votes(void) {
     CHECK(pick(60.4, NULL, 0, 120.0f, 0) == 120.0f, "60.4 fps: 120");
 }
 
+/* The tablet at about 30 fps (2x 59.8 .. 61.6) with the panel capped at 120 by the system: the session's
+ * peak is 144 (or 120), the panel runs at 120. */
+static void votes_near_30_on_the_tablet(void) {
+    const float m[] = {30, 48, 50, 60, 90, 120, 144};
+    const double fps[] = {29.9, 30.0, 30.8};
+    for (unsigned i = 0; i < sizeof(fps) / sizeof(fps[0]); i++) {
+        const double f = fps[i];
+        CHECK(pick(f, m, 7, 144.0f, 0) == 60.0f, "%.1f fps, peak 144: 60, got %.1f", f, pick(f, m, 7, 144.0f, 0));
+        CHECK(pick(f, m, 7, 144.0f, 60.0f) == 60.0f, "%.1f fps after 60: 60", f);
+        CHECK(pick(f, m, 7, 144.0f, 144.0f) == 60.0f, "%.1f fps after 144: 60", f);
+        CHECK(pick(f, m, 7, 120.0f, 0) == 60.0f, "%.1f fps, peak 120: 60", f);
+        CHECK(pick(f, m, 7, 120.0f, 120.0f) == 60.0f, "%.1f fps after 120: 60, the lower rate that fits", f);
+        struct zfg_fast fs = {0, 0};
+        CHECK(!zfg_fast_update(&fs, 1000 * MS, (int64_t)(1e9 / f), 120.0f, 144.0f), "%.1f fps on 120 (peak 144): not fast",
+              f);
+    }
+    /* a vote of 60 stays while 2x the real rate is at most 5 % above or 8 % below 60 */
+    CHECK(pick(27.75, m, 7, 144.0f, 60.0f) == 60.0f, "55.5 outputs after 60: 60");
+    CHECK(pick(27.25, m, 7, 144.0f, 60.0f) == 144.0f, "54.5 outputs after 60: 144");
+    CHECK(pick(27.75, m, 7, 144.0f, 0) == 144.0f, "55.5 outputs, no vote yet: 144");
+    CHECK(pick(31.45, m, 7, 144.0f, 60.0f) == 60.0f, "62.9 outputs after 60: 60");
+    CHECK(pick(31.8, m, 7, 144.0f, 60.0f) == 144.0f, "63.6 outputs after 60: 144");
+}
+
+/* Intervals of a game at about `fps`: each within 10 % of the mean, a 1.7x one every 23rd. */
+static uint32_t jit_state;
+static int64_t jittered(double fps, int n) {
+    jit_state = jit_state * 1664525u + 1013904223u;
+    const double u = (double)(jit_state >> 8) / 16777216.0;
+    double iv = 1e9 / fps * (0.9 + 0.2 * u);
+    if (n % 23 == 22) iv *= 1.7;
+    return (int64_t)iv;
+}
+
+/* Frames as zfg_present takes them: the trimmed-mean period, then the vote. Returns the vote at the end and
+ * counts the frames after `settle` whose vote was not `want`. */
+static float vote_run(double fps, float peak, int frames, int64_t settle, float want, struct zfg_vote *v,
+                      int64_t *t, int *off) {
+    const float m[] = {30, 48, 50, 60, 90, 120, 144};
+    struct zfg_period p;
+    zfg_period_reset(&p);
+    const int64_t t0 = *t;
+    float hz = v->hz;
+    for (int n = 0; n < frames; n++) {
+        const int64_t iv = jittered(fps, n);
+        *t += iv;
+        if (!zfg_is_gap(iv, zfg_period_get(&p))) zfg_period_add(&p, iv);
+        hz = zfg_vote_step(v, *t, zfg_period_get(&p), m, 7, peak);
+        if (*t - t0 >= settle && hz != want) (*off)++;
+    }
+    return hz;
+}
+
+static void vote_steady_through_uneven_frames(void) {
+    const double fps[] = {29.9, 30.0, 30.8};
+    const float peaks[] = {144.0f, 120.0f};
+    for (unsigned i = 0; i < sizeof(fps) / sizeof(fps[0]); i++)
+        for (unsigned k = 0; k < 2; k++) {
+            struct zfg_vote v;
+            zfg_vote_reset(&v);
+            jit_state = 7 + i;
+            int64_t t = 1000 * MS;
+            int off = 0;
+            const float hz = vote_run(fps[i], peaks[k], (int)(fps[i] * 120), 3000 * MS, 60.0f, &v, &t, &off);
+            CHECK(hz == 60.0f && off == 0, "%.1f fps, peak %.0f, frames 10 %% uneven: 60 after 3 s, got %.1f, %d "
+                  "frames not 60", fps[i], peaks[k], hz, off);
+        }
+    /* the vote follows a real change of rate, after the hold */
+    const float m[] = {30, 48, 50, 60, 90, 120, 144};
+    struct zfg_vote v;
+    zfg_vote_reset(&v);
+    jit_state = 3;
+    int64_t t = 1000 * MS;
+    int off = 0;
+    vote_run(30.0, 144.0f, 300, 3000 * MS, 60.0f, &v, &t, &off);
+    CHECK(v.hz == 60.0f && off == 0, "30 fps: 60, %d frames not", off);
+    const int64_t step = t;
+    int64_t moved = 0;
+    for (int n = 0; n < 200 && !moved; n++) {
+        const int64_t iv = (int64_t)(1e9 / 45.0);
+        t += iv;
+        if (zfg_vote_step(&v, t, iv, m, 7, 144.0f) != 60.0f) moved = t - step;
+    }
+    CHECK(v.hz == 90.0f, "30 then 45 fps: 90, got %.1f", v.hz);
+    CHECK(moved >= ZFG_VOTE_HOLD_NS && moved <= ZFG_VOTE_HOLD_NS + 500 * MS,
+          "the vote moved %lld ms after the rate changed", (long long)(moved / MS));
+}
+
+static void vote_steps(void) {
+    const float m[] = {30, 48, 50, 60, 90, 120, 144};
+    struct zfg_vote v;
+    zfg_vote_reset(&v);
+    CHECK(zfg_vote_step(&v, 1000 * MS, 0, m, 7, 144.0f) == 0.0f, "period unknown: no vote");
+    CHECK(zfg_vote_step(&v, 1010 * MS, 33333333, m, 7, 144.0f) == 60.0f, "the first vote at once");
+    /* 20 fps for 500 ms (the period of the vote moves towards 50 ms): 60 stays */
+    int64_t t = 1010 * MS;
+    for (int n = 0; n < 10; n++) {
+        t += 50 * MS;
+        CHECK(zfg_vote_step(&v, t, 50 * MS, m, 7, 144.0f) == 60.0f, "a stretch at 20 fps, frame %d: 60 stays", n);
+    }
+    for (int n = 0; n < 30; n++) {
+        t += 33333333;
+        zfg_vote_step(&v, t, 33333333, m, 7, 144.0f);
+    }
+    CHECK(v.hz == 60.0f && !v.away, "back at 30 fps: 60, nothing pending");
+    zfg_vote_reset(&v);
+    CHECK(v.hz == 0.0f && v.period == 0, "reset: no vote");
+}
+
+static void import_formats(void) {
+    CHECK(zfg_import_format(ZFG_AHB_BGRA8, 0) == ZFG_VK_B8G8R8A8_UNORM, "BGRA_8888 without a format: B8G8R8A8_UNORM");
+    CHECK(zfg_import_format(ZFG_AHB_BGRA8, ZFG_VK_B8G8R8A8_UNORM) == ZFG_VK_B8G8R8A8_UNORM, "BGRA_8888 as reported");
+    CHECK(zfg_import_format(ZFG_AHB_BGRA8, 50) == 50, "the driver's own format first (B8G8R8A8_SRGB)");
+    CHECK(zfg_import_format(1, 37) == 37, "R8G8B8A8_UNORM as reported");
+    CHECK(zfg_import_format(1, 0) == 0, "R8G8B8A8 without a format: none");
+    CHECK(zfg_import_format(0x2b, 0) == 0, "R10G10B10A2 without a format: none");
+    CHECK(zfg_import_format(0x23, 0) == 0, "YCbCr without a format: none");
+}
+
 static void too_fast(void) {
     CHECK(!zfg_too_fast(32 * MS, 120.0f, 0), "31 fps on 120 Hz: room");
     CHECK(!zfg_too_fast(16666666, 120.0f, 0), "60 fps on 120 Hz: room");
@@ -656,6 +775,10 @@ int main(void) {
     schedule_does_not_drift();
     desired_and_apply_times();
     votes();
+    votes_near_30_on_the_tablet();
+    vote_steady_through_uneven_frames();
+    vote_steps();
+    import_formats();
     too_fast();
     fast_against_the_running_rate();
     sim_30_on_120();

@@ -40,7 +40,8 @@ void droiddeck_log(const char *tag, const char *fmt, ...) __attribute__((format(
 #define STATS_NS 5000000000LL
 #define IDLE_NS 10000000000LL
 #define RECENT_NS 5000000000LL
-#define AHB_FORMAT_BGRA8 5 /* HAL_PIXEL_FORMAT_BGRA_8888: DXVK's swapchains */
+#define AHB_FORMAT_BGRA8 ZFG_AHB_BGRA8 /* HAL_PIXEL_FORMAT_BGRA_8888: B8G8R8A8 swapchains (DXVK's, Steam's) */
+_Static_assert(ZFG_VK_B8G8R8A8_UNORM == VK_FORMAT_B8G8R8A8_UNORM, "zfg_import_format's B8G8R8A8");
 #define OUT_FORMAT VK_FORMAT_R8G8B8A8_UNORM /* the layer pools' AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM */
 
 enum { SK_FIRST, SK_CUT, SK_FAST, SK_EARLY, SK_LATE, SK_BUSY, SK_MISSED, SK_UNSUPPORTED, SK_ERROR, SK_PREP, SK_COUNT };
@@ -157,7 +158,7 @@ static struct {
     struct zfg_period period;
     float vote;
     int vote_slot;
-    int64_t vote_ns;
+    struct zfg_vote vs;     /* the vote of vote_slot's layer over its frames */
     const char *said_filter;
     int said_on;
     struct zjob jobs[ZJOBS];
@@ -900,14 +901,39 @@ static int zimport(AHardwareBuffer *ahb, int sampled, struct zimg *out, const ch
     AHardwareBuffer_describe(ahb, &desc);
     VkAndroidHardwareBufferFormatPropertiesANDROID fp = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
     VkAndroidHardwareBufferPropertiesANDROID ap = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, .pNext = &fp};
-    if (D.GetAndroidHardwareBufferPropertiesANDROID(D.dev, ahb, &ap) != VK_SUCCESS || fp.format == VK_FORMAT_UNDEFINED ||
-        !ap.memoryTypeBits) {
+    if (D.GetAndroidHardwareBufferPropertiesANDROID(D.dev, ahb, &ap) != VK_SUCCESS) {
+        *why = "vkGetAndroidHardwareBufferPropertiesANDROID refused its buffers";
+        return -1;
+    }
+    if (!ap.memoryTypeBits) {
+        *why = "no memory type can import its buffers";
+        return -1;
+    }
+    /* B8G8R8A8 swapchain buffers (AHardwareBuffer format 5) may get no Vulkan format of their own from the driver
+     * (VK_FORMAT_UNDEFINED, an external format); their presenters render into them as VK_FORMAT_B8G8R8A8_UNORM. */
+    const VkFormat fmt = (VkFormat)zfg_import_format(desc.format, (uint32_t)fp.format);
+    if (fmt == VK_FORMAT_UNDEFINED) {
         *why = "its buffers have no Vulkan format";
         return -1;
     }
+    VkFormatFeatureFlags feats = fp.formatFeatures;
+    if (fmt != fp.format) {
+        PFN_vkGetPhysicalDeviceFormatProperties props =
+            (PFN_vkGetPhysicalDeviceFormatProperties)D.gipa(D.inst, "vkGetPhysicalDeviceFormatProperties");
+        VkFormatProperties pf;
+        memset(&pf, 0, sizeof(pf));
+        if (props) props(D.pd, fmt, &pf);
+        feats = pf.optimalTilingFeatures;
+        static int said;
+        if (!said) {
+            said = 1;
+            ZLOG("AHardwareBuffer format %#x has no Vulkan format of its own on this driver: imported as "
+                 "B8G8R8A8_UNORM", desc.format);
+        }
+    }
     const VkFormatFeatureFlags need = sampled ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
                                               : VK_FORMAT_FEATURE_BLIT_DST_BIT;
-    if ((fp.formatFeatures & need) != need) {
+    if ((feats & need) != need) {
         *why = sampled ? "its buffers cannot be sampled with linear filtering" : "the layer buffers cannot be blitted into";
         return -1;
     }
@@ -917,7 +943,7 @@ static int zimport(AHardwareBuffer *ahb, int sampled, struct zimg *out, const ch
     VkExternalMemoryImageCreateInfo ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
     VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &ext, .imageType = VK_IMAGE_TYPE_2D,
-                             .format = fp.format, .extent = {desc.width, desc.height, 1}, .mipLevels = 1, .arrayLayers = 1,
+                             .format = fmt, .extent = {desc.width, desc.height, 1}, .mipLevels = 1, .arrayLayers = 1,
                              .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     for (int t = 0; t < 2 && !out->img; t++) {
@@ -935,14 +961,14 @@ static int zimport(AHardwareBuffer *ahb, int sampled, struct zimg *out, const ch
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ded,
                                 .allocationSize = ap.allocationSize, .memoryTypeIndex = idx};
     VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                                 .format = fp.format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                                 .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (D.AllocateMemory(D.dev, &mai, NULL, &out->mem) != VK_SUCCESS) { out->mem = VK_NULL_HANDLE; goto fail; }
     if (D.BindImageMemory(D.dev, out->img, out->mem, 0) != VK_SUCCESS) goto fail;
     vci.image = out->img;
     if (D.CreateImageView(D.dev, &vci, NULL, &out->view) != VK_SUCCESS) { out->view = VK_NULL_HANDLE; goto fail; }
     AHardwareBuffer_acquire(ahb);
     out->ahb = ahb;
-    out->fmt = fp.format;
+    out->fmt = fmt;
     out->w = desc.width;
     out->h = desc.height;
     return 0;
@@ -981,8 +1007,9 @@ static struct zsrc *src_get(const struct vku_frame *f, const char **why) {
             said_chain = f->chain;
             AHardwareBuffer_Desc desc;
             AHardwareBuffer_describe(f->ahb, &desc);
-            ZLOG("swapchain %u (%ux%u, AHardwareBuffer format %#x) cannot be used: %s; its frames are shown as they are",
-                 VP_CHAIN_ID(f->chain), desc.width, desc.height, desc.format, *why);
+            ZLOG("swapchain %u of presenter %u (%ux%u, AHardwareBuffer format %#x) cannot be used: %s; its frames are "
+                 "shown as they are",
+                 VP_CHAIN_ID(f->chain), f->chain >> 29, desc.width, desc.height, desc.format, *why);
         }
         return NULL;
     }
@@ -1221,6 +1248,7 @@ static void vote_clear(void) {
     if (Z.vote_slot >= 0) sc_layer_vortek_frame_rate(Z.vote_slot, 0.0f);
     Z.vote_slot = -1;
     Z.vote = 0.0f;
+    zfg_vote_reset(&Z.vs);
 }
 
 static void stats_reset(int64_t now) {
@@ -1317,14 +1345,13 @@ static void vote_update(int slot, int64_t period, float peak, int64_t now) {
     if (!Z.k_vote) return;
     float modes[16];
     const int n = modes_get(modes);
-    const float v = zfg_vote_pick(period, modes, n, peak, Z.vote_slot == slot ? Z.vote : 0.0f);
-    if (v <= 0.0f) return;
-    if (Z.vote_slot == slot && (v == Z.vote || now - Z.vote_ns < 1000000000LL)) return;
+    if (Z.vote_slot != slot) zfg_vote_reset(&Z.vs);
+    const float v = zfg_vote_step(&Z.vs, now, period, modes, n, peak);
+    if (v <= 0.0f || (Z.vote_slot == slot && v == Z.vote)) return;
     if (Z.vote_slot >= 0 && Z.vote_slot != slot) sc_layer_vortek_frame_rate(Z.vote_slot, 0.0f);
     sc_layer_vortek_frame_rate(slot, v);
     Z.vote_slot = slot;
     Z.vote = v;
-    Z.vote_ns = now;
 }
 
 static void say_on(int dpt) {
