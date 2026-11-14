@@ -7,9 +7,12 @@ import com.droiddeck.launcher.core.WirelessAdbFix
 
 /**
  * [mali-g2] Water cooler mode on the Xring O3: while a game is on screen, a GPU clock floor from the system's perf
- * lock service, and MiBridge asks for GPU and DDR but not CPU ([MIBRIDGE_SPEC]). With a CPU floor as well, the SoC
- * reaches 85 C within seconds and the system clamps every cluster to about 1.3 GHz for 5-8 s, over and over; measured
- * over 15 minutes this point held 77 fps with a low of 75 at half resolution, against 75 with a low of 54.
+ * lock service, and MiBridge asks for CPU, GPU and DDR as it does by default ([MIBRIDGE_SPEC]). MiBridge's GPU
+ * level 1 only holds 979 MHz; the GPU governor picks the lowest clock that keeps the GPU about 95% busy, which was
+ * 1248 MHz in Duckov at half resolution (busy 0.92, about 81 fps), and the floor at 1497.6 MHz gave 2.2 to 3.3 fps
+ * more there. MiBridge grants the CPU floor only below the board temperature in
+ * persist.sys.miuibooster.thermalbreaklimit; with that at 50 C, leaving the CPU floor out cost about 10 fps (main
+ * thread at 2.64 instead of about 3.6 GHz).
  *
  * The lock needs the shell user, so it goes through the wireless debugging pairing. It lasts [LOCK_MS] and is renewed
  * every [RENEW_MS], never with duration 0, so it lapses by itself if this process dies. Before each renewal every
@@ -27,7 +30,7 @@ object CoolerFloor {
     private const val IDLE_MS = 1_000L
     private const val RETRY_MS = 15_000L
     internal const val RESUME_MARGIN_C = 1.0
-    const val MIBRIDGE_SPEC = "gpu=1,ddr=1"
+    const val MIBRIDGE_SPEC = "cpu=1,gpu=1,ddr=1"
 
     internal val LIMITS = mapOf(
         "quiet_therm" to 42.0, "soc-thermal" to 93.0, "gpu-ss-max" to 90.0, "cpu-ss-max" to 95.0, "battery" to 42.0,
