@@ -142,6 +142,20 @@ def duckov_mono_hacks(game):
 
 
 @fix
+def duckov_job_workers(game):
+    """Escape from Duckov's Unity player on a Xring O3 starts 9 Job.Worker threads and 10 PhysX dispatcher
+    workers; with job-worker-count=3 in its boot.config there were 3 and 4. At half resolution (2 runs each,
+    interleaved) that was 83.18 against 81.10 fps (+2.6%; +1.3 fps at the same 1248 MHz GPU clock), 22.67
+    against 24.65 ms of game-thread CPU a frame (-8%), 11.03 against 11.24 ms on the main thread, and a longest
+    frame in 40 s of 20.8 against 34.7 ms. In the same test gc-max-time-slice=0 stalled about 40 ms every 13 s
+    and gfx jobs cost 6.9%, so neither is set. Its UnityPlayer.dll (2022.3.62f2) reads boot.config and then the
+    command line ("-key value", keys compared without case) into the same settings, so the key goes on the
+    command line; a -job-worker-count the game is launched with is kept."""
+    if is_duckov(game) and not any(a.lower() == "-job-worker-count" for a in game.args):
+        return {}, ["-job-worker-count", "3"], "Escape from Duckov: 3 Unity job workers"
+
+
+@fix
 def godot_vulkan(game):
     if is_godot(game) and not game.has_arg("--rendering-driver"):
         return {}, ["--rendering-driver", "vulkan"], "Godot: Vulkan renderer"

@@ -1710,7 +1710,7 @@ class GameEnvironmentTest(unittest.TestCase):
             for exe in (duckov, bare_duckov):
                 env, extra, notes = MODULE["engine_fixes"](exe, [])
                 self.assertEqual(env, expected, exe)
-                self.assertEqual((extra, notes), ([], self.UNITY_NOTES + ["Escape from Duckov: FEX MonoHacks off"]))
+                self.assertEqual((extra, notes), (self.DUCKOV_JOB_WORKERS, self.UNITY_NOTES + self.DUCKOV_NOTES))
             env = MODULE["engine_fixes"](duckov, [])[0]
             preset = {"version": 1, "shared": {"FEX_TSOENABLED": "1", "FEX_DISABLEL2CACHE": "1", "FEX_MONOHACKS": "1"}}
             result = MODULE["apply_config"]({"FEX_DYNAMICL1CACHE": "1"}, preset, "3167020", env)
@@ -1726,6 +1726,66 @@ class GameEnvironmentTest(unittest.TestCase):
             self.assertEqual(MODULE["engine_fixes"](other_unity, [])[0], {"FEX_TSOENABLED": "1"})
             self.assertEqual(MODULE["engine_fixes"](other_duckov, []), ({}, [], []))
             self.assertEqual(MODULE["engine_fixes"](ava, []), ({}, [], []))
+
+    DUCKOV_JOB_WORKERS = ["-job-worker-count", "3"]
+    DUCKOV_NOTES = ["Escape from Duckov: FEX MonoHacks off", "Escape from Duckov: 3 Unity job workers"]
+
+    def test_only_duckov_gets_three_unity_job_workers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = self.unity_game(tmp)
+            duckov = game("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll",
+                          "Escape from Duckov/MonoBleedingEdge/EmbedRuntime/mono-2.0-bdwgc.dll")
+            bare_duckov = game("Bare Duckov/Duckov.exe", "Bare Duckov/UnityPlayer.dll")
+            for exe in (duckov, bare_duckov):
+                self.assertEqual(MODULE["engine_fixes"](exe, [])[1], self.DUCKOV_JOB_WORKERS, exe)
+                self.assertEqual(MODULE["engine_fixes"](exe, ["-screen-fullscreen", "0"])[1], self.DUCKOV_JOB_WORKERS, exe)
+            others = (game("RoR2/Risk of Rain 2.exe", "RoR2/UnityPlayer.dll", "RoR2/MonoBleedingEdge/"),
+                      game("Crab Game/Crab Game.exe", "Crab Game/UnityPlayer.dll", "Crab Game/GameAssembly.dll"),
+                      game("Plain/Plain.exe", "Plain/UnityPlayer.dll"),
+                      game("Megabonk/Megabonk.x86_64", "Megabonk/UnityPlayer.so", "Megabonk/GameAssembly.so"),
+                      game("Not Unity/Duckov.exe"),
+                      game("AVA/AVA.exe", "AVA/AVA.ini"))
+            for exe in others:
+                env, extra, notes = MODULE["engine_fixes"](exe, [])
+                self.assertEqual(extra, [], exe)
+                self.assertNotIn("Escape from Duckov: 3 Unity job workers", notes)
+
+    def test_duckov_keeps_a_job_worker_count_it_is_launched_with(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            duckov = self.unity_game(tmp)("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll")
+            # Unity compares command-line keys without case, so any spelling of the key is the game's own.
+            for args in (["-job-worker-count", "5"], ["-screen-width", "1280", "-job-worker-count", "0"], ["-Job-Worker-Count", "6"]):
+                env, extra, notes = MODULE["engine_fixes"](duckov, args)
+                self.assertEqual((extra, notes), ([], self.UNITY_NOTES + ["Escape from Duckov: FEX MonoHacks off"]), args)
+                self.assertEqual(env["FEX_MONOHACKS"], "0")
+            # Other keys and values do not count as the game's own count.
+            for args in (["-job-worker-count-max", "5"], ["--job-worker-count", "5"], ["job-worker-count"], ["3"]):
+                self.assertEqual(MODULE["engine_fixes"](duckov, args)[1], self.DUCKOV_JOB_WORKERS, args)
+
+    def test_duckov_job_workers_reach_the_proton_command_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            duckov = Path(self.unity_game(tmp)("Escape from Duckov/Duckov.exe", "Escape from Duckov/UnityPlayer.dll"))
+            other = Path(self.unity_game(tmp)("Other/Other.exe", "Other/UnityPlayer.dll", "Other/MonoBleedingEdge/"))
+            probe = home / "proton"
+            probe.write_text("#!" + sys.executable + "\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+            probe.chmod(0o755)
+            env = dict(os.environ, HOME=tmp, STEAM_COMPAT_DATA_PATH=str(home / "compatdata/3167020"))
+
+            def launch(exe, *args):
+                result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"), str(probe), "waitforexitandrun", str(exe), *args],
+                                        env=env, text=True, capture_output=True, check=True)
+                return json.loads(result.stdout.strip().splitlines()[-1]), result.stderr
+
+            argv, stderr = launch(duckov)
+            self.assertEqual(argv, ["waitforexitandrun", str(duckov), "-job-worker-count", "3"])
+            self.assertIn("droiddeck-game-env: Escape from Duckov: 3 Unity job workers", stderr)
+            self.assertEqual(launch(duckov, "-screen-fullscreen", "0")[0],
+                             ["waitforexitandrun", str(duckov), "-screen-fullscreen", "0", "-job-worker-count", "3"])
+            argv, stderr = launch(duckov, "-job-worker-count", "8")
+            self.assertEqual(argv, ["waitforexitandrun", str(duckov), "-job-worker-count", "8"])
+            self.assertNotIn("3 Unity job workers", stderr)
+            self.assertEqual(launch(other)[0], ["waitforexitandrun", str(other)])
 
     def test_a_wine_alert_spin_from_the_session_environment_reaches_proton(self):
         with tempfile.TemporaryDirectory() as tmp:

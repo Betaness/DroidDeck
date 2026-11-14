@@ -213,6 +213,18 @@ the lookup caches this changes the code FEX generates for Mono's JIT output, so
 other Mono games keep MonoHacks on. Set `FEX_MONOHACKS=1` in the game's own
 environment to turn it back.
 
+Escape from Duckov is also launched with `-job-worker-count 3`. On a Xring O3
+its Unity player starts 9 `Job.Worker` threads and 10 PhysX dispatcher workers;
+with `job-worker-count=3` in its `boot.config` there were 3 and 4. At half
+resolution (2 runs each, interleaved) that measured 83.18 against 81.10 fps
+(+2.6%; +1.3 fps at the same 1248 MHz GPU clock), 22.67 against 24.65 ms of
+game-thread CPU a frame, 11.03 against 11.24 ms on the main thread, and a
+longest frame in 40 s of 20.8 against 34.7 ms. Its `UnityPlayer.dll`
+(2022.3.62f2) reads `boot.config` and then the command line (`-key value`,
+keys compared without case) into the same settings, so the argument has the
+same key as the file. A `-job-worker-count` in the game's own launch options
+is kept.
+
 Elsewhere Windows sees a game's cores fastest first (Windows CPU 0 is the
 fastest core; `DROIDDECK_FASTEST_CORES=0` turns it off). Where the app forwards
 the GPU (`BL_GPU_MODE=vortek`, Mali) that order is off unless
