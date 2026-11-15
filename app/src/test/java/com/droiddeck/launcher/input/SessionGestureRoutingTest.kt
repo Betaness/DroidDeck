@@ -266,6 +266,7 @@ class SessionGestureRoutingTest {
             @JvmStatic @Implementation fun __staticInitializer__() {}
             @JvmStatic @Implementation fun nativeSendTouch(action: Int, id: Int, x: Int, y: Int) {}
             @JvmStatic @Implementation fun nativeSendSceneInput(type: Int, code: Int, value: Int) {}
+            @JvmStatic @Implementation fun nativeSendPointerDelta(dx: Int, dy: Int, seq: Int) {}
         }
     }
 }

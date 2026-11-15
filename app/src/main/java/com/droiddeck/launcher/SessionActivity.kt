@@ -316,6 +316,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var lastPadInputMs = 0L
     private val cursorBuf = IntArray(WaylandCompositor.CURSOR_BUF_INTS)
     private val cursorPosBuf = IntArray(2)
+    private val cursorSceneBuf = DoubleArray(com.droiddeck.launcher.input.GuestPointerTrack.STATE_SIZE)
+    private val mousePointerBuf = FloatArray(2)
     private var cursorSerial = 0
     private var clientHidesCursor = false
     private var mouseOwnsCursor = false
@@ -357,7 +359,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
             if (mouseOwnsCursor) {
                 if (pointerLocked) return
-                alignCursorToGuest()
+                alignMouseCursorToGuest()
                 if (!clientHidesCursor) cursorVisible = true
                 uiHandler.postDelayed(this, 60)
                 return
@@ -379,6 +381,31 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (kotlin.math.abs(x - cursorPos.x) < 0.75f && kotlin.math.abs(y - cursorPos.y) < 0.75f) return false
         cursorPos = androidx.compose.ui.geometry.Offset(x, y)
         return true
+    }
+
+    /**
+     * The compositor's pointer on the output view, with the mouse motion it has not read yet, into
+     * mousePointerBuf. Scene px are mapped the way the compositor shows the scene, so the drawn cursor
+     * stays on the pointer when the session runs below the output resolution.
+     */
+    private fun guestMousePointer(): Boolean {
+        if (!CompositorHost.isStarted) return false
+        val view = outputView()
+        if (!WaylandCompositor.nativeCursorScene(cursorSceneBuf)) return false
+        return WaylandCompositor.pointerTrack().place(cursorSceneBuf, android.os.SystemClock.uptimeMillis(),
+            view.width, view.height, mousePointerBuf)
+    }
+
+    private fun alignMouseCursorToGuest() {
+        if (pointerLocked) return
+        if (!guestMousePointer()) {
+            alignCursorToGuest()
+            return
+        }
+        val x = mousePointerBuf[0]
+        val y = mousePointerBuf[1]
+        if (kotlin.math.abs(x - cursorPos.x) < 0.75f && kotlin.math.abs(y - cursorPos.y) < 0.75f) return
+        cursorPos = androidx.compose.ui.geometry.Offset(x, y)
     }
     private val uiHandler = Handler(Looper.getMainLooper())
     private var pendingBackAction: Runnable? = null
@@ -3363,8 +3390,12 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun moveCapturedMouse(dx: Float, dy: Float) {
         val rect = drawnRect() ?: return
-        val scale = sceneScale(rect)
         WaylandCompositor.sendPointerDelta(dx, dy)
+        if (guestMousePointer()) {
+            showCursor(mousePointerBuf[0], mousePointerBuf[1], fromMouse = true)
+            return
+        }
+        val scale = sceneScale(rect)
         showCursor(
             (cursorPos.x + dx / scale).coerceIn(rect.left, rect.right),
             (cursorPos.y + dy / scale).coerceIn(rect.top, rect.bottom),

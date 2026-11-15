@@ -1,0 +1,78 @@
+/* Tests of src/pointer_sync.c: cc -O2 -Wall -Wextra -Werror -Isrc tests/pointer_sync_test.c src/pointer_sync.c */
+#include "pointer_sync.h"
+
+#include <math.h>
+#include <stdio.h>
+
+static int failures;
+
+#define CHECK(cond, ...)                                              \
+    do {                                                              \
+        if (!(cond)) {                                                \
+            failures++;                                               \
+            fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__);      \
+            fprintf(stderr, __VA_ARGS__);                             \
+            fputc('\n', stderr);                                      \
+        }                                                             \
+    } while (0)
+
+static int near(double a, double b) { return fabs(a - b) < 1e-9; }
+
+static void motion(void) {
+    /* locked: relative motion only, as before */
+    for (int rel = 0; rel < 2; rel++)
+        for (int consumed = 0; consumed < 2; consumed++)
+            for (int moved = 0; moved < 2; moved++)
+                for (int desktop = 0; desktop < 2; desktop++)
+                    CHECK(ptrsync_motion(1, rel, consumed, moved, desktop) == 0,
+                          "locked: no motion and no catch-up (rel %d consumed %d moved %d desktop %d)",
+                          rel, consumed, moved, desktop);
+    CHECK(ptrsync_motion(0, 1, 1, 1, 0) == PTRSYNC_BEHIND, "consumed delta: no motion, the position falls behind");
+    CHECK(ptrsync_motion(0, 1, 1, 1, 1) == 0, "consumed delta on the desktop: no motion, nothing marked");
+    CHECK(ptrsync_motion(0, 1, 0, 1, 0) == PTRSYNC_MOTION, "delta without a relative pointer: motion");
+    CHECK(ptrsync_motion(0, 1, 0, 0, 0) == 0, "button without motion: none");
+    CHECK(ptrsync_motion(0, 0, 0, 0, 0) == PTRSYNC_MOTION, "absolute position: motion");
+    CHECK(ptrsync_motion(0, 0, 1, 1, 0) == PTRSYNC_MOTION, "absolute position with relative motion: motion");
+    CHECK(ptrsync_motion(0, 0, 1, 1, 1) == PTRSYNC_MOTION, "absolute position on the desktop: motion");
+}
+
+static void catch_up(void) {
+    CHECK(ptrsync_catch_up(0, 1), "behind: caught up");
+    CHECK(!ptrsync_catch_up(0, 0), "up to date: nothing");
+    CHECK(!ptrsync_catch_up(1, 1), "locked: nothing, also when behind");
+}
+
+static void scene_map(void) {
+    double m[4] = { 0 };
+    /* a 1704x1136 scene stretched over a 3408x2272 output: one scene px is two output px */
+    CHECK(ptrsync_scene_map(1, 0, 0, 2, 2, 3408, 2272, 1704, 1136, m), "shown scene");
+    CHECK(near(m[0] * 1704, 1.0) && near(m[1], 0) && near(m[2] * 1136, 1.0) && near(m[3], 0),
+          "stretched: %g %g %g %g", m[0], m[1], m[2], m[3]);
+    CHECK(near((m[0] * 783 + m[1]) * 3408, 1566), "scene x 783 at output x 1566");
+
+    /* 1280x720 fitted into 3408x2272 at 2.6625, 3408x1917 at y 177 */
+    double k = 3408.0 / 1280;
+    CHECK(ptrsync_scene_map(1, 0, 177, k, 177 + k, 3408, 2272, 1280, 720, m), "letterboxed scene");
+    CHECK(near((m[2] * 0 + m[3]) * 2272, 177) && near((m[2] * 720 + m[3]) * 2272, 177 + 720 * k),
+          "letterboxed: top %g bottom %g", (m[2] * 0 + m[3]) * 2272, (m[2] * 720 + m[3]) * 2272);
+    CHECK(near((m[0] * 640 + m[1]) * 3408, 1704), "letterboxed: centre column");
+
+    CHECK(ptrsync_scene_map(0, 0, 0, 0, 0, 0, 0, 1704, 1136, m), "not shown yet");
+    CHECK(near(m[0], 1.0 / 1704) && near(m[1], 0) && near(m[2], 1.0 / 1136) && near(m[3], 0),
+          "not shown: the scene fills the output");
+    CHECK(ptrsync_scene_map(1, 5, 5, 5, 5, 3408, 2272, 1704, 1136, m) && near(m[0], 1.0 / 1704),
+          "a degenerate mapping falls back to the scene");
+    CHECK(!ptrsync_scene_map(1, 0, 0, 2, 2, 3408, 2272, 0, 1136, m), "no scene: no mapping");
+}
+
+int main(void) {
+    motion();
+    catch_up();
+    scene_map();
+    if (failures) {
+        fprintf(stderr, "%d failure(s)\n", failures);
+        return 1;
+    }
+    printf("pointer_sync_test: ok\n");
+    return 0;
+}

@@ -32,6 +32,7 @@
 #include "pointer-constraints-unstable-v1-server-protocol.h"
 #include "relative-pointer-unstable-v1-server-protocol.h"
 #include "vk_present.h"
+#include "pointer_sync.h"
 #include "framegen_bridge.h"
 #include <pthread.h>
 #include "effects_chain.h"
@@ -508,7 +509,8 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
 }
 
 
-struct seat_pointer { struct wl_resource *ptr; struct wl_resource *focus; };
+/* behind: relative motion moved the pointer without wl_pointer.motion (pointer_sync.h) */
+struct seat_pointer { struct wl_resource *ptr; struct wl_resource *focus; int behind; };
 struct seat_keyboard { struct wl_resource *kb; struct wl_resource *focus; };
 struct seat_touch { struct wl_resource *touch; struct wl_resource *focus; };
 #define MAX_PTRS 32
@@ -2643,7 +2645,7 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
     struct wl_resource *p = wl_resource_create(c, &wl_pointer_interface, wl_resource_get_version(r), id);
     if (!p) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p, &pointer_impl, NULL, pointer_res_destroy);
-    if (g_nptrs < MAX_PTRS) { g_ptrs[g_nptrs].ptr = p; g_ptrs[g_nptrs].focus = NULL; g_nptrs++; }
+    if (g_nptrs < MAX_PTRS) { g_ptrs[g_nptrs].ptr = p; g_ptrs[g_nptrs].focus = NULL; g_ptrs[g_nptrs].behind = 0; g_nptrs++; }
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct wl_resource *k = wl_resource_create(c, &wl_keyboard_interface, wl_resource_get_version(r), id);
@@ -2733,6 +2735,7 @@ static void pointer_focus(struct wl_resource *target, wl_fixed_t fx, wl_fixed_t 
     for_each_pointer_of(client, sp) {
         if (sp->focus == target) continue;
         sp->focus = target;
+        sp->behind = 0;
         wl_pointer_send_enter(sp->ptr, wl_display_next_serial(g_display), target, fx, fy);
         entered = 1;
     }
@@ -2790,6 +2793,8 @@ struct relative_pointer {
 static struct wl_list g_relative_pointers;
 
 static double g_ptr_x, g_ptr_y;
+/* The number Android gave the last pointer delta read (scene input 6), 0 before the first. */
+static uint32_t g_delta_seq;
 static int g_ptr_known;
 static double g_raw_x, g_raw_y;
 static int g_raw_valid;
@@ -3199,12 +3204,11 @@ static void relative_pointers_pointer_gone(struct wl_resource *pointer) {
         if (rp->pointer == pointer) rp->pointer = NULL;
 }
 
-static int send_relative_motion(struct wl_client *client, double dx, double dy) {
+static int relative_motion_to(struct wl_client *client, double dx, double dy) {
     struct relative_pointer *rp;
     struct timespec ts;
     uint64_t ut;
     int sent = 0;
-    if (dx == 0 && dy == 0) return 0;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     ut = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000;
     wl_list_for_each(rp, &g_relative_pointers, link) {
@@ -3217,6 +3221,26 @@ static int send_relative_motion(struct wl_client *client, double dx, double dy) 
     return sent;
 }
 
+static int send_relative_motion(struct wl_client *client, double dx, double dy) {
+    if (dx == 0 && dy == 0) return 0;
+    return relative_motion_to(client, dx, dy);
+}
+
+/* Before a button or wheel event: a client whose position is behind (pointer_sync.h) gets it, at (fx, fy) on
+ * its focus. The zero relative motion in the same frame makes Xwayland move its X pointer without raw motion. */
+static void pointer_catch_up(struct wl_client *client, int locked, wl_fixed_t fx, wl_fixed_t fy, uint32_t t) {
+    struct seat_pointer *sp;
+    int behind = 0;
+    for_each_pointer_of(client, sp) behind |= sp->behind;
+    if (!ptrsync_catch_up(locked, behind)) return;
+    relative_motion_to(client, 0, 0);
+    for_each_pointer_of(client, sp) {
+        wl_pointer_send_motion(sp->ptr, t, fx, fy);
+        if (wl_resource_get_version(sp->ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(sp->ptr);
+        sp->behind = 0;
+    }
+}
 
 static void pointer_input(double x, double y, int relative, uint32_t button, int pressed) {
     struct surface *target;
@@ -3269,9 +3293,18 @@ static void pointer_input(double x, double y, int relative, uint32_t button, int
     uint32_t t = now_ms();
 
     pointer_focus(target->resource, fx, fy);
+    const int locked = k && k->is_lock;
     int rel_consumed = send_relative_motion(client, dx, dy);
-    if (!(k && k->is_lock) && !(relative && rel_consumed) && (!relative || dx != 0 || dy != 0))
-        for_each_pointer_of(client, sp) wl_pointer_send_motion(sp->ptr, t, fx, fy);
+    int sync = ptrsync_motion(locked, relative, rel_consumed, dx != 0 || dy != 0, target == g_desktop);
+    if (sync == PTRSYNC_MOTION) {
+        for_each_pointer_of(client, sp) {
+            wl_pointer_send_motion(sp->ptr, t, fx, fy);
+            sp->behind = 0;
+        }
+    } else if (sync == PTRSYNC_BEHIND) {
+        for_each_pointer_of(client, sp) sp->behind = 1;
+    }
+    if (button && relative) pointer_catch_up(client, locked, fx, fy, t);
     for_each_pointer_of(client, sp) {
         if (button)
             wl_pointer_send_button(sp->ptr, wl_display_next_serial(g_display), t, button,
@@ -3291,7 +3324,9 @@ static void pointer_event(double x, double y, uint32_t button, int pressed) {
     pointer_input(x, y, 0, button, pressed);
 }
 
-static void pointer_delta(double dx, double dy) {
+/* seq: the delta's number from Android, 0 for none. */
+static void pointer_delta(double dx, double dy, uint32_t seq) {
+    if (seq) g_delta_seq = seq;
     pointer_input(dx, dy, 1, 0, 0);
 }
 
@@ -3300,12 +3335,27 @@ static void pointer_forget_origin(void) {
     g_raw_valid = 0;
 }
 
+/* pointer_catch_up for every client that has the pointer focus. */
+static void pointer_catch_up_focused(uint32_t t) {
+    const int locked = g_active_constraint && g_active_constraint->is_lock;
+    for (int i = 0; i < g_nptrs; i++) {
+        struct seat_pointer *sp = &g_ptrs[i];
+        if (!sp->focus || !sp->behind) continue;
+        struct surface *s = wl_resource_get_user_data(sp->focus);
+        int tx = 0, ty = 0;
+        if (s && s != g_desktop && s->placed) { tx = s->x; ty = s->y; }
+        pointer_catch_up(wl_resource_get_client(sp->ptr), locked,
+                         wl_fixed_from_double(g_ptr_x - tx), wl_fixed_from_double(g_ptr_y - ty), t);
+    }
+}
+
 static void pointer_button(uint32_t button, int pressed) {
     if (pressed) {
         pointer_input(0, 0, 1, button, pressed);
         return;
     }
     uint32_t t = now_ms();
+    pointer_catch_up_focused(t);
     for (int i = 0; i < g_nptrs; i++) {
         struct seat_pointer *sp = &g_ptrs[i];
         if (!sp->focus) continue;
@@ -3417,8 +3467,13 @@ struct query_snapshot {
     int has_position;
     int input_x, input_y;
     int focus_takes_touch;
+    /* the pointer in scene px, the scene size, ptrsync_scene_map's mapping and the last delta number read */
+    double ptr_x, ptr_y;
+    int scene_w, scene_h;
+    double map[4];
+    uint32_t delta_seq;
 };
-static struct query_snapshot g_query = { 0, 0, 0, 1 };
+static struct query_snapshot g_query = { 0, 0, 0, 1, 0, 0, 0, 0, { 0, 0, 0, 0 }, 0 };
 
 static void publish_query_state(void) {
     struct surface *target = g_key_target ? g_key_target : (g_grab ? g_grab : toplevel_at(g_ptr_x, g_ptr_y));
@@ -3430,10 +3485,11 @@ static void publish_query_state(void) {
         for_each_touch_of(client, st) takes_touch = 1;
     }
     int w = 0, h = 0, ow = 0, oh = 0, input_x = 0, input_y = 0, has_position = 0;
+    double map[4] = { 0, 0, 0, 0 };
     scene_size(&w, &h);
     vkp_output_size(&ow, &oh);
     if (g_ptr_known && w > 0 && h > 0) {
-        double ox, oy;
+        double ox, oy, o0x = 0, o0y = 0, o1x = 0, o1y = 0;
         if (ow > 0 && oh > 0 && vkp_scene_to_output(g_ptr_x, g_ptr_y, &ox, &oy)) {
             input_x = (int)(ox * INPUT_SPACE_W / ow);
             input_y = (int)(oy * INPUT_SPACE_H / oh);
@@ -3441,6 +3497,8 @@ static void publish_query_state(void) {
             input_x = (int)(g_ptr_x * INPUT_SPACE_W / w);
             input_y = (int)(g_ptr_y * INPUT_SPACE_H / h);
         }
+        int shown = ow > 0 && oh > 0 && vkp_scene_to_output(0, 0, &o0x, &o0y) && vkp_scene_to_output(1, 1, &o1x, &o1y);
+        ptrsync_scene_map(shown, o0x, o0y, o1x, o1y, ow, oh, w, h, map);
         has_position = 1;
     }
     pthread_mutex_lock(&g_query_lock);
@@ -3448,6 +3506,12 @@ static void publish_query_state(void) {
     g_query.has_position = has_position;
     g_query.input_x = input_x;
     g_query.input_y = input_y;
+    g_query.ptr_x = g_ptr_x;
+    g_query.ptr_y = g_ptr_y;
+    g_query.scene_w = w;
+    g_query.scene_h = h;
+    memcpy(g_query.map, map, sizeof(map));
+    g_query.delta_seq = g_delta_seq;
     pthread_mutex_unlock(&g_query_lock);
 }
 
@@ -3466,6 +3530,21 @@ int droiddeck_cursor_input_pos(int *x, int *y) {
     if (!has_position) return 0;
     *x = input_x;
     *y = input_y;
+    return 1;
+}
+
+/* out: pointer x, y (scene px), scene width, height, the four ptrsync_scene_map values, the last delta number. */
+int droiddeck_cursor_scene_state(double out[9]) {
+    pthread_mutex_lock(&g_query_lock);
+    struct query_snapshot q = g_query;
+    pthread_mutex_unlock(&g_query_lock);
+    if (!q.has_position) return 0;
+    out[0] = q.ptr_x;
+    out[1] = q.ptr_y;
+    out[2] = q.scene_w;
+    out[3] = q.scene_h;
+    memcpy(out + 4, q.map, sizeof(q.map));
+    out[8] = q.delta_seq;
     return 1;
 }
 
@@ -3597,7 +3676,9 @@ static void axis_event(int vertical120, int horizontal120, int finger) {
     int tx = 0, ty = 0;
     if (target != g_desktop && target->placed) { tx = target->x; ty = target->y; }
     uint32_t t = now_ms();
-    pointer_focus(target->resource, wl_fixed_from_double(g_ptr_x - tx), wl_fixed_from_double(g_ptr_y - ty));
+    wl_fixed_t fx = wl_fixed_from_double(g_ptr_x - tx), fy = wl_fixed_from_double(g_ptr_y - ty);
+    pointer_focus(target->resource, fx, fy);
+    pointer_catch_up(client, g_active_constraint && g_active_constraint->is_lock, fx, fy, t);
     for_each_pointer_of(client, sp) {
         int version = wl_resource_get_version(sp->ptr);
         if (!finger) {
@@ -3719,7 +3800,7 @@ static int on_input_readable(int fd, uint32_t mask, void *data) {
         case 3: pointer_button(m.p1, m.p2); break;
         case 4: scroll_event(m.p1); break;
         case 5: vsync = 1; vsync_ns = ((int64_t)m.p1 << 32) | (uint32_t)m.p2; break;
-        case 6: pointer_delta(m.p1 / 256.0, m.p2 / 256.0); break;
+        case 6: pointer_delta(m.p1 / 256.0, m.p2 / 256.0, (uint32_t)m.p3); break;
         case 7: deliver_touch(&m); break;
         case 8: output_resized(); break;
         case 9:
@@ -3803,6 +3884,14 @@ void droiddeck_wayland_vsync(int64_t frame_time_ns) {
 void droiddeck_wayland_send_scene_input(int type, int a, int b) {
     if (g_input_pipe[1] < 0) return;
     struct input_msg m = { type, a, b, 0, 0 };
+    ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
+    (void)n;
+}
+
+/* A pointer delta in 1/256 scene px; seq: its number, published with the pointer once it is read. */
+void droiddeck_wayland_send_pointer_delta(int dx, int dy, int seq) {
+    if (g_input_pipe[1] < 0) return;
+    struct input_msg m = { 6, dx, dy, seq, 0 };
     ssize_t n = write(g_input_pipe[1], &m, sizeof(m));
     (void)n;
 }
@@ -3987,7 +4076,7 @@ static void test_input_line(const char *line) {
     }
     if (n < 3) return;
     if (!strcmp(cmd, "move")) pointer_event(x, y, 0, 0);
-    else if (!strcmp(cmd, "rel")) pointer_delta(x, y);
+    else if (!strcmp(cmd, "rel")) pointer_delta(x, y, 0);
     else if (!strcmp(cmd, "down")) pointer_event(x, y, BTN_LEFT, 1);
     else if (!strcmp(cmd, "up")) pointer_event(x, y, BTN_LEFT, 0);
     else if (!strcmp(cmd, "rdown")) pointer_event(x, y, BTN_RIGHT, 1);

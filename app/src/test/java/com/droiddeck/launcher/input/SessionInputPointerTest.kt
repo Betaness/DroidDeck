@@ -278,6 +278,7 @@ class SessionInputPointerTest {
             @JvmStatic @Implementation fun __staticInitializer__() {}
             @JvmStatic @Implementation fun nativeSendPointer(action: Int, x: Int, y: Int) { pointers += Triple(action, x, y) }
             @JvmStatic @Implementation fun nativeSendSceneInput(type: Int, code: Int, value: Int) { events += Triple(type, code, value) }
+            @JvmStatic @Implementation fun nativeSendPointerDelta(dx: Int, dy: Int, seq: Int) { events += Triple(6, dx, dy) }
             @JvmStatic @Implementation fun nativeSendKey(code: Int, value: Int) { keys += code to value }
         }
     }

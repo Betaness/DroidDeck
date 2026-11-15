@@ -192,6 +192,9 @@ public final class WaylandCompositor {
 
     public static native boolean nativeCursorInputPos(int[] out);
 
+    /** The pointer in scene px with the scene and its place on the output; layout in GuestPointerTrack. */
+    public static native boolean nativeCursorScene(double[] out);
+
     public static native void nativeVsync(long frameTimeNanos);
 
     public static native int nativeCompositorTid();
@@ -347,6 +350,8 @@ public final class WaylandCompositor {
 
     public static native void nativeSendSceneInput(int type, int a, int b);
 
+    public static native void nativeSendPointerDelta(int dx, int dy, int seq);
+
     public static final int FG_ENGINE_LSFG = 0, FG_ENGINE_DDFG = 1, FG_ENGINE_ZEROFG = 2;
 
     /** [mali-g2] ZeroFG's engines (zerofg_glue.h ZFG_MODE_*). */
@@ -392,9 +397,23 @@ public final class WaylandCompositor {
 
     public static native int nativeStreamFrames();
 
+    private static final class Track {
+        static final com.droiddeck.launcher.input.GuestPointerTrack INSTANCE =
+                new com.droiddeck.launcher.input.GuestPointerTrack();
+    }
+
+    /** The relative motion sent, until the compositor has read it. */
+    public static com.droiddeck.launcher.input.GuestPointerTrack pointerTrack() {
+        return Track.INSTANCE;
+    }
+
+    private static void sendDelta(int x, int y) {
+        nativeSendPointerDelta(x, y, pointerTrack().add(x, y, android.os.SystemClock.uptimeMillis()));
+    }
+
     public static void sendPointerDelta(int dx, int dy) {
         if (dx == 0 && dy == 0) return;
-        nativeSendSceneInput(6, dx * 256, dy * 256);
+        sendDelta(dx * 256, dy * 256);
     }
 
     /** The next absolute pointer position sends no relative motion (Android moved its pointer meanwhile). */
@@ -412,6 +431,6 @@ public final class WaylandCompositor {
         if (x == 0 && y == 0) return;
         pendingDeltaX -= x;
         pendingDeltaY -= y;
-        nativeSendSceneInput(6, x, y);
+        sendDelta(x, y);
     }
 }

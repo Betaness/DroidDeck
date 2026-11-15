@@ -23,6 +23,13 @@ static void wl_pointer_send_button(struct wl_resource *r, uint32_t serial,
     r->held &= ~(1u << (button - 0x110));
     r->releases++;
 }
+static unsigned catch_ups, releases_before_catch_up;
+static struct wl_resource *first_pointer;
+static void pointer_catch_up_focused(uint32_t t) {
+    assert(t == 42);
+    catch_ups++;
+    releases_before_catch_up += first_pointer->releases;
+}
 static void pointer_input(double x, double y, int relative, uint32_t button, int pressed) {
     assert(x == 0 && y == 0 && relative == 1 && button >= 0x110 && button <= 0x112);
     assert(pressed == 1);
@@ -49,6 +56,7 @@ int main(int argc, char **argv) {
     g_ptrs[1] = (struct seat_pointer){&b, &surface};
     g_ptrs[2] = (struct seat_pointer){&other, NULL};
     g_grab = &surface;
+    first_pointer = &a;
     if (!strcmp(argv[1], "fallback") || !strcmp(argv[1], "native")) {
         int fallback = !strcmp(argv[1], "fallback");
         g_touches[0] = (struct seat_touch){&a, &surface};
@@ -62,6 +70,7 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[1], "press")) {
         pointer_button(0x110, 1);
         assert(motion_calls == 1 && !a.releases && g_grab == &surface);
+        assert(!catch_ups);
     } else if (!strcmp(argv[1], "unfocused")) {
         g_ptrs[0].focus = g_ptrs[1].focus = NULL;
         pointer_button(0x110, 0);
@@ -72,6 +81,7 @@ int main(int argc, char **argv) {
         assert(!motion_calls && !a.held && !b.held && other.held == 7);
         assert(a.releases == 3 && b.releases == 3 && !other.releases);
         assert(!g_grab && flushes == 3);
+        assert(catch_ups == 3 && releases_before_catch_up == 0 + 1 + 2);
     } else {
         assert(!strcmp(argv[1], "focused"));
         a.held = b.held = 1;
@@ -81,6 +91,7 @@ int main(int argc, char **argv) {
         assert(a.frames == 1 && !b.frames && !other.frames);
         assert(g_ptrs[0].focus == &surface && g_ptrs[1].focus == &surface);
         assert(!g_grab && flushes == 1);
+        assert(catch_ups == 1 && releases_before_catch_up == 0);
     }
     puts("PASS");
 }

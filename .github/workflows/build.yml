@@ -364,6 +364,12 @@ jobs:
           W=app/src/main/cpp/waylandcomp
           cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/zerofg_pace_test $W/tests/zerofg_pace_test.c $W/src/zerofg_pace.c -lm
           mali-g2/vortek/out/zerofg_pace_test
+      - name: Compositor pointer sync test (mali-g2)
+        run: |
+          set -euo pipefail
+          W=app/src/main/cpp/waylandcomp
+          cc -O2 -Wall -Wextra -Werror -I$W/src -o mali-g2/vortek/out/pointer_sync_test $W/tests/pointer_sync_test.c $W/src/pointer_sync.c -lm
+          mali-g2/vortek/out/pointer_sync_test
       - uses: actions/upload-artifact@v4
         with:
           name: vortek-client
