@@ -67,6 +67,26 @@ int main(int argc, char **argv) {
       if (r == FP_SLOW) puts("SLOW");
       else if (r < 0) printf("E%ld\n", -r);
       else printf("%ld\n", r);
+    } else if (!strcmp(op, "rawx")) {
+      // getxattr through the raw-syscall dispatcher; name "bad" is an unmapped pointer, "edge" an
+      // unterminated "user." name that ends at an unmapped page.
+#if defined(__aarch64__)
+      long reg[9] = {0}, pg = sysconf(_SC_PAGESIZE);
+      char *edge = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      munmap(edge + pg, pg);
+      memcpy(edge + pg - 8, "user.abc", 8);
+      reg[0] = (long)argv[i + 2];
+      reg[1] = !strcmp(argv[i + 3], "bad") ? 8 : !strcmp(argv[i + 3], "edge") ? (long)(edge + pg - 8) : (long)argv[i + 3];
+      reg[8] = !strcmp(argv[i + 1], "F") ? SYS_getxattr : SYS_lgetxattr;
+      long r = svc_path_call(reg);
+      if (r == FP_SLOW) puts("SLOW");
+      else if (r < 0) printf("E%ld\n", -r);
+      else printf("%ld\n", r);
+      munmap(edge, pg);
+#else
+      puts("NOSVC");
+#endif
+      i += 3;
     } else if (!strcmp(op, "count")) {
       printf("%lu %lu\n", calls, xattr_calls);
       calls = xattr_calls = 0;
@@ -314,6 +334,79 @@ class FastPathDotDotTest(unittest.TestCase):
         self.assertEqual(out[11:14], [t, t, t])
         self.assertEqual(out[14], other)
         self.assertEqual(out[15:18], ["E2", t, other])
+
+    def test_an_entry_built_on_a_cached_parent_expires_with_it(self):
+        r = self.root
+        for d in ["rp/v1/a/b/c", "rp/v2/a/b/c"]:
+            (r / d).mkdir(parents=True)
+        for f in ["rp/v1/a/f", "rp/v2/a/f"]:
+            (r / f).touch()
+        os.symlink("v1", r / "rp/cur")
+        try:
+            queries = [
+                ("ttl", 300),
+                ("stat", "L", "/rp/cur/zz"),
+                ("unlink", r / "rp/cur"), ("symlink", "v2", r / "rp/cur"),
+                ("nap", 150),
+                ("stat", "F", "/rp/cur/a/.."),
+                ("nap", 250),
+                ("stat", "F", "/rp/cur/a/.."),
+                ("stat", "L", "/rp/cur/a/f"),
+                ("stat", "F", "/rp/cur/a/b/.."),
+                ("nap", 150),
+                ("stat", "F", "/rp/cur/a/b/c/.."),
+            ]
+            new = self.ask(*queries)
+            os.unlink(r / "rp/cur")
+            os.symlink("v1", r / "rp/cur")
+            old = self.ask(*queries, env={"PROOT_FP_DOTDOT": "0"})
+            want = [self.kernel("rp/v2"), self.kernel("rp/v2/a/f"), self.kernel("rp/v2/a"), self.kernel("rp/v2/a/b")]
+            self.assertIn(new[1], [self.kernel("rp/v1"), self.kernel("rp/v2")])
+            self.assertEqual(new[2:], want)
+            self.assertEqual(old[2:], want)
+        finally:
+            shutil.rmtree(r / "rp")
+
+    def test_symbolic_links_are_counted_over_the_whole_path(self):
+        r = self.root
+        (r / "lk/a/b/c/d").mkdir(parents=True)
+        for where, name, target in [("lk", "k", "a"), ("lk/a", "m", "b"), ("lk/a/b", "n", "c"), ("lk/a/b/c", "o", "d")]:
+            os.symlink(target, r / where / (name + "0"))
+            for k in range(1, 16):
+                os.symlink("%s%d" % (name, k - 1), r / where / ("%s%d" % (name, k)))
+        try:
+            looping = ["/lk/k15/m15/../m15", "/lk/k15/m15/n15/..", "/lk/k15/m15/n15", "/lk/k15/m15/n15/o15/..",
+                       "/lk/k15/m15/n15/o15/zz"]
+            for p in looping:
+                with self.assertRaises(OSError) as e:
+                    os.stat(str(r) + p)
+                self.assertEqual(e.exception.errno, 40, p)
+            queries = []
+            for _ in range(2):
+                queries += [("stat", "F", "/lk/k15/m15/..")] + [("stat", "F", p) for p in looping]
+            out = self.ask(*queries)
+            n = 1 + len(looping)
+            self.assertEqual(out[:n], out[n:])
+            self.assertEqual(out[0], self.kernel("lk/a"))
+            self.assertEqual(out[1:n], ["SLOW"] * len(looping))
+        finally:
+            shutil.rmtree(r / "lk")
+
+    def test_a_raw_getxattr_reads_the_name_through_the_dispatcher(self):
+        out = self.ask(("rawx", "F", "/x/old2", "user.q"), ("rawx", "F", "/x/old2", "bad"),
+                       ("rawx", "L", "/x/old2", "bad"), ("rawx", "F", "/x/old2", "edge"),
+                       ("rawx", "F", "/x/old2", ""), ("rawx", "F", "/x/missing", "bad"))
+        if out[0] == "NOSVC":
+            self.skipTest("the raw-syscall dispatcher is built only for aarch64")
+        try:
+            os.getxattr(self.root / "x/old2", "user.q")
+            first = None
+        except OSError as e:
+            first = "E%d" % e.errno
+        self.assertEqual(out[0], first)
+        self.assertEqual(out[1:4], ["SLOW"] * 3)
+        self.assertEqual(out[4], "E34")
+        self.assertEqual(out[5], "SLOW")
 
     def test_random_paths_match_the_full_walk(self):
         names = ["d", "e", "g", "h", "f", "file", "rel", "chain", "abs", "fl", "up", "dangling", "missing",

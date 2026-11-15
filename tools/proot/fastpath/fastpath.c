@@ -36,6 +36,8 @@
 #define MAX_BINDS 256
 #define FP_SLOW (-100000L)
 #define MAX_LINKS 16
+// The kernel's MAXSYMLINKS: more symbolic links than this over a whole path is ELOOP.
+#define MAX_PATH_LINKS 40
 
 typedef long (*stub_fn)(long nr, long a, long b, long c, long d, long e, long f);
 static stub_fn fp_sys;
@@ -452,7 +454,7 @@ static long detranslated(char *text, const char *at) {
 
 #define SLOTS 512
 #define SLOT_PATH 256
-struct slot { long long stamp; unsigned hash; unsigned gen; int direct; char literal[SLOT_PATH]; char guest[SLOT_PATH]; };
+struct slot { long long stamp; unsigned hash; unsigned gen; int direct; int links; char literal[SLOT_PATH]; char guest[SLOT_PATH]; };
 static struct slot cache[SLOTS];
 static unsigned generation;
 
@@ -469,32 +471,6 @@ static unsigned hash_of(const char *s) {
 }
 
 static void forget(void) { __atomic_add_fetch(&generation, 1, __ATOMIC_RELEASE); }
-
-// direct: the last component of the literal path was not a symbolic link when it was resolved.
-static int cached(const char *literal, unsigned h, char *guest, int *direct) {
-  if (ttl_ns <= 0 || pthread_mutex_trylock(&cache_lock) != 0) return 0;
-  struct slot *e = &cache[h % SLOTS];
-  int hit = e->stamp && e->hash == h && e->gen == __atomic_load_n(&generation, __ATOMIC_ACQUIRE)
-         && now_ns() - e->stamp < ttl_ns && strcmp(e->literal, literal) == 0;
-  if (hit) memcpy(guest, e->guest, strlen(e->guest) + 1);
-  if (hit && direct) *direct = e->direct;
-  pthread_mutex_unlock(&cache_lock);
-  return hit;
-}
-
-static void remember(const char *literal, unsigned h, const char *guest, int direct) {
-  if (ttl_ns <= 0 || strlen(literal) >= SLOT_PATH || strlen(guest) >= SLOT_PATH) return;
-  unsigned gen = __atomic_load_n(&generation, __ATOMIC_ACQUIRE);
-  if (pthread_mutex_trylock(&cache_lock) != 0) return;
-  struct slot *e = &cache[h % SLOTS];
-  e->hash = h;
-  e->gen = gen;
-  e->direct = direct;
-  strcpy(e->literal, literal);
-  strcpy(e->guest, guest);
-  e->stamp = now_ns();
-  pthread_mutex_unlock(&cache_lock);
-}
 
 static int binding_below(const char *g) {
   size_t len = strlen(g);
@@ -514,7 +490,41 @@ struct res {
   int moving;
   int magic;
   int final_link;
+  int links;       // symbolic links followed since "/"
+  long long since; // 0, or the stamp of the cached entry the answer was built on
 };
+
+// direct: the last component of the literal path was not a symbolic link when it was resolved.
+static int cached(const char *literal, unsigned h, struct res *r, int *direct) {
+  if (ttl_ns <= 0 || pthread_mutex_trylock(&cache_lock) != 0) return 0;
+  struct slot *e = &cache[h % SLOTS];
+  int hit = e->stamp && e->hash == h && e->gen == __atomic_load_n(&generation, __ATOMIC_ACQUIRE)
+         && now_ns() - e->stamp < ttl_ns && strcmp(e->literal, literal) == 0;
+  if (hit) {
+    memcpy(r->guest, e->guest, strlen(e->guest) + 1);
+    r->links = e->links;
+    r->since = e->stamp;
+    if (direct) *direct = e->direct;
+  }
+  pthread_mutex_unlock(&cache_lock);
+  return hit;
+}
+
+// An entry built on another cached entry keeps that entry's stamp, so it expires with it.
+static void remember(const char *literal, unsigned h, const struct res *r, int direct) {
+  if (ttl_ns <= 0 || strlen(literal) >= SLOT_PATH || strlen(r->guest) >= SLOT_PATH) return;
+  unsigned gen = __atomic_load_n(&generation, __ATOMIC_ACQUIRE);
+  if (pthread_mutex_trylock(&cache_lock) != 0) return;
+  struct slot *e = &cache[h % SLOTS];
+  e->hash = h;
+  e->gen = gen;
+  e->direct = direct;
+  e->links = r->links;
+  strcpy(e->literal, literal);
+  strcpy(e->guest, r->guest);
+  e->stamp = r->since ? r->since : now_ns();
+  pthread_mutex_unlock(&cache_lock);
+}
 
 static int gone(const char *h, size_t n) {
   return n > 10 && strcmp(h + n - 10, " (deleted)") == 0;
@@ -652,7 +662,7 @@ static long walk(struct res *r, const char *text, int follow, int last) {
     if (S_ISLNK(r->st.st_mode) && (!final || follow)) {
       char target[PATH_MAX];
       long t;
-      if (++links > MAX_LINKS || binding_below(r->guest)) return FP_SLOW;
+      if (++links > MAX_LINKS || ++r->links > MAX_PATH_LINKS || binding_below(r->guest)) return FP_SLOW;
       if (final) r->final_link = 1;
       if (under(r->guest, "/proc", 5)) {
         t = proc_link(r, target, final && last);
@@ -725,7 +735,7 @@ static long dir_or_error(const struct res *r, long w) {
 
 static int cached_dir(struct res *r, const char *literal, unsigned h) {
   int direct = 0;
-  return cached(literal, h, r->guest, &direct) && direct && to_host(r->guest, r->host, NULL) == 0
+  return cached(literal, h, r, &direct) && direct && to_host(r->guest, r->host, NULL) == 0
       && sc(SYS_newfstatat, AT_FDCWD, (long)r->host, (long)&r->st, AT_SYMLINK_NOFOLLOW, 0) == 0
       && S_ISDIR(r->st.st_mode);
 }
@@ -742,18 +752,20 @@ static long before_dotdot(struct res *r, char *norm, size_t split) {
     char *slash = strrchr(norm, '/');
     strcpy(r->guest, "/");
     r->moving = 0;
+    r->links = 0;
+    r->since = 0;
     if (slash != norm) {
       *slash = 0;
       unsigned hp = hash_of(norm);
-      if (!cached(norm, hp, r->guest, NULL)) {
+      if (!cached(norm, hp, r, NULL)) {
         w = dir_or_error(r, walk(r, norm, 1, 0));
-        if (w == 0) remember(norm, hp, r->guest, !r->final_link);
+        if (w == 0) remember(norm, hp, r, !r->final_link);
       }
       *slash = '/';
     }
     if (w == 0) {
       w = dir_or_error(r, walk(r, slash + 1, 1, 0));
-      if (w == 0) remember(norm, h, r->guest, !r->final_link);
+      if (w == 0) remember(norm, h, r, !r->final_link);
     }
   }
   norm[split] = keep;
@@ -789,6 +801,8 @@ static long resolve_in(const char *base, const char *path, int follow, struct re
   strcpy(r->guest, "/");
   r->moving = 0;
   r->magic = 0;
+  r->links = 0;
+  r->since = 0;
   long w;
   char *slash = strrchr(norm, '/');
   long d = split > 0 && dotdot_fast && ttl_ns > 0 ? before_dotdot(r, norm, split) : FP_SLOW;
@@ -800,11 +814,13 @@ static long resolve_in(const char *base, const char *path, int follow, struct re
     strcpy(r->guest, "/");
     r->moving = 0;
     r->magic = 0;
+    r->links = 0;
+    r->since = 0;
     w = walk(r, o ? norm : "/", follow || trailing, 1);
   } else {
     *slash = 0;
     unsigned h = hash_of(norm);
-    if (!cached(norm, h, r->guest, NULL)) {
+    if (!cached(norm, h, r, NULL)) {
       w = walk(r, norm, 1, 0);
       if (w == FP_SLOW && !trailing) {
         *slash = '/';
@@ -812,7 +828,7 @@ static long resolve_in(const char *base, const char *path, int follow, struct re
       }
       if (w < 0) return w;
       if (w != GLUE && !S_ISDIR(r->st.st_mode)) return -ENOTDIR;
-      if (!r->moving) remember(norm, h, r->guest, w == 0 && !r->final_link);
+      if (!r->moving) remember(norm, h, r, w == 0 && !r->final_link);
     }
     *slash = '/';
     w = walk(r, slash + 1, follow || trailing, 1);
@@ -1452,7 +1468,8 @@ static int xattr_keyed(const struct xslot *e, const struct stat *st, const char 
 }
 
 static int xattr_cacheable(const char *name) {
-  return xattr_absent_cache && ttl_ns > 0 && name && strncmp(name, "user.", 5) == 0 && strlen(name) < sizeof xslots[0].name;
+  return xattr_absent_cache && ttl_ns > 0 && name && strncmp(name, "user.", 5) == 0
+      && strnlen(name, sizeof xslots[0].name) < sizeof xslots[0].name;
 }
 
 static int xattr_absent(const struct stat *st, const char *name, int follow) {

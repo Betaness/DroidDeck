@@ -119,8 +119,13 @@ static long svc_path_call(const long *r) {
     struct statfs st;
     return svc_output(fp_statfs(path, &st), &st, r[1], sizeof st);
   }
-  case SYS_getxattr: case SYS_lgetxattr:
-    return fp_getxattr(path, (const char *)r[1], (void *)r[2], (size_t)r[3], r[8] == SYS_getxattr);
+  case SYS_getxattr: case SYS_lgetxattr: {
+    // fp_getxattr reads the name; a name the kernel would fault on or reject as too long goes the slow way.
+    char name[256];
+    long n = svc_memory(name, r[1], sizeof name, 0);
+    if (n <= 0 || !memchr(name, 0, (size_t)n)) return FP_SLOW;
+    return fp_getxattr(path, name, (void *)r[2], (size_t)r[3], r[8] == SYS_getxattr);
+  }
   case SYS_listxattr: case SYS_llistxattr:
     return fp_listxattr(path, (char *)r[1], (size_t)r[2], r[8] == SYS_listxattr);
   case SYS_inotify_add_watch: return fp_inotify((int)r[0], path, (uint32_t)r[2]);
