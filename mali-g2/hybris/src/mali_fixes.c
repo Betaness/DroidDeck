@@ -60,8 +60,9 @@
  *     DROIDDECK_HYBRIS_PASS_BARRIER_LOG_S seconds (60) of presents, and at device destruction.
  *   - DROIDDECK_HYBRIS_EVENT_SLEEP_US=<microseconds> (1..1000; more counts as 1000): vkGetEventStatus is
  *     wrapped. When the driver answers VK_EVENT_RESET and the same thread's previous call was for the
- *     same event and got VK_EVENT_RESET too, the thread sleeps that long (clock_nanosleep) and asks the
- *     driver again; a call always returns the driver's last answer. Unset or 0: nothing is wrapped.
+ *     same event, got VK_EVENT_RESET too and returned at most 1 ms before, the thread sleeps that long
+ *     (clock_nanosleep) and asks the driver again; a call always returns the driver's last answer.
+ *     Unset or 0: nothing is wrapped.
  *     While the file named by DROIDDECK_HYBRIS_EVENT_SLEEP_PAUSE exists nothing sleeps (looked at on
  *     repeated resets, at most every 250 ms). Lines "hybris-icd: event sleep: ..." at the first lookup,
  *     the first sleep, each pause and resume, every DROIDDECK_HYBRIS_EVENT_SLEEP_LOG_S seconds (60) of
@@ -129,6 +130,10 @@ static PbMode pbModeNow(void) {
 
 #define ES_MAX_US 1000
 #define ES_PAUSE_CHECK_NS 250000000ll
+/* A RESET counts as repeated only when the previous one (same thread and event) returned at most this
+ * long before: polls a frame apart do not, whether of a query still pending or of a VkEvent that DXVK
+ * has reset and handed out again in between. */
+#define ES_REPEAT_NS 1000000ull
 
 static uint32_t esUs; /* 0: vkGetEventStatus is not wrapped */
 static uint32_t esLogSeconds = 60;
@@ -211,34 +216,37 @@ static bool esPausedNow(uint64_t now) {
 /* The driver's vkGetEventStatus: the first one a device lookup gives (libhybris gives every device the same). */
 static PFN_vkGetEventStatus nextGetEventStatus;
 
-/* The event of this thread's last call when its answer was VK_EVENT_RESET, else null. */
+/* The event of this thread's last call when its answer was VK_EVENT_RESET (else null), and when that
+ * call returned. */
 static __thread struct {
     VkDevice device;
     VkEvent event;
+    uint64_t ns;
 } esLast;
 
 static VkResult VKAPI_CALL GetEventStatus(VkDevice device, VkEvent event) {
     PFN_vkGetEventStatus next = __atomic_load_n(&nextGetEventStatus, __ATOMIC_ACQUIRE);
     VkResult result = next(device, event);
     __atomic_add_fetch(&esCount.calls, 1, __ATOMIC_RELAXED);
-    if (result == VK_EVENT_RESET && esLast.event == event && esLast.device == device) {
-        uint64_t start = nowNs();
-        if (!esPausedNow(start)) {
-            struct timespec sleep = {0, (long)esUs * 1000};
-            clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep, NULL);
-            uint64_t slept = nowNs() - start;
-            __atomic_add_fetch(&esCount.sleeps, 1, __ATOMIC_RELAXED);
-            __atomic_add_fetch(&esCount.sleptNs, slept, __ATOMIC_RELAXED);
-            if (!__atomic_load_n(&esSlept, __ATOMIC_RELAXED) && !__atomic_exchange_n(&esSlept, 1, __ATOMIC_RELAXED))
-                fprintf(stderr, "hybris-icd: event sleep: first sleep, pid %d, event 0x%llx, %u us asked, %llu us slept\n", (int)getpid(),
-                        (unsigned long long)(uintptr_t)event, esUs, (unsigned long long)(slept / 1000));
-            result = next(device, event);
-            if (result == VK_EVENT_SET) __atomic_add_fetch(&esCount.setAfterSleep, 1, __ATOMIC_RELAXED);
-        }
+    uint64_t now = result == VK_EVENT_RESET ? nowNs() : 0;
+    if (result == VK_EVENT_RESET && esLast.event == event && esLast.device == device && now - esLast.ns <= ES_REPEAT_NS &&
+        !esPausedNow(now)) {
+        struct timespec sleep = {0, (long)esUs * 1000};
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep, NULL);
+        uint64_t woke = nowNs(), slept = woke - now;
+        __atomic_add_fetch(&esCount.sleeps, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&esCount.sleptNs, slept, __ATOMIC_RELAXED);
+        if (!__atomic_load_n(&esSlept, __ATOMIC_RELAXED) && !__atomic_exchange_n(&esSlept, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "hybris-icd: event sleep: first sleep, pid %d, event 0x%llx, %u us asked, %llu us slept\n", (int)getpid(),
+                    (unsigned long long)(uintptr_t)event, esUs, (unsigned long long)(slept / 1000));
+        result = next(device, event);
+        if (result == VK_EVENT_SET) __atomic_add_fetch(&esCount.setAfterSleep, 1, __ATOMIC_RELAXED);
+        now = woke;
     }
     if (result == VK_EVENT_SET) __atomic_add_fetch(&esCount.set, 1, __ATOMIC_RELAXED);
     esLast.device = result == VK_EVENT_RESET ? device : VK_NULL_HANDLE;
     esLast.event = result == VK_EVENT_RESET ? event : VK_NULL_HANDLE;
+    esLast.ns = now;
     return result;
 }
 

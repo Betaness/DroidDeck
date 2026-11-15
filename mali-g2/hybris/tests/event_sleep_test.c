@@ -49,6 +49,7 @@ static VkQueue queue;
 static PFN_vkGetEventStatus getEventStatus;
 static const VkEvent eventA = (VkEvent)(uintptr_t)0x100, eventB = (VkEvent)(uintptr_t)0x200;
 static int sleepsSeen; /* answers for which the driver was asked twice */
+static __thread uint64_t lastReturnNs; /* when this thread's last call returned */
 
 #define INST(name) ((PFN_vk##name)vk_icdGetInstanceProcAddr(instance, "vk" #name))
 #define DEV(name) ((PFN_vk##name)gdpa(device, "vk" #name))
@@ -66,6 +67,12 @@ static uint64_t nowNs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Whether this thread's last call returned well within the wrapper's 1 ms: where the steps in between
+ * (threads, files) could take longer under load, the check of a repeated reset is made only then. */
+static bool recent(void) {
+    return nowNs() - lastReturnNs < 500000ull;
 }
 
 static void sleepMs(long ms) {
@@ -120,6 +127,7 @@ static void present(void) {
 static void expect(const char* what, VkEvent event, VkResult want, int calls) {
     int before = fk->events.calls;
     VkResult got = getEventStatus(device, event);
+    lastReturnNs = nowNs();
     int made = fk->events.calls - before;
     if (made == 2) sleepsSeen++;
     CHECK(got == fk->lastEventResult && fk->lastEvent == event, "%s: answer %d, the driver's last %d", what, got, fk->lastEventResult);
@@ -202,6 +210,12 @@ static void runOff(void) {
     }
 }
 
+/* One reset on eventB: a first one for this thread whatever the caller's last call was. */
+static void* otherThreadOnce(void* arg) {
+    expect("thread: its first reset", eventB, R, 1);
+    return NULL;
+}
+
 static void* otherThread(void* arg) {
     expect("thread: its first reset", eventB, R, 1);
     expect("thread: its repeated reset", eventB, R, 2);
@@ -235,10 +249,18 @@ static void runOn(void) {
     expect("event B after A", eventB, R, 1);
     expect("event A after B", eventA, R, 1);
     expect("event B after A again", eventB, R, 1);
-    /* the other thread's calls do not count for this one, nor this one's for it */
+    /* the other thread's calls do not count for this one, nor this one's for it (a second thread checks
+     * its own repetition: its sleep would put this thread's next call outside the 1 ms) */
     pthread_t thread;
-    CHECK(pthread_create(&thread, NULL, otherThread, NULL) == 0 && pthread_join(thread, NULL) == 0, "thread");
-    expect("this thread's repeated reset after the other's", eventB, R, 2);
+    CHECK(pthread_create(&thread, NULL, otherThreadOnce, NULL) == 0 && pthread_join(thread, NULL) == 0, "thread");
+    bool soon = recent();
+    expect("this thread's repeated reset after the other's", eventB, R, soon ? 2 : -1);
+    CHECK(pthread_create(&thread, NULL, otherThread, NULL) == 0 && pthread_join(thread, NULL) == 0, "second thread");
+    /* the same event again more than 1 ms after this thread's last reset of it (a poll each frame, a
+     * reused VkEvent): a first reset; right after that, a repeated one */
+    sleepMs(3);
+    expect("event B 3 ms later", eventB, R, 1);
+    expect("event B right after", eventB, R, 2);
     /* errors: returned as they are, never followed by a sleep, and end the repetition */
     script(&fk->events, R, 1, LOST);
     expect("an error", eventB, LOST, 1);
@@ -258,8 +280,8 @@ static void runOn(void) {
           "one \"on\" line");
     CHECK(countLines(log, "hybris-icd: event sleep: first sleep, pid ") == 1 && strstr(log, ", 800 us asked, "), "one first-sleep line");
     CHECK(!strstr(log, "event sleep: counts,"), "no counts line before 60 s");
-    checkCounts(log, "device destroyed", 800, 18, 3, sleepsSeen, 2);
-    CHECK(sleepsSeen == 8, "%d sleeps", sleepsSeen);
+    checkCounts(log, "device destroyed", 800, 21, 3, sleepsSeen, 2);
+    CHECK(soon ? sleepsSeen == 9 : sleepsSeen == 8 || sleepsSeen == 9, "%d sleeps", sleepsSeen);
 }
 
 static void runMax(void) {
@@ -279,8 +301,9 @@ static void runMax(void) {
     checkCounts(log, "device destroyed", 1000, 2, 0, 1, 0);
 }
 
-/* The pause file is there at the start, goes, comes back. Its state is looked at every 250 ms at most:
- * where a check of that depends on the time, it is made only when this ran fast enough. */
+/* The pause file is there at the start, goes, comes back. Its state is looked at every 250 ms at most,
+ * on repeated resets only (1 ms apart at most): where a check of that depends on the time, it is made
+ * only when this ran fast enough. */
 static void runPause(void) {
     const char* path = getenv("DROIDDECK_HYBRIS_EVENT_SLEEP_PAUSE");
     setUp();
@@ -295,14 +318,16 @@ static void runPause(void) {
     bool fast = nowNs() - looked < 200000000ull;
     expect("file gone, not looked at yet", eventA, R, fast ? 1 : -1);
     sleepMs(300);
+    expect("file gone, 300 ms later: a first reset", eventA, R, 1);
     expect("file gone, looked at", eventA, R, 2);
     looked = nowNs();
     int fd = open(path, O_CREAT | O_WRONLY, 0600);
     CHECK(fd >= 0, "pause file");
     if (fd >= 0) close(fd);
-    fast = nowNs() - looked < 200000000ull;
+    fast = nowNs() - looked < 200000000ull && recent();
     expect("file back, not looked at yet", eventA, R, fast ? 2 : -1);
     sleepMs(300);
+    expect("file back, 300 ms later: a first reset", eventA, R, 1);
     expect("file back, looked at", eventA, R, 1);
     expect("paused again", eventA, R, 1);
     unlink(path);
@@ -317,7 +342,7 @@ static void runPause(void) {
     CHECK(countLines(log, "hybris-icd: event sleep: resumed, pid ") == 1 && countsLine(log, "resumed", &c) && !c.paused,
           "one \"resumed\" line");
     CHECK(countLines(log, "hybris-icd: event sleep: paused, pid ") == 1 && countsLine(log, "paused", &c) && c.paused, "one \"paused\" line");
-    checkCounts(log, "device destroyed", 800, 8, 0, sleepsSeen, 0);
+    checkCounts(log, "device destroyed", 800, 10, 0, sleepsSeen, 0);
     CHECK(sleepsSeen >= 1, "%d sleeps", sleepsSeen);
 }
 
@@ -340,12 +365,13 @@ static void runCounts(void) {
     sleepMs(1100);
     present();
     CHECK(countLines(ownLog(), "hybris-icd: event sleep: counts, pid ") == 1, "no counts line without new calls");
+    expect("first after the wait", eventA, R, 1);
     expect("repeated again", eventA, R, 2);
     tearDown();
     log = ownLog();
     CHECK(countLines(log, "hybris-icd: event sleep: on, 500 us after a repeated VK_EVENT_RESET, no pause file, counts every 1 s") == 1,
           "one \"on\" line");
-    checkCounts(log, "device destroyed", 500, 3, 0, 2, 0);
+    checkCounts(log, "device destroyed", 500, 4, 0, 2, 0);
 }
 
 /* ---- the processes ---- */
