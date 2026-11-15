@@ -341,7 +341,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 uiHandler.removeCallbacks(cursorResync)
                 uiHandler.post(cursorResync)
             }
-            updatePointerCapture()
+            updatePointerCapture(if (locked) "pointer lock taken" else "pointer lock released")
         }
     }
     private var cursorImage by mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null)
@@ -656,7 +656,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             joyConVr?.refresh()
             padBridge?.syncConnectedControllers()
             refreshControls()
-            updatePointerCapture()
+            updatePointerCapture("input device added")
             requestRelativeMouse()
             updateHandCamera()
             refreshSecondScreenDisplays()
@@ -673,7 +673,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             padBridge?.onDeviceRemoved(deviceId)
             if (::padMouse.isInitialized) padMouse.reset()
             refreshControls()
-            updatePointerCapture()
+            updatePointerCapture("input device removed")
             requestRelativeMouse()
             updateHandCamera()
             refreshSecondScreenDisplays()
@@ -749,14 +749,6 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         val root = object : FrameLayout(this) {
             override fun dispatchCapturedPointerEvent(event: MotionEvent): Boolean =
                 onCapturedPointer(event) || super.dispatchCapturedPointerEvent(event)
-            override fun dispatchPointerCaptureChanged(hasCapture: Boolean) {
-                super.dispatchPointerCaptureChanged(hasCapture)
-                Log.i(TAG, "pointer capture " + if (hasCapture) "on" else "off")
-                if (!hasCapture) {
-                    releaseHeldGuestInput()
-                    uiHandler.postDelayed(::updatePointerCapture, 250)
-                }
-            }
         }
         sessionRoot = root
         surfaceView = SurfaceView(this)
@@ -966,7 +958,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             androidx.compose.runtime.DisposableEffect(Unit) {
                 onDispose { com.droiddeck.launcher.glasses.GlassesMenuMirror.setSessionMenuVisible(this@SessionActivity, false) }
             }
-            androidx.compose.runtime.LaunchedEffect(drawerOpen, pcKeyboardOpen, achievementsOpen, inputSettingsOpen, pipUi, bottomOutputActive) { updatePointerCapture() }
+            androidx.compose.runtime.LaunchedEffect(drawerOpen, pcKeyboardOpen, achievementsOpen, inputSettingsOpen, pipUi, bottomOutputActive) { updatePointerCapture("session panels changed") }
             androidx.compose.runtime.LaunchedEffect(bottomOutputActive) { hud.setHidden(pipUi || bottomOutputActive) }
             androidx.compose.runtime.LaunchedEffect(pipUi) {
                 hud.setHidden(pipUi || bottomOutputActive)
@@ -4262,10 +4254,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun onMouse(event: MotionEvent): Boolean {
         when (event.actionMasked) {
-            MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_ENTER ->
-                if (evdevMouseActive) sendMouseDelta(event.x, event.y) else movePointer(event.x, event.y, fromMouse = true)
+            MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_ENTER -> mouseMotion(event)
             MotionEvent.ACTION_BUTTON_PRESS, MotionEvent.ACTION_BUTTON_RELEASE -> {
-                if (evdevMouseActive) sendMouseDelta(event.x, event.y) else movePointer(event.x, event.y, fromMouse = true)
+                mouseMotion(event)
                 guestMouseButton(event.actionButton)?.let { heldButtons.set(8, it, event.actionMasked == MotionEvent.ACTION_BUTTON_PRESS) }
             }
             MotionEvent.ACTION_SCROLL -> {
@@ -4276,6 +4267,11 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             else -> return false
         }
         return true
+    }
+
+    private fun mouseMotion(event: MotionEvent) {
+        if (holdUncapturedMotion(event)) return
+        if (evdevMouseActive) sendMouseDelta(event.x, event.y) else movePointer(event.x, event.y, fromMouse = true)
     }
 
     private fun isHardwareMouse(d: InputDevice?): Boolean =
@@ -4299,13 +4295,99 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         isHardwareMouse(d) && d?.supportsSource(InputDevice.SOURCE_TOUCHPAD) != true
     }
 
-    private fun updatePointerCapture() {
+    private val uncapturedMouse = com.droiddeck.launcher.input.UncapturedMouseGuard()
+    private var captureRequestReason = "none"
+    private var captureReleasedFor: String? = null
+    private val captureRecheck = Runnable { updatePointerCapture("re-check after capture loss") }
+
+    private fun captureBlocker(mouse: Boolean = mouseAttached()): String? =
+        com.droiddeck.launcher.input.PointerCapturePolicy.blocker(
+            mouseAttached = mouse,
+            pointerLocked = pointerLocked,
+            multiWindow = isInMultiWindowMode,
+            glassesOutput = glassesOutputActive,
+            resumed = resumed,
+            windowFocused = hasWindowFocus(),
+            drawerOpen = drawerOpen,
+            pcKeyboardOpen = pcKeyboardOpen,
+            achievementsOpen = achievementsOpen,
+            inputSettingsOpen = inputSettingsOpen,
+            pipUi = pipUi,
+            bottomOutput = bottomOutputActive,
+            touchEditorOpen = touchEditorOpen,
+        )
+
+    private fun updatePointerCapture(reason: String) {
         if (!::surfaceView.isInitialized) return
         val view = window.decorView
-        val want = (pointerLocked || relativeMouseAttached()) && resumed && hasWindowFocus() && !drawerOpen && !pcKeyboardOpen && !achievementsOpen && !inputSettingsOpen && !pipUi && !bottomOutputActive && !touchEditorOpen && mouseAttached()
+        val blocker = captureBlocker()
+        val want = blocker == null
         releaseDesktopMouseGrab()
         if (want == view.hasPointerCapture()) return
-        if (want) view.requestPointerCapture() else view.releasePointerCapture()
+        if (want) requestCapture(reason)
+        else {
+            captureReleasedFor = blocker
+            Log.i(TAG, "releasing pointer capture ($blocker)")
+            view.releasePointerCapture()
+        }
+    }
+
+    private fun requestCapture(reason: String, log: Boolean = true) {
+        uncapturedMouse.requested(android.os.SystemClock.uptimeMillis())
+        captureRequestReason = reason
+        captureReleasedFor = null
+        if (log) Log.i(TAG, "requesting pointer capture ($reason)")
+        window.decorView.requestPointerCapture()
+    }
+
+    override fun onPointerCaptureChanged(hasCapture: Boolean) {
+        super.onPointerCaptureChanged(hasCapture)
+        lastMouseX = Float.NaN
+        lastMouseY = Float.NaN
+        val held = uncapturedMouse.held
+        uncapturedMouse.captureChanged()
+        if (!::surfaceView.isInitialized) return
+        if (hasCapture) {
+            Log.i(TAG, "pointer capture on ($captureRequestReason" + (if (held > 0) "; $held uncaptured mouse events held" else "") + ")")
+            return
+        }
+        releaseHeldGuestInput()
+        val blocker = captureBlocker()
+        val released = captureReleasedFor
+        captureReleasedFor = null
+        Log.i(TAG, "pointer capture off (" + when {
+            released != null -> "released: $released"
+            blocker != null -> "taken away; now $blocker"
+            else -> "taken away while wanted"
+        } + ")")
+        if (blocker == null && uncapturedMouse.mayRequest(android.os.SystemClock.uptimeMillis())) requestCapture("taken away while wanted")
+        uiHandler.removeCallbacks(captureRecheck)
+        uiHandler.postDelayed(captureRecheck, 250)
+    }
+
+    /**
+     * True when this event's motion must not reach the guest: a hardware mouse arrived uncaptured
+     * while capture is wanted, so its position carries Android's pointer acceleration.
+     */
+    private fun holdUncapturedMotion(event: MotionEvent): Boolean {
+        val device = event.device
+        if (!isHardwareMouse(device) || device?.supportsSource(InputDevice.SOURCE_TOUCHPAD) == true) return false
+        if (!::surfaceView.isInitialized) return false
+        val verdict = uncapturedMouse.uncaptured(
+            android.os.SystemClock.uptimeMillis(),
+            wanted = captureBlocker(mouse = true) == null,
+            holdable = SessionState.mode != SessionService.MODE_DESKTOP,
+        )
+        if (verdict.first) Log.w(TAG, "mouse arrives uncaptured while pointer capture is wanted" +
+            (if (verdict.holdMotion) "; holding its motion for up to ${com.droiddeck.launcher.input.UncapturedMouseGuard.HOLD_MS} ms" else ""))
+        if (verdict.gaveUp) Log.w(TAG, "pointer capture still off after ${com.droiddeck.launcher.input.UncapturedMouseGuard.HOLD_MS} ms; " +
+            "uncaptured mouse motion passes (${uncapturedMouse.held} events held)")
+        if (verdict.requestCapture) requestCapture("mouse arrived uncaptured", log = verdict.first)
+        if (verdict.holdMotion) {
+            lastMouseX = Float.NaN
+            lastMouseY = Float.NaN
+        }
+        return verdict.holdMotion
     }
 
     private fun programLocksPointer(): Boolean =
@@ -4349,14 +4431,14 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean, newConfig: android.content.res.Configuration) {
         super.onMultiWindowModeChanged(isInMultiWindowMode, newConfig)
-        updatePointerCapture()
+        updatePointerCapture("multi-window changed")
     }
 
     private var platformPointerShown: Boolean? = null
 
     private fun touchEditorChanged() {
         touchEditorOpen = steamTouchControls?.isEditing == true
-        updatePointerCapture()
+        updatePointerCapture("touch editor changed")
         applyPlatformPointer(appUiOwnsPointer())
     }
 
@@ -4872,7 +4954,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             setPressed = { padBridge?.setHomeGuidePressed(it) },
             onCancel = { padBridge?.cancelHomeGuide() },
         )
-        updatePointerCapture()
+        updatePointerCapture("resumed")
         if (!pipUi) sessionClipboard.start()
         updatePadMotion()
         ControllerPrefs.prefs(this).registerOnSharedPreferenceChangeListener(shortcutPrefListener)
@@ -4921,7 +5003,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (::scrollTouch.isInitialized) scrollTouch.cancel()
         if (::padMouse.isInitialized) padMouse.reset()
         resumed = false
-        updatePointerCapture()
+        updatePointerCapture("paused")
         updatePadMotion()
         keyboard?.takeIf { it.shown }?.hide()
         SessionPrefs.sessionPrefs(this).unregisterOnSharedPreferenceChangeListener(cardboardPrefListener)
@@ -5142,7 +5224,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         glassesOutputActive = glassesScreen?.holder === holder
         bottomOutputActive = bottomGame?.holder === holder
         updateOnScreenPad()
-        updatePointerCapture()
+        updatePointerCapture("output attached")
         if (bottomOutputActive) bottomRecoveries = 0
         if (CompositorHost.isStarted) WaylandCompositor.nativeSetCursorComposite(glassesOutputActive || bottomOutputActive)
         surfaceView.visibility = if (glassesOutputActive || bottomOutputActive) View.INVISIBLE else View.VISIBLE
@@ -5480,7 +5562,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             goFullscreen()
             refreshClipboard()
         }
-        updatePointerCapture()
+        updatePointerCapture(if (hasFocus) "window focus regained" else "window focus lost")
     }
 
     fun refreshClipboard() {
