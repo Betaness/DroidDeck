@@ -397,6 +397,11 @@ public final class WaylandCompositor {
         nativeSendSceneInput(6, dx * 256, dy * 256);
     }
 
+    /** The next absolute pointer position sends no relative motion (Android moved its pointer meanwhile). */
+    public static void forgetPointerOrigin() {
+        nativeSendSceneInput(13, 0, 0);
+    }
+
     private static float pendingDeltaX, pendingDeltaY;
 
     public static void sendPointerDelta(float dx, float dy) {

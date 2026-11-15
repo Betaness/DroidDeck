@@ -102,16 +102,45 @@ class PointerCaptureTest {
             guard.uncaptured(2200, wanted = true, holdable = true).holdMotion)
     }
 
-    @Test fun captureChangesStartOver() {
+    @Test fun aSteadyCaptureStartsOver() {
         val guard = UncapturedMouseGuard(retryMs = 250, holdMs = 1000, slowRetryMs = 2000)
         guard.uncaptured(0, wanted = true, holdable = true)
-        guard.uncaptured(1000, wanted = true, holdable = true)
-        guard.captureChanged()
-        assertEquals(0, guard.held)
-        val again = guard.uncaptured(5000, wanted = true, holdable = true)
+        assertTrue(guard.uncaptured(1000, wanted = true, holdable = true).gaveUp)
+        guard.captureChanged(true, 1200)
+        guard.captureChanged(false, 2200)
+        val again = guard.uncaptured(2210, wanted = true, holdable = true)
         assertTrue(again.first)
         assertTrue(again.holdMotion)
         assertTrue(again.requestCapture)
+        assertTrue(guard.uncaptured(3100, wanted = true, holdable = true).holdMotion)
+    }
+
+    @Test fun flappingCaptureStillGivesUp() {
+        val guard = UncapturedMouseGuard(retryMs = 250, holdMs = 1000, slowRetryMs = 2000)
+        var t = 0L
+        var gaveUpAt = -1L
+        repeat(8) {
+            for (i in 0 until 250 step 10) {
+                val v = guard.uncaptured(t + i, wanted = true, holdable = true)
+                if (v.gaveUp) gaveUpAt = t + i
+            }
+            guard.captureChanged(true, t + 250)
+            guard.captureChanged(false, t + 300)
+            t += 300
+        }
+        assertTrue("gave up after about 1 s held, at $gaveUpAt", gaveUpAt in 1000L..1300L)
+        val later = guard.uncaptured(t, wanted = true, holdable = true)
+        assertFalse(later.holdMotion)
+        assertFalse(later.first)
+    }
+
+    @Test fun heldEventsAreCountedUntilTaken() {
+        val guard = UncapturedMouseGuard(retryMs = 250, holdMs = 1000, slowRetryMs = 2000)
+        guard.uncaptured(0, wanted = true, holdable = true)
+        guard.uncaptured(10, wanted = true, holdable = true)
+        guard.captureChanged(true, 20)
+        assertEquals(2, guard.takeHeld())
+        assertEquals(0, guard.held)
     }
 
     @Test fun nothingHappensWhileCaptureIsNotWanted() {
@@ -123,15 +152,17 @@ class PointerCaptureTest {
         assertEquals(0, guard.held)
     }
 
-    @Test fun leavingTheWantedStateRestartsTheHoldClock() {
+    @Test fun theHoldTimeAddsUpAcrossUnwantedMoments() {
         val guard = UncapturedMouseGuard(retryMs = 250, holdMs = 1000, slowRetryMs = 2000)
         guard.uncaptured(0, wanted = true, holdable = true)
-        guard.uncaptured(900, wanted = false, holdable = true)
-        val v = guard.uncaptured(1500, wanted = true, holdable = true)
+        guard.uncaptured(600, wanted = true, holdable = true)
+        guard.uncaptured(4000, wanted = false, holdable = true)
+        val v = guard.uncaptured(5000, wanted = true, holdable = true)
         assertTrue(v.holdMotion)
         assertFalse(v.gaveUp)
         assertFalse("still one stretch for the log", v.first)
-        assertTrue(guard.uncaptured(2500, wanted = true, holdable = true).gaveUp)
+        assertTrue(guard.uncaptured(5300, wanted = true, holdable = true).holdMotion)
+        assertTrue(guard.uncaptured(5400, wanted = true, holdable = true).gaveUp)
     }
 
     @Test fun theDesktopSessionRequestsCaptureButKeepsMotion() {

@@ -4298,7 +4298,16 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private val uncapturedMouse = com.droiddeck.launcher.input.UncapturedMouseGuard()
     private var captureRequestReason = "none"
     private var captureReleasedFor: String? = null
-    private val captureRecheck = Runnable { updatePointerCapture("re-check after capture loss") }
+    private var captureTakenAt = -1L
+    private var focusLostSinceCaptureTaken = false
+    private val captureRecheck = Runnable {
+        explainCaptureLoss()
+        updatePointerCapture("re-check after capture loss")
+    }
+    private val captureRetake = Runnable {
+        if (::surfaceView.isInitialized && !window.decorView.hasPointerCapture() && captureBlocker() == null &&
+            uncapturedMouse.mayRequest(android.os.SystemClock.uptimeMillis())) requestCapture("taken away")
+    }
 
     private fun captureBlocker(mouse: Boolean = mouseAttached()): String? =
         com.droiddeck.launcher.input.PointerCapturePolicy.blocker(
@@ -4342,27 +4351,58 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     override fun onPointerCaptureChanged(hasCapture: Boolean) {
         super.onPointerCaptureChanged(hasCapture)
-        lastMouseX = Float.NaN
-        lastMouseY = Float.NaN
-        val held = uncapturedMouse.held
-        uncapturedMouse.captureChanged()
+        val now = android.os.SystemClock.uptimeMillis()
+        uncapturedMouse.captureChanged(hasCapture, now)
         if (!::surfaceView.isInitialized) return
+        forgetMouseOrigin()
         if (hasCapture) {
+            val held = uncapturedMouse.takeHeld()
             Log.i(TAG, "pointer capture on ($captureRequestReason" + (if (held > 0) "; $held uncaptured mouse events held" else "") + ")")
+            // A request can still be granted after a panel opened or focus moved.
+            captureBlocker()?.let { blocker ->
+                captureReleasedFor = blocker
+                Log.i(TAG, "releasing pointer capture (granted while $blocker)")
+                window.decorView.releasePointerCapture()
+            }
             return
         }
         releaseHeldGuestInput()
-        val blocker = captureBlocker()
         val released = captureReleasedFor
         captureReleasedFor = null
-        Log.i(TAG, "pointer capture off (" + when {
-            released != null -> "released: $released"
-            blocker != null -> "taken away; now $blocker"
-            else -> "taken away while wanted"
-        } + ")")
-        if (blocker == null && uncapturedMouse.mayRequest(android.os.SystemClock.uptimeMillis())) requestCapture("taken away while wanted")
+        if (released != null) Log.i(TAG, "pointer capture off (released: $released)")
+        else {
+            // Input dispatch sends this before the focus change, so hasWindowFocus() is not settled yet:
+            // the re-check says why.
+            Log.i(TAG, "pointer capture off (taken away)")
+            captureTakenAt = now
+            focusLostSinceCaptureTaken = false
+            uiHandler.removeCallbacks(captureRetake)
+            uiHandler.post(captureRetake)
+        }
         uiHandler.removeCallbacks(captureRecheck)
         uiHandler.postDelayed(captureRecheck, 250)
+    }
+
+    private fun explainCaptureLoss() {
+        if (captureTakenAt < 0) return
+        val ago = android.os.SystemClock.uptimeMillis() - captureTakenAt
+        captureTakenAt = -1L
+        val blocker = captureBlocker()
+        Log.i(TAG, "pointer capture was taken away $ago ms ago " + when {
+            focusLostSinceCaptureTaken -> "with the window focus"
+            blocker != null -> "($blocker now)"
+            else -> "while wanted; the window kept focus"
+        } + "; capture is " + (if (window.decorView.hasPointerCapture()) "back" else "still off"))
+    }
+
+    /**
+     * Android moved its pointer without the guest seeing it: the next uncaptured position must not
+     * become one relative jump (raw mouse channel and compositor alike).
+     */
+    private fun forgetMouseOrigin() {
+        lastMouseX = Float.NaN
+        lastMouseY = Float.NaN
+        if (CompositorHost.isStarted) WaylandCompositor.forgetPointerOrigin()
     }
 
     /**
@@ -4383,10 +4423,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (verdict.gaveUp) Log.w(TAG, "pointer capture still off after ${com.droiddeck.launcher.input.UncapturedMouseGuard.HOLD_MS} ms; " +
             "uncaptured mouse motion passes (${uncapturedMouse.held} events held)")
         if (verdict.requestCapture) requestCapture("mouse arrived uncaptured", log = verdict.first)
-        if (verdict.holdMotion) {
-            lastMouseX = Float.NaN
-            lastMouseY = Float.NaN
-        }
+        if (verdict.holdMotion) forgetMouseOrigin()
         return verdict.holdMotion
     }
 
@@ -5551,6 +5588,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (!hasFocus) backQamInput.cancel()
         if (!hasFocus) mouseBackInput.cancel()
         if (!hasFocus && ::padMouse.isInitialized) padMouse.reset()
+        if (!hasFocus && captureTakenAt >= 0) focusLostSinceCaptureTaken = true
         if (runtimeRemovalBlocked) return
         if (!hasFocus) {
             if (::touchscreenGestures.isInitialized) touchscreenGestures.cancel()

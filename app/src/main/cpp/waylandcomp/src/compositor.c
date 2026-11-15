@@ -3295,6 +3295,11 @@ static void pointer_delta(double dx, double dy) {
     pointer_input(dx, dy, 1, 0, 0);
 }
 
+/* The next absolute position sends no relative motion: Android moved its pointer meanwhile. */
+static void pointer_forget_origin(void) {
+    g_raw_valid = 0;
+}
+
 static void pointer_button(uint32_t button, int pressed) {
     if (pressed) {
         pointer_input(0, 0, 1, button, pressed);
@@ -3724,6 +3729,7 @@ static int on_input_readable(int fd, uint32_t mask, void *data) {
         case 10: break;
         case 11: axis_event(m.p1, m.p2, 0); break;
         case 12: axis_event(m.p1, m.p2, 1); break;
+        case 13: pointer_forget_origin(); break;
         case 20: stream_take(); break;
         case 21: if (!m.p1) stream_forget_all(); schedule_render(); break;
         case 22: schedule_render(); break;

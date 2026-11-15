@@ -44,9 +44,10 @@ object PointerCapturePolicy {
  * Handles hardware mouse events that arrive uncaptured while the session wants capture.
  *
  * Capture is requested again at once and then at most every [retryMs]. Motion is held back for up to
- * [holdMs], so accelerated positions do not reach the game; if capture is still off by then, motion
- * passes through so the mouse keeps working, and requests slow to every [slowRetryMs].
- * [captureChanged] starts over.
+ * [holdMs] in total, so accelerated positions do not reach the game; if capture is still off by then,
+ * motion passes through so the mouse keeps working, and requests slow to every [slowRetryMs].
+ * The time held adds up over short grants and over moments when capture is not wanted (those
+ * moments themselves do not count); it starts over once capture has stayed on for [holdMs].
  */
 class UncapturedMouseGuard(
     private val retryMs: Long = RETRY_MS,
@@ -56,7 +57,7 @@ class UncapturedMouseGuard(
     class Verdict(
         val requestCapture: Boolean,
         val holdMotion: Boolean,
-        /** First uncaptured event while capture is wanted since capture last changed. */
+        /** First uncaptured event while capture is wanted since the hold time last started over. */
         val first: Boolean,
         /** Capture stayed off for [holdMs]; motion passes and requests slow down from now on. */
         val gaveUp: Boolean,
@@ -66,11 +67,16 @@ class UncapturedMouseGuard(
     private var requestedAt = 0L
     private var seen = false
     private var since = -1L
+    private var lastAt = -1L
+    private var spent = 0L
     private var passing = false
+    private var capturedAt = -1L
 
-    /** Mouse events whose motion was held since capture last changed. */
+    /** Mouse events whose motion was held since [takeHeld] was last called. */
     var held = 0
         private set
+
+    fun takeHeld(): Int = held.also { held = 0 }
 
     fun mayRequest(now: Long): Boolean =
         !requested || now - requestedAt >= (if (passing) slowRetryMs else retryMs)
@@ -80,29 +86,52 @@ class UncapturedMouseGuard(
         requestedAt = now
     }
 
-    fun captureChanged() {
-        seen = false
-        since = -1L
-        passing = false
-        held = 0
+    fun captureChanged(hasCapture: Boolean, now: Long) {
+        if (hasCapture) {
+            endStretch(now)
+            capturedAt = now
+        } else {
+            endCapture(now)
+        }
     }
 
     /** [holdable] is false where uncaptured motion has to keep flowing (the desktop session). */
     fun uncaptured(now: Long, wanted: Boolean, holdable: Boolean): Verdict {
+        endCapture(now)
         if (!wanted) {
-            since = -1L
+            endStretch(lastAt)
             return PASS
         }
         val first = !seen
         seen = true
         if (!passing && since < 0) since = now
-        val gaveUp = !passing && now - since >= holdMs
-        if (gaveUp) passing = true
+        lastAt = now
+        val gaveUp = !passing && spent + now - since >= holdMs
+        if (gaveUp) {
+            passing = true
+            since = -1L
+        }
         val request = mayRequest(now)
         if (request) requested(now)
         val hold = holdable && !passing
         if (hold) held++
         return Verdict(request, holdMotion = hold, first = first, gaveUp = gaveUp)
+    }
+
+    /** A stretch ends when capture comes on, or at its last event when capture stops being wanted. */
+    private fun endStretch(end: Long) {
+        if (since >= 0) spent += maxOf(0L, end - since)
+        since = -1L
+    }
+
+    private fun endCapture(now: Long) {
+        if (capturedAt < 0) return
+        if (now - capturedAt >= holdMs) {
+            seen = false
+            spent = 0L
+            passing = false
+        }
+        capturedAt = -1L
     }
 
     companion object {
