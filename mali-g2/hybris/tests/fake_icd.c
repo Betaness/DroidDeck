@@ -1,8 +1,8 @@
 /*
- * A Vulkan driver of one device for tests/guards_icd_test.c (see tests/fake_icd.h): one queue family
- * of FAKE_QUEUES queues, a device-local heap of FAKE_HEAP_MB and a host heap, no extensions. Waits,
- * idle waits and query reads play their FakeScript; vkEndCommandBuffer and pipeline creation fault
- * on demand.
+ * A Vulkan driver of one device for tests/guards_icd_test.c and tests/event_sleep_test.c (see
+ * tests/fake_icd.h): one queue family of FAKE_QUEUES queues, a device-local heap of FAKE_HEAP_MB and a
+ * host heap, no extensions. Waits, idle waits, query reads and event status queries play their
+ * FakeScript; vkEndCommandBuffer and pipeline creation fault on demand.
  */
 #include "fake_icd.h"
 
@@ -155,6 +155,11 @@ static VkResult VKAPI_CALL GetQueryPoolResults(VkDevice device, VkQueryPool pool
     return r;
 }
 
+static VkResult VKAPI_CALL GetEventStatus(VkDevice device, VkEvent event) {
+    fake_icd.lastEvent = event;
+    return fake_icd.lastEventResult = play(&fake_icd.events);
+}
+
 static VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* info) {
     return VK_SUCCESS;
 }
@@ -207,7 +212,7 @@ static const struct {
     F("ResetQueryPool", ResetQueryPool), F("CmdResetQueryPool", CmdResetQueryPool), F("GetQueryPoolResults", GetQueryPoolResults),
     F("BeginCommandBuffer", BeginCommandBuffer), F("EndCommandBuffer", EndCommandBuffer), F("ResetCommandBuffer", ResetCommandBuffer),
     F("CreateComputePipelines", CreateComputePipelines), F("CreateGraphicsPipelines", CreateGraphicsPipelines),
-    F("DestroyPipeline", DestroyPipeline),
+    F("DestroyPipeline", DestroyPipeline), F("GetEventStatus", GetEventStatus),
 };
 
 EXPORT PFN_vkVoidFunction fake_icd_device_proc(const char* name) {

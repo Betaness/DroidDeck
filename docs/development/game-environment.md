@@ -225,6 +225,20 @@ keys compared without case) into the same settings, so the argument has the
 same key as the file. A `-job-worker-count` in the game's own launch options
 is kept.
 
+A.V.A. Global (Steam app 1473480) on the in-process Mali driver
+(`DROIDDECK_GPU_PATH=hybris`) gets `DROIDDECK_HYBRIS_EVENT_SLEEP_US=50`
+(`mali-g2/hybris/src/mali_fixes.c`). Its render thread polls DXVK's event
+queries with `vkGetEventStatus` for about 4 ms a frame while it waits for the
+GPU; with the variable set, the thread sleeps 50 µs between polls of an event
+that stays reset. On a Xring O3 at native 3408x2272 and 144 Hz (one session,
+60 s segments off, on, off) that measured 135.34 against 133.52 and 131.84 fps
+(+2.00%), 4.8% more GPU cycles executed a second at a GPU clock of 1591 against
+about 1500 MHz, render thread busy 0.37 against 0.98, and the CPU and SoC about
+1–2 °C cooler; 100 µs measured +1.88% fps. Only A.V.A. was measured, and a
+sleep holds DXVK's event lock, so other games do not get it. A value already in
+the environment is kept; set it to `0` in the game's own environment to turn it
+off.
+
 Elsewhere Windows sees a game's cores fastest first (Windows CPU 0 is the
 fastest core; `DROIDDECK_FASTEST_CORES=0` turns it off). Where the app forwards
 the GPU (`BL_GPU_MODE=vortek`, Mali) that order is off unless

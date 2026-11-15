@@ -58,16 +58,27 @@
  *     inline stages, identifier queries) is scanned for the guards until they trip. Unset or off:
  *     nothing is wrapped or scanned. A line "hybris-icd: pass barrier: ..." every
  *     DROIDDECK_HYBRIS_PASS_BARRIER_LOG_S seconds (60) of presents, and at device destruction.
+ *   - DROIDDECK_HYBRIS_EVENT_SLEEP_US=<microseconds> (1..1000; more counts as 1000): vkGetEventStatus is
+ *     wrapped. When the driver answers VK_EVENT_RESET and the same thread's previous call was for the
+ *     same event, got VK_EVENT_RESET too and returned at most 1 ms before, the thread sleeps that long
+ *     (clock_nanosleep) and asks the driver again; a call always returns the driver's last answer.
+ *     Unset or 0: nothing is wrapped.
+ *     While the file named by DROIDDECK_HYBRIS_EVENT_SLEEP_PAUSE exists nothing sleeps (looked at on
+ *     repeated resets, at most every 250 ms). Lines "hybris-icd: event sleep: ..." at the first lookup,
+ *     the first sleep, each pause and resume, every DROIDDECK_HYBRIS_EVENT_SLEEP_LOG_S seconds (60) of
+ *     presents and at device destruction (counts since the process started).
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
  */
 #include "icd.h"
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "spirv_clip_cull.h"
 #include "spirv_spec_composite.h"
@@ -113,6 +124,130 @@ static void pbReadMode(void) {
 static PbMode pbModeNow(void) {
     pthread_once(&pbOnce, pbReadMode);
     return pbMode;
+}
+
+/* ---- DROIDDECK_HYBRIS_EVENT_SLEEP_US: a short sleep between polls of an event that stays reset ---- */
+
+#define ES_MAX_US 1000
+#define ES_PAUSE_CHECK_NS 250000000ll
+/* A RESET counts as repeated only when the previous one (same thread and event) returned at most this
+ * long before: polls a frame apart do not, whether of a query still pending or of a VkEvent that DXVK
+ * has reset and handed out again in between. */
+#define ES_REPEAT_NS 1000000ull
+
+static uint32_t esUs; /* 0: vkGetEventStatus is not wrapped */
+static uint32_t esLogSeconds = 60;
+static char* esPausePath;
+static pthread_once_t esOnce = PTHREAD_ONCE_INIT;
+static uint64_t esStartNs, esLastLogNs, esPauseCheckNs, esLoggedCalls; /* the last three atomic */
+static uint32_t esPaused, esSlept;                                     /* atomic */
+static struct {
+    uint64_t calls, set, sleeps, setAfterSleep, sleptNs;
+} esCount; /* atomic fields */
+
+static void esReadConfig(void) {
+    const char* text = getenv("DROIDDECK_HYBRIS_EVENT_SLEEP_US");
+    if (!text || !*text) return;
+    char* end;
+    errno = 0;
+    long us = strtol(text, &end, 10);
+    if (end == text || *end || errno || us < 0) {
+        fprintf(stderr, "hybris-icd: DROIDDECK_HYBRIS_EVENT_SLEEP_US=%s ignored (microseconds, 0 to %d)\n", text, ES_MAX_US);
+        return;
+    }
+    if (!us) return;
+    esUs = us > ES_MAX_US ? ES_MAX_US : (uint32_t)us;
+    int seconds = icd_env_int("DROIDDECK_HYBRIS_EVENT_SLEEP_LOG_S", 60);
+    esLogSeconds = seconds > 0 ? (uint32_t)seconds : 60;
+    const char* pause = getenv("DROIDDECK_HYBRIS_EVENT_SLEEP_PAUSE");
+    if (pause && *pause) esPausePath = strdup(pause);
+    esStartNs = esLastLogNs = esPauseCheckNs = nowNs();
+    if (esPausePath) esPaused = !access(esPausePath, F_OK);
+    char lowered[96] = "";
+    if (us > ES_MAX_US) snprintf(lowered, sizeof(lowered), " (DROIDDECK_HYBRIS_EVENT_SLEEP_US=%s lowered to the maximum)", text);
+    fprintf(stderr, "hybris-icd: event sleep: on, %u us%s after a repeated VK_EVENT_RESET, %s%s%s, counts every %u s\n", esUs, lowered,
+            esPausePath ? "pause file " : "no pause file", esPausePath ? esPausePath : "", esPaused ? " (there: paused)" : "",
+            esLogSeconds);
+}
+
+static uint32_t esSleepUs(void) {
+    pthread_once(&esOnce, esReadConfig);
+    return esUs;
+}
+
+/* A line with the counts since the process started; `what` says why it is written. */
+static void esLine(const char* what) {
+    fprintf(stderr,
+            "hybris-icd: event sleep: %s, pid %d, seconds %llu, us %u, paused %d, calls %llu, set %llu, sleeps %llu, "
+            "set-after-sleep %llu, slept %.1f ms\n",
+            what, (int)getpid(), (unsigned long long)((nowNs() - esStartNs) / 1000000000ull), esUs,
+            (int)__atomic_load_n(&esPaused, __ATOMIC_RELAXED), (unsigned long long)__atomic_load_n(&esCount.calls, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&esCount.set, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&esCount.sleeps, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&esCount.setAfterSleep, __ATOMIC_RELAXED),
+            (double)__atomic_load_n(&esCount.sleptNs, __ATOMIC_RELAXED) / 1e6);
+}
+
+/* Every esLogSeconds (presents call this), unless no call came since the last line; `force`: now, if
+ * there was any call. */
+static void esLog(bool force) {
+    uint64_t last = __atomic_load_n(&esLastLogNs, __ATOMIC_RELAXED);
+    uint64_t now = nowNs();
+    if (!force && ((int64_t)(now - last) < (int64_t)esLogSeconds * 1000000000ll ||
+                   !__atomic_compare_exchange_n(&esLastLogNs, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)))
+        return;
+    uint64_t calls = __atomic_load_n(&esCount.calls, __ATOMIC_RELAXED);
+    if (!calls || (!force && __atomic_exchange_n(&esLoggedCalls, calls, __ATOMIC_RELAXED) == calls)) return;
+    esLine(force ? "device destroyed" : "counts");
+}
+
+/* Whether the pause file exists, looked at again when the last look is 250 ms old. */
+static bool esPausedNow(uint64_t now) {
+    if (!esPausePath) return false;
+    uint64_t last = __atomic_load_n(&esPauseCheckNs, __ATOMIC_RELAXED);
+    if ((int64_t)(now - last) >= ES_PAUSE_CHECK_NS &&
+        __atomic_compare_exchange_n(&esPauseCheckNs, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        uint32_t paused = !access(esPausePath, F_OK);
+        if (__atomic_exchange_n(&esPaused, paused, __ATOMIC_RELAXED) != paused) esLine(paused ? "paused" : "resumed");
+    }
+    return __atomic_load_n(&esPaused, __ATOMIC_RELAXED);
+}
+
+/* The driver's vkGetEventStatus: the first one a device lookup gives (libhybris gives every device the same). */
+static PFN_vkGetEventStatus nextGetEventStatus;
+
+/* The event of this thread's last call when its answer was VK_EVENT_RESET (else null), and when that
+ * call returned. */
+static __thread struct {
+    VkDevice device;
+    VkEvent event;
+    uint64_t ns;
+} esLast;
+
+static VkResult VKAPI_CALL GetEventStatus(VkDevice device, VkEvent event) {
+    PFN_vkGetEventStatus next = __atomic_load_n(&nextGetEventStatus, __ATOMIC_ACQUIRE);
+    VkResult result = next(device, event);
+    __atomic_add_fetch(&esCount.calls, 1, __ATOMIC_RELAXED);
+    uint64_t now = result == VK_EVENT_RESET ? nowNs() : 0;
+    if (result == VK_EVENT_RESET && esLast.event == event && esLast.device == device && now - esLast.ns <= ES_REPEAT_NS &&
+        !esPausedNow(now)) {
+        struct timespec sleep = {0, (long)esUs * 1000};
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep, NULL);
+        uint64_t woke = nowNs(), slept = woke - now;
+        __atomic_add_fetch(&esCount.sleeps, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&esCount.sleptNs, slept, __ATOMIC_RELAXED);
+        if (!__atomic_load_n(&esSlept, __ATOMIC_RELAXED) && !__atomic_exchange_n(&esSlept, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "hybris-icd: event sleep: first sleep, pid %d, event 0x%llx, %u us asked, %llu us slept\n", (int)getpid(),
+                    (unsigned long long)(uintptr_t)event, esUs, (unsigned long long)(slept / 1000));
+        result = next(device, event);
+        if (result == VK_EVENT_SET) __atomic_add_fetch(&esCount.setAfterSleep, 1, __ATOMIC_RELAXED);
+        now = woke;
+    }
+    if (result == VK_EVENT_SET) __atomic_add_fetch(&esCount.set, 1, __ATOMIC_RELAXED);
+    esLast.device = result == VK_EVENT_RESET ? device : VK_NULL_HANDLE;
+    esLast.event = result == VK_EVENT_RESET ? event : VK_NULL_HANDLE;
+    esLast.ns = now;
+    return result;
 }
 
 /* Shader code handed to the driver (`what`, and the module's handle when there is one): the guards not
@@ -636,11 +771,13 @@ void mali_device_destroyed(Device* device) {
     cmdmem_device_destroyed(commandMemory, (uint64_t)(uintptr_t)device->handle);
     xfb_stats_flush(XFB_TAG);
     if (pbModeNow() != PB_OFF) pbLog(true);
+    if (esSleepUs()) esLog(true);
 }
 
 void mali_presented(void) {
     xfb_stats_present(XFB_TAG);
     if (pbModeNow() != PB_OFF && !(__atomic_add_fetch(&pbPresents, 1, __ATOMIC_RELAXED) & 7)) pbLog(false);
+    if (esSleepUs()) esLog(false);
 }
 
 /* ---- stream output counts (xfb_stats.h): the driver's two commands, kept like the reset's ---- */
@@ -903,6 +1040,8 @@ PFN_vkVoidFunction mali_device_proc(VkDevice handle, const char* name) {
         return pbModeNow() != PB_OFF ? xfbProc(handle, name, &nextPipelineBarrier2, (PFN_vkVoidFunction)CmdPipelineBarrier2) : NULL;
     if (!strcmp(name, "vkCmdPipelineBarrier2KHR"))
         return pbModeNow() != PB_OFF ? xfbProc(handle, name, &nextPipelineBarrier2KHR, (PFN_vkVoidFunction)CmdPipelineBarrier2KHR) : NULL;
+    if (!strcmp(name, "vkGetEventStatus"))
+        return esSleepUs() ? xfbProc(handle, name, &nextGetEventStatus, (PFN_vkVoidFunction)GetEventStatus) : NULL;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)CreateGraphicsPipelines;
     if (!strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)CreateComputePipelines;
     if (!strcmp(name, "vkCreateRayTracingPipelinesKHR") || !strcmp(name, "vkGetShaderModuleCreateInfoIdentifierEXT"))

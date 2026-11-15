@@ -908,6 +908,27 @@ def hybris_pipeline_cache(env):
     return os.path.join(cache, "droiddeck", "hybris-pipelines")
 
 
+AVA_APP_ID = "1473480"
+EVENT_SLEEP_US = "DROIDDECK_HYBRIS_EVENT_SLEEP_US"
+
+
+def ava_event_sleep(env):
+    """[mali-g2] A.V.A. Global (Steam 1473480) on the in-process driver: its render thread polls DXVK's event
+    queries (vkGetEventStatus) for about 4 ms a frame while it waits for the GPU. DROIDDECK_HYBRIS_EVENT_SLEEP_US=50
+    makes it sleep 50 us between polls of an event that stays reset (mali-g2/hybris/src/mali_fixes.c). On a Xring O3
+    at native 3408x2272, 144 Hz, in one range session with 60 s segments off, on, off: 135.34 against 133.52 and
+    131.84 fps (+2.00%), 1439 against 1401 and 1345 million GPU cycles executed a second (+4.8%) at a GPU clock of
+    1591 against 1504 and 1493 MHz, 10.6 against 10.5 and 10.2 million cycles a frame, render thread busy 0.37
+    against 0.98, CPU and SoC about 1-2 C cooler; about 5,700 sleeps a second, 109 us slept per 50 us asked. 100 us
+    in a second session: +1.88% fps, +6.3% cycles a second. A sleep holds DXVK's event lock and, on a multithreaded
+    D3D9 device, the device lock, so only this game gets it. A value already set (0 in the game's own environment
+    turns it off) is kept."""
+    if game_id(env) != AVA_APP_ID or EVENT_SLEEP_US in env:
+        return None
+    env[EVENT_SLEEP_US] = "50"
+    return "A.V.A.: hybris sleeps 50 us between vkGetEventStatus polls"
+
+
 def hybris_gpu(command, env):
     """[mali-g2] DROIDDECK_GPU_PATH=hybris (the app's gpuPath setting, or a game's environment): the game's
     processes run the Mali driver themselves through libhybris (mali-g2/hybris) instead of forwarding every
@@ -935,6 +956,9 @@ def hybris_gpu(command, env):
     result.setdefault("VORTEK_PRESENT_SOCKET", os.path.join(env.get("XDG_RUNTIME_DIR") or "/run/droiddeck", "vortek-present"))
     result.setdefault("DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR", hybris_pipeline_cache(env))
     print("droiddeck-game-env: Vulkan in-process (libhybris), Steam stays on Vortek", file=sys.stderr)
+    note = ava_event_sleep(result)
+    if note:
+        print("droiddeck-game-env: " + note, file=sys.stderr)
     return result
 
 
