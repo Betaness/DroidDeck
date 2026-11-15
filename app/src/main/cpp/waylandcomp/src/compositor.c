@@ -2911,24 +2911,21 @@ static void constraint_origin(const struct constraint *k, int *x, int *y) {
     if (k->surface && k->surface != g_desktop && k->surface->placed) { *x = k->surface->x; *y = k->surface->y; }
 }
 
-static void confine_clamp(const struct constraint *k, double *x, double *y) {
-    int ox, oy, w, h, rx = 0, ry = 0, rw, rh;
-    if (!k->surface) return;
+static int confine_box(const struct constraint *k, double box[4]) {
+    int ox, oy, w, h;
+    if (!k->surface) return 0;
     constraint_origin(k, &ox, &oy);
     surface_size(k->surface, &w, &h);
-    rw = w; rh = h;
-    if (k->region.set) {
-        int x2 = rx + rw < k->region.x + k->region.w ? rx + rw : k->region.x + k->region.w;
-        int y2 = ry + rh < k->region.y + k->region.h ? ry + rh : k->region.y + k->region.h;
-        if (k->region.x > rx) rx = k->region.x;
-        if (k->region.y > ry) ry = k->region.y;
-        rw = x2 - rx; rh = y2 - ry;
-    }
-    if (rw <= 0 || rh <= 0) return;
-    if (*x < ox + rx) *x = ox + rx;
-    if (*x > ox + rx + rw - 1) *x = ox + rx + rw - 1;
-    if (*y < oy + ry) *y = oy + ry;
-    if (*y > oy + ry + rh - 1) *y = oy + ry + rh - 1;
+    return ptrsync_confine_box(ox, oy, w, h, k->region.set, k->region.x, k->region.y, k->region.w, k->region.h, box);
+}
+
+static void confine_clamp(const struct constraint *k, double *x, double *y) {
+    double b[4];
+    if (!confine_box(k, b)) return;
+    if (*x < b[0]) *x = b[0];
+    if (*x > b[2]) *x = b[2];
+    if (*y < b[1]) *y = b[1];
+    if (*y > b[3]) *y = b[3];
 }
 
 static void constraint_send_state(struct constraint *k, int on) {
@@ -2967,6 +2964,7 @@ static void constraint_end(struct constraint *k, int tell_client, const char *wh
     constraint_describe(k, name, sizeof(name));
     droiddeck_log("pointer", "%s: %s (%s), pointer at %d,%d", k->is_lock ? "unlocked" : "unconfined",
                name, why, (int)g_ptr_x, (int)g_ptr_y);
+    publish_query_state();
     sync_lock_notify();
 }
 
@@ -3003,6 +3001,7 @@ static void constraint_activate(struct constraint *k) {
     else
         droiddeck_log("pointer", "confined: %s (%s) to the whole window", name,
                    k->lifetime == ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT ? "oneshot" : "persistent");
+    publish_query_state();
     sync_lock_notify();
     wl_display_flush_clients(g_display);
 }
@@ -3041,8 +3040,10 @@ static void constraints_pointer_gone(struct wl_resource *pointer) {
 static void constraints_surface_commit(struct surface *s) {
     struct constraint *k;
     const double was_x = g_ptr_x, was_y = g_ptr_y;
+    int changed = 0;
     wl_list_for_each(k, &g_constraints, link) {
         if (k->surface != s) continue;
+        if (k->active && (k->pending_hint_set || k->pending_region_set)) changed = 1;
         if (k->pending_hint_set) {
             k->hint_set = 1;
             k->hint_x = k->pending_hint_x;
@@ -3064,6 +3065,7 @@ static void constraints_surface_commit(struct surface *s) {
             if (k->active && !k->is_lock) confine_clamp(k, &g_ptr_x, &g_ptr_y);
         }
     }
+    if (changed) publish_query_state();
     if ((g_ptr_x != was_x || g_ptr_y != was_y) && atomic_load(&g_cursor_composite))
         schedule_render();
 }
@@ -3231,10 +3233,11 @@ static int send_relative_motion(struct wl_client *client, double dx, double dy) 
 static void pointer_catch_up(struct wl_client *client, int locked, wl_fixed_t fx, wl_fixed_t fy, uint32_t t) {
     struct seat_pointer *sp;
     int behind = 0;
-    for_each_pointer_of(client, sp) behind |= sp->behind;
+    for_each_pointer_of(client, sp) if (sp->focus) behind |= sp->behind;
     if (!ptrsync_catch_up(locked, behind)) return;
     relative_motion_to(client, 0, 0);
     for_each_pointer_of(client, sp) {
+        if (!sp->focus) continue;
         wl_pointer_send_motion(sp->ptr, t, fx, fy);
         if (wl_resource_get_version(sp->ptr) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(sp->ptr);
@@ -3467,13 +3470,15 @@ struct query_snapshot {
     int has_position;
     int input_x, input_y;
     int focus_takes_touch;
-    /* the pointer in scene px, the scene size, ptrsync_scene_map's mapping and the last delta number read */
+    /* the pointer in scene px, the scene size, ptrsync_scene_map's mapping, the last delta number read and
+     * the box a confined pointer stays in (the scene when not confined) */
     double ptr_x, ptr_y;
     int scene_w, scene_h;
     double map[4];
     uint32_t delta_seq;
+    double box[4];
 };
-static struct query_snapshot g_query = { 0, 0, 0, 1, 0, 0, 0, 0, { 0, 0, 0, 0 }, 0 };
+static struct query_snapshot g_query = { 0, 0, 0, 1, 0, 0, 0, 0, { 0, 0, 0, 0 }, 0, { 0, 0, 0, 0 } };
 
 static void publish_query_state(void) {
     struct surface *target = g_key_target ? g_key_target : (g_grab ? g_grab : toplevel_at(g_ptr_x, g_ptr_y));
@@ -3485,7 +3490,7 @@ static void publish_query_state(void) {
         for_each_touch_of(client, st) takes_touch = 1;
     }
     int w = 0, h = 0, ow = 0, oh = 0, input_x = 0, input_y = 0, has_position = 0;
-    double map[4] = { 0, 0, 0, 0 };
+    double map[4] = { 0, 0, 0, 0 }, box[4] = { 0, 0, 0, 0 };
     scene_size(&w, &h);
     vkp_output_size(&ow, &oh);
     if (g_ptr_known && w > 0 && h > 0) {
@@ -3499,6 +3504,9 @@ static void publish_query_state(void) {
         }
         int shown = ow > 0 && oh > 0 && vkp_scene_to_output(0, 0, &o0x, &o0y) && vkp_scene_to_output(1, 1, &o1x, &o1y);
         ptrsync_scene_map(shown, o0x, o0y, o1x, o1y, ow, oh, w, h, map);
+        box[2] = w - 1;
+        box[3] = h - 1;
+        if (g_active_constraint && !g_active_constraint->is_lock) confine_box(g_active_constraint, box);
         has_position = 1;
     }
     pthread_mutex_lock(&g_query_lock);
@@ -3512,6 +3520,7 @@ static void publish_query_state(void) {
     g_query.scene_h = h;
     memcpy(g_query.map, map, sizeof(map));
     g_query.delta_seq = g_delta_seq;
+    memcpy(g_query.box, box, sizeof(box));
     pthread_mutex_unlock(&g_query_lock);
 }
 
@@ -3533,8 +3542,9 @@ int droiddeck_cursor_input_pos(int *x, int *y) {
     return 1;
 }
 
-/* out: pointer x, y (scene px), scene width, height, the four ptrsync_scene_map values, the last delta number. */
-int droiddeck_cursor_scene_state(double out[9]) {
+/* out: pointer x, y (scene px), scene width, height, the four ptrsync_scene_map values, the last delta number,
+ * the box the pointer stays in (x0, y0, x1, y1, scene px). */
+int droiddeck_cursor_scene_state(double out[13]) {
     pthread_mutex_lock(&g_query_lock);
     struct query_snapshot q = g_query;
     pthread_mutex_unlock(&g_query_lock);
@@ -3545,6 +3555,7 @@ int droiddeck_cursor_scene_state(double out[9]) {
     out[3] = q.scene_h;
     memcpy(out + 4, q.map, sizeof(q.map));
     out[8] = q.delta_seq;
+    memcpy(out + 9, q.box, sizeof(q.box));
     return 1;
 }
 

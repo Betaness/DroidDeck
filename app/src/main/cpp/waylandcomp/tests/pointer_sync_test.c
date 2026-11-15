@@ -65,10 +65,27 @@ static void scene_map(void) {
     CHECK(!ptrsync_scene_map(1, 0, 0, 2, 2, 3408, 2272, 0, 1136, m), "no scene: no mapping");
 }
 
+static void confine(void) {
+    double b[4] = { -1, -1, -1, -1 };
+    CHECK(ptrsync_confine_box(0, 0, 1704, 1136, 0, 0, 0, 0, 0, b), "whole window");
+    CHECK(near(b[0], 0) && near(b[1], 0) && near(b[2], 1703) && near(b[3], 1135),
+          "whole window: %g %g %g %g", b[0], b[1], b[2], b[3]);
+    CHECK(ptrsync_confine_box(100, 50, 800, 600, 1, 200, 100, 300, 200, b), "region of a placed window");
+    CHECK(near(b[0], 300) && near(b[1], 150) && near(b[2], 599) && near(b[3], 349),
+          "region: %g %g %g %g", b[0], b[1], b[2], b[3]);
+    CHECK(ptrsync_confine_box(0, 0, 800, 600, 1, -50, 500, 2000, 400, b), "region past the window");
+    CHECK(near(b[0], 0) && near(b[1], 500) && near(b[2], 799) && near(b[3], 599),
+          "cut to the window: %g %g %g %g", b[0], b[1], b[2], b[3]);
+    b[0] = 7;
+    CHECK(!ptrsync_confine_box(0, 0, 800, 600, 1, 900, 0, 10, 10, b) && near(b[0], 7), "empty: no box, unchanged");
+    CHECK(!ptrsync_confine_box(0, 0, 0, 600, 0, 0, 0, 0, 0, b), "no window size: no box");
+}
+
 int main(void) {
     motion();
     catch_up();
     scene_map();
+    confine();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

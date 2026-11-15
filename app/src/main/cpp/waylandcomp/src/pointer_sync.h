@@ -26,4 +26,9 @@ int ptrsync_catch_up(int locked, int behind);
 int ptrsync_scene_map(int shown, double o0x, double o0y, double o1x, double o1y, int ow, int oh,
                       int scene_w, int scene_h, double map[4]);
 
+/* The box a pointer confined to a w x h window at (ox, oy) stays in, scene px, inclusive: box = x0, y0, x1, y1.
+ * region_set: only the part of the window in the region (rx, ry, rw, rh, window px). 0 (box unchanged) when
+ * that is empty. */
+int ptrsync_confine_box(int ox, int oy, int w, int h, int region_set, int rx, int ry, int rw, int rh, double box[4]);
+
 #endif

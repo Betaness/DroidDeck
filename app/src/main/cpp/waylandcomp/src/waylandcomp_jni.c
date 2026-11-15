@@ -31,7 +31,7 @@ extern int droiddeck_hud_frame_times(float *out, int len, int64_t *total);
 extern void droiddeck_wayland_send_key(int evdev, int state);
 extern int  droiddeck_focus_takes_touch(void);
 extern int  droiddeck_cursor_input_pos(int *x, int *y);
-extern int  droiddeck_cursor_scene_state(double out[9]);
+extern int  droiddeck_cursor_scene_state(double out[13]);
 extern void droiddeck_wayland_send_scene_input(int type, int a, int b);
 extern void droiddeck_wayland_send_pointer_delta(int dx, int dy, int seq);
 extern void droiddeck_wayland_set_cursor_composite(int on);
@@ -352,10 +352,10 @@ JNIEXPORT jboolean JNICALL
 Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeCursorScene(
         JNIEnv *env, jclass clazz, jdoubleArray out) {
     (void)clazz;
-    if (!out || (*env)->GetArrayLength(env, out) < 9) return JNI_FALSE;
-    double state[9];
+    if (!out || (*env)->GetArrayLength(env, out) < 13) return JNI_FALSE;
+    double state[13];
     if (!droiddeck_cursor_scene_state(state)) return JNI_FALSE;
-    (*env)->SetDoubleArrayRegion(env, out, 0, 9, state);
+    (*env)->SetDoubleArrayRegion(env, out, 0, 13, state);
     return JNI_TRUE;
 }
 

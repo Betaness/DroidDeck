@@ -27,3 +27,19 @@ int ptrsync_scene_map(int shown, double o0x, double o0y, double o1x, double o1y,
     }
     return 1;
 }
+
+int ptrsync_confine_box(int ox, int oy, int w, int h, int region_set, int rx, int ry, int rw, int rh, double box[4]) {
+    int x0 = 0, y0 = 0, x1 = w, y1 = h;
+    if (region_set) {
+        if ((long long)rx + rw < x1) x1 = rx + rw;
+        if ((long long)ry + rh < y1) y1 = ry + rh;
+        if (rx > x0) x0 = rx;
+        if (ry > y0) y0 = ry;
+    }
+    if (x1 - x0 <= 0 || y1 - y0 <= 0) return 0;
+    box[0] = ox + x0;
+    box[1] = oy + y0;
+    box[2] = ox + x1 - 1;
+    box[3] = oy + y1 - 1;
+    return 1;
+}

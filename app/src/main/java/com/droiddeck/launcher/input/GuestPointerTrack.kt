@@ -6,8 +6,8 @@ package com.droiddeck.launcher.input
  *
  * Pointer deltas reach the compositor through a pipe it reads on its own thread. It publishes its pointer
  * in scene px with the number of the last delta it read (WaylandCompositor.nativeCursorScene), and the
- * deltas sent after that one are added here, clamped to the scene as the compositor clamps them. A
- * session below the output resolution shows one scene px as more than one view px.
+ * deltas sent after that one are added here, clamped to the scene and to a confined pointer's box as the
+ * compositor clamps them. A session below the output resolution shows one scene px as more than one view px.
  */
 class GuestPointerTrack @JvmOverloads constructor(
     private val capacity: Int = 256,
@@ -48,18 +48,22 @@ class GuestPointerTrack @JvmOverloads constructor(
     fun place(state: DoubleArray, nowMs: Long, viewWidth: Int, viewHeight: Int, out: FloatArray): Boolean {
         val w = state[SCENE_W].toInt()
         val h = state[SCENE_H].toInt()
-        if (w <= 0 || h <= 0 || viewWidth <= 0 || viewHeight <= 0) return false
+        if (state.size < STATE_SIZE || w <= 0 || h <= 0 || viewWidth <= 0 || viewHeight <= 0) return false
         val applied = state[SEQ].toLong().toInt()
         while (count > 0 && (read(seqs[first], applied) || nowMs - times[first] > maxAgeMs)) {
             first = (first + 1) % capacity
             count--
         }
+        val boxX = state[BOX_X0] <= state[BOX_X1]
+        val boxY = state[BOX_Y0] <= state[BOX_Y1]
         var x = state[X]
         var y = state[Y]
         for (n in 0 until count) {
             val i = (first + n) % capacity
             x = (x + dxs[i] / 256.0).coerceIn(0.0, w - 1.0)
             y = (y + dys[i] / 256.0).coerceIn(0.0, h - 1.0)
+            if (boxX) x = x.coerceIn(state[BOX_X0], state[BOX_X1])
+            if (boxY) y = y.coerceIn(state[BOX_Y0], state[BOX_Y1])
         }
         out[0] = ((state[MAP_AX] * x + state[MAP_BX]) * viewWidth).toFloat()
         out[1] = ((state[MAP_AY] * y + state[MAP_BY]) * viewHeight).toFloat()
@@ -85,6 +89,11 @@ class GuestPointerTrack @JvmOverloads constructor(
         const val MAP_BY = 7
         /** The number of the last delta the compositor read, 0 before the first. */
         const val SEQ = 8
-        const val STATE_SIZE = 9
+        /** The box the pointer stays in, scene px, inclusive: the scene, or a confined pointer's box. */
+        const val BOX_X0 = 9
+        const val BOX_Y0 = 10
+        const val BOX_X1 = 11
+        const val BOX_Y1 = 12
+        const val STATE_SIZE = 13
     }
 }

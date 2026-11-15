@@ -9,6 +9,8 @@ class GuestPointerTrackTest {
     /** The compositor's side: deltas wait in its pipe until it reads them, then move and clamp its pointer. */
     private class Compositor(val w: Int, val h: Int, var x: Double, var y: Double) {
         var seq = 0
+        /** A confined pointer's box (x0, y0, x1, y1), or null. */
+        var box: DoubleArray? = null
         private val pipe = ArrayDeque<IntArray>()
 
         fun send(track: GuestPointerTrack, dx: Int, dy: Int, nowMs: Long) {
@@ -23,6 +25,10 @@ class GuestPointerTrackTest {
                 val m = pipe.removeFirstOrNull() ?: return
                 x = (x + m[0] / 256.0).coerceIn(0.0, w - 1.0)
                 y = (y + m[1] / 256.0).coerceIn(0.0, h - 1.0)
+                box?.let {
+                    x = x.coerceIn(it[0], it[2])
+                    y = y.coerceIn(it[1], it[3])
+                }
                 seq = m[2]
             }
         }
@@ -30,7 +36,8 @@ class GuestPointerTrackTest {
         /** A scene stretched over the whole output, as the Xiaomi Pad's half-resolution session. */
         fun state(map: DoubleArray = doubleArrayOf(1.0 / w, 0.0, 1.0 / h, 0.0)): DoubleArray =
             doubleArrayOf(x, y, w.toDouble(), h.toDouble(), map[0], map[1], map[2], map[3],
-                (seq.toLong() and 0xffffffffL).toDouble())
+                (seq.toLong() and 0xffffffffL).toDouble()) +
+                (box ?: doubleArrayOf(0.0, 0.0, w - 1.0, h - 1.0))
     }
 
     private val out = FloatArray(2)
@@ -68,6 +75,32 @@ class GuestPointerTrackTest {
         compositor.read()
         assertTrue(track.place(compositor.state(), 0, 3408, 2272, out))
         assertEquals(1125 * 2f, out[1], 1e-3f)
+    }
+
+    @Test fun motionTheCompositorHasNotReadStopsAtTheConfinedBox() {
+        val track = GuestPointerTrack()
+        val compositor = Compositor(1704, 1136, 595.0, 300.0)
+        compositor.box = doubleArrayOf(300.0, 150.0, 599.0, 349.0)
+        repeat(10) { compositor.send(track, 1, 0, 0) }
+        assertTrue(track.place(compositor.state(), 0, 3408, 2272, out))
+        assertEquals(599 * 2f, out[0], 1e-3f)
+        repeat(4) { compositor.send(track, -1, 0, 0) }
+        assertTrue(track.place(compositor.state(), 0, 3408, 2272, out))
+        assertEquals("back from the box edge", 595 * 2f, out[0], 1e-3f)
+        compositor.read()
+        assertTrue(track.place(compositor.state(), 0, 3408, 2272, out))
+        assertEquals("the same place once the compositor has read it", 595 * 2f, out[0], 1e-3f)
+    }
+
+    @Test fun aWarpTheCompositorPublishedMovesTheCursorWithoutMotion() {
+        val track = GuestPointerTrack()
+        val compositor = Compositor(1704, 1136, 100.0, 100.0)
+        assertTrue(track.place(compositor.state(), 0, 3408, 2272, out))
+        compositor.x = 852.0
+        compositor.y = 568.0
+        assertTrue(track.place(compositor.state(), 0, 3408, 2272, out))
+        assertEquals(1704f, out[0], 1e-3f)
+        assertEquals(1136f, out[1], 1e-3f)
     }
 
     @Test fun deltasTheCompositorHasReadAreNotAddedAgain() {
@@ -152,5 +185,6 @@ class GuestPointerTrackTest {
         val state = Compositor(1704, 1136, 1.0, 1.0).state()
         assertFalse(track.place(state, 0, 0, 2272, out))
         assertFalse(track.place(state.copyOf().also { it[GuestPointerTrack.SCENE_W] = 0.0 }, 0, 3408, 2272, out))
+        assertFalse("an older layout", track.place(state.copyOf(9), 0, 3408, 2272, out))
     }
 }
