@@ -1,7 +1,7 @@
 /*
- * The driver below the ICD in tests/guards_icd_test.c (tests/fake_icd.c, built as
- * libfake_mali_icd.so: the crash guard sees its functions in a library of the Mali driver). Its
- * state is shared with the test, which links it too.
+ * The driver below the ICD in tests/guards_icd_test.c and tests/event_sleep_test.c (tests/fake_icd.c,
+ * built as libfake_mali_icd.so: the crash guard sees its functions in a library of the Mali driver).
+ * Its state is shared with the test, which links it too.
  */
 #ifndef FAKE_ICD_H
 #define FAKE_ICD_H
@@ -20,10 +20,12 @@ typedef struct {
 } FakeScript;
 
 typedef struct {
-    FakeScript fences, semaphores, queueIdle, deviceIdle, queries;
+    FakeScript fences, semaphores, queueIdle, deviceIdle, queries, events;
     int submits, submits2, ends, pipelines, budgets;
     uintptr_t endFault, pipelineFault; /* read by vkEndCommandBuffer / vkCreate*Pipelines when set */
     VkQueue lastIdleQueue;
+    VkEvent lastEvent; /* vkGetEventStatus: the last call's event and answer */
+    VkResult lastEventResult;
 } FakeIcd;
 
 extern FakeIcd fake_icd;
