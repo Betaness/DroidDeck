@@ -3145,6 +3145,52 @@ class ForceSsbsTest(unittest.TestCase):
             finally:
                 g.update(old)
 
+    def test_only_ava_on_the_in_process_driver_gets_the_load_skip_unless_it_is_set(self):
+        hybris = MODULE["hybris_gpu"]
+        g = hybris.__globals__
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {name: Path(tmp) / name for name in ("icd.json", "libhybris-common.so.1", "libvulkan.so")}
+            for path in files.values():
+                path.write_bytes(b"")
+            old = {name: g[name] for name in ("HYBRIS_ICD", "HYBRIS_PRELOAD", "ANDROID_VULKAN")}
+            g.update(HYBRIS_ICD=str(files["icd.json"]), HYBRIS_PRELOAD=str(files["libhybris-common.so.1"]),
+                     ANDROID_VULKAN=str(files["libvulkan.so"]))
+            arm = Path(tmp) / "arm"
+            (arm / "files/lib/wine/aarch64-unix").mkdir(parents=True)
+            x86 = Path(tmp) / "x86"
+            (x86 / "files/lib/wine/x86_64-unix").mkdir(parents=True)
+            name = "DROIDDECK_HYBRIS_LOAD_SKIP"
+            try:
+                game = [str(arm / "proton"), "waitforexitandrun", "AVA.exe"]
+                ava = {"DROIDDECK_GPU_PATH": "hybris", "BL_GPU_MODE": "vortek",
+                       "STEAM_COMPAT_DATA_PATH": "/steam/steamapps/compatdata/1473480/"}
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    got = hybris(game, ava)
+                self.assertEqual(got[name], "all")
+                # The event sleep stays beside it.
+                self.assertEqual(got["DROIDDECK_HYBRIS_EVENT_SLEEP_US"], "50")
+                self.assertIn("droiddeck-game-env: A.V.A.: hybris turns colour loads that one full-cover draw "
+                              "overwrites into DONT_CARE", stderr.getvalue())
+                self.assertNotIn(name, ava)
+                for own in ("off", "", "full"):
+                    self.assertEqual(hybris(game, dict(ava, **{name: own}))[name], own)
+                other = dict(ava, STEAM_COMPAT_DATA_PATH="/steam/steamapps/compatdata/3167020")
+                self.assertNotIn(name, hybris(game, other))
+                self.assertNotIn(name, hybris(game, dict(ava, STEAM_COMPAT_DATA_PATH="")))
+                for off in ({"DROIDDECK_GPU_PATH": "vortek"}, {"BL_GPU_MODE": "adreno"}):
+                    self.assertNotIn(name, hybris(game, dict(ava, **off)))
+                self.assertNotIn(name, hybris([str(x86 / "proton"), "waitforexitandrun", "AVA.exe"], ava))
+                self.assertNotIn(name, hybris([str(arm / "proton"), "run", "iscriptevaluator.exe"], ava))
+                # The game's own environment wins, and turns it off with off; another game's setting does not reach it.
+                preset = {"version": 1, "games": {"1473480": {name: "off"}}}
+                self.assertEqual(hybris(game, MODULE["apply_config"](ava, preset, "1473480"))[name], "off")
+                preset = {"version": 1, "games": {"3167020": {name: "off"}}}
+                self.assertEqual(hybris(game, MODULE["apply_config"](ava, preset, "1473480"))[name], "all")
+                self.assertNotIn(name, MODULE["engine_fixes"]("/games/AVA/Binaries/AVA.exe", [])[0])
+            finally:
+                g.update(old)
+
     def test_only_ava_on_the_in_process_driver_gets_the_event_sleep_unless_it_is_set(self):
         hybris = MODULE["hybris_gpu"]
         g = hybris.__globals__

@@ -239,6 +239,17 @@ sleep holds DXVK's event lock, so other games do not get it. A value already in
 the environment is kept; set it to `0` in the game's own environment to turn it
 off.
 
+A.V.A. on the in-process driver also gets `DROIDDECK_HYBRIS_LOAD_SKIP=all`
+(`mali-g2/hybris/src/cmd_stats.c`): a render pass's colour `LOAD` becomes
+`DONT_CARE` when its one opaque draw is proven to cover every pixel. The game's
+post passes (about 17 full-screen and 49 smaller single-draw passes a lobby
+frame) load the colour they then overwrite. At native 3408x2272, in one session
+with 30 s segments off, full, all, off: lobby 26.32, 32.56, 34.40 and 26.24 fps
+(all +31%; 60.5 against 46.3 million GPU cycles a frame), range 134.22, 142.94,
+145.64 and 133.47 fps (all +8.5%); 66.2 of 69.3 lobby passes changed a frame,
+none stale, and the screenshots differ from off only where the scene moves.
+A value already set is kept; `off` in the game's own environment turns it off.
+
 Elsewhere Windows sees a game's cores fastest first (Windows CPU 0 is the
 fastest core; `DROIDDECK_FASTEST_CORES=0` turns it off). Where the app forwards
 the GPU (`BL_GPU_MODE=vortek`, Mali) that order is off unless

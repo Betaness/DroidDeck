@@ -929,6 +929,24 @@ def ava_event_sleep(env):
     return "A.V.A.: hybris sleeps 50 us between vkGetEventStatus polls"
 
 
+LOAD_SKIP = "DROIDDECK_HYBRIS_LOAD_SKIP"
+
+
+def ava_load_skip(env):
+    """[mali-g2] A.V.A. Global on the in-process driver: DROIDDECK_HYBRIS_LOAD_SKIP=all (mali-g2/hybris/src/
+    cmd_stats.c) turns a render pass's colour LOAD into DONT_CARE when its one opaque draw is proven to cover every
+    pixel. The game's post passes (about 17 full-screen and 49 smaller single-draw passes a lobby frame) each load
+    the colour they overwrite. On a Xring O3 at native 3408x2272, in one session with 30 s segments off, full, all,
+    off: lobby 26.32, 32.56, 34.40, 26.24 fps (all +31%), 60.5, 48.9, 46.3, 60.7 million GPU cycles a frame; range
+    134.22, 142.94, 145.64, 133.47 fps (all +8.5%); 66.2 of 69.3 lobby passes and 16.2 of 18.3 range passes
+    changed a frame, none stale; screenshots differ from off only where the scene moves. A value already set (off
+    in the game's own environment turns it off) is kept."""
+    if game_id(env) != AVA_APP_ID or LOAD_SKIP in env:
+        return None
+    env[LOAD_SKIP] = "all"
+    return "A.V.A.: hybris turns colour loads that one full-cover draw overwrites into DONT_CARE"
+
+
 def hybris_gpu(command, env):
     """[mali-g2] DROIDDECK_GPU_PATH=hybris (the app's gpuPath setting, or a game's environment): the game's
     processes run the Mali driver themselves through libhybris (mali-g2/hybris) instead of forwarding every
@@ -956,9 +974,10 @@ def hybris_gpu(command, env):
     result.setdefault("VORTEK_PRESENT_SOCKET", os.path.join(env.get("XDG_RUNTIME_DIR") or "/run/droiddeck", "vortek-present"))
     result.setdefault("DROIDDECK_HYBRIS_PIPELINE_CACHE_DIR", hybris_pipeline_cache(env))
     print("droiddeck-game-env: Vulkan in-process (libhybris), Steam stays on Vortek", file=sys.stderr)
-    note = ava_event_sleep(result)
-    if note:
-        print("droiddeck-game-env: " + note, file=sys.stderr)
+    for fix in (ava_event_sleep, ava_load_skip):
+        note = fix(result)
+        if note:
+            print("droiddeck-game-env: " + note, file=sys.stderr)
     return result
 
 
