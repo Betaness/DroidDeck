@@ -49,16 +49,26 @@
  *               (spv_fs_may_discard), nor read attachments (input attachments, tile images).
  *   viewport    viewport 0 contains every pixel centre of the render area, scissor 0 the area.
  *   geometry    the draw's vertices, read from host-mapped memory where the vertex and index buffers
- *               are bound, are run through the vertex shader on the CPU (spv_vs_run): every
- *               position is known, finite and within 1e6 w, clip and cull distances never written or not negative, Layer and
- *               ViewportIndex never written or 0, and the triangles cover every pixel centre
- *               (ls_cover: one triangle, or a quad of two triangles sharing an edge, with a margin).
- *               A pipeline keeps its last run: the same inputs, byte for byte, are not run again.
- *               The data must not be written by the GPU in any command buffer not yet reset since
- *               (copies, fills, updates, query results, transform feedback, shaders that write
- *               memory). It is read when the pass is recorded: it must not change before the pass
- *               runs (DXVK writes it before it records the draw); at each submission it is read
- *               again and a change is counted (stale).
+ *               are bound, are run through the vertex shader on the CPU (spv_vs_run) with its
+ *               specialization constants, the push constants recorded in the secondary for the
+ *               vertex stage, and the uniform and storage buffers it declares, read from host-mapped
+ *               memory through the descriptor sets the secondary bound (vkCmdBindDescriptorSets or
+ *               its 2 form, dynamic offsets included; sets written by vkUpdateDescriptorSets or an
+ *               update template and not written again since they were bound; push descriptors,
+ *               descriptor buffers and update-after-bind layouts are not followed): every position is
+ *               known, finite and within 1e6 w, clip and cull distances never written or not
+ *               negative, Layer and ViewportIndex never written or 0, and the triangles cover every
+ *               pixel centre (ls_cover: one triangle, or a quad of two triangles sharing an edge, with
+ *               a margin). A position not known is kept for where it came from: vs-ubo-unmapped,
+ *               vs-ubo-pending-write, vs-ubo-range (past the descriptor's range or 16 KB),
+ *               vs-descriptor, vs-push, vs-image, vs-input, vs-branch (a branch on a value the run
+ *               does not compute), vs (anything else). A pipeline keeps its last run: the same
+ *               vertices and the same bytes read for it are not run again. The data must not be
+ *               written by the GPU in any command buffer not yet reset since (copies, fills,
+ *               updates, query results, transform feedback, shaders that write memory). It is read
+ *               when the pass is recorded: it must not change before the pass runs (DXVK writes
+ *               vertices and shader constants before it records the draw); at each submission it is
+ *               read again and a change is counted (stale).
  * Every DROIDDECK_HYBRIS_CMD_STATS_LOG_S seconds of presents a line "hybris-icd: load skip: ..."
  * counts the passes that had a colour LOAD: applied, and the ones kept by the first check that
  * failed (its reason). DROIDDECK_HYBRIS_LOAD_SKIP_FILE=<path>: "off", "full" or "all" in that file
@@ -158,12 +168,14 @@ static const char* const statNames[S_COUNT] = {
 enum {
     L_APPLIED, L_COLOR_COUNT, L_FLAGS, L_INLINE, L_PNEXT, L_DEPTH, L_LAYERS, L_FEEDBACK, L_AREA, L_SMALL, L_ORDER,
     L_SECONDARY, L_DRAWS, L_BARRIER, L_PIPELINE, L_BLEND, L_MASK, L_LOGIC_OP, L_RASTER, L_DISCARD, L_DYNAMIC,
-    L_VIEWPORT, L_SCISSOR, L_VERTEX, L_VS, L_GEOMETRY, L_GEOMETRY_EDGE, L_CONDITIONAL, L_UNWRAPPED, L_OFF, L_STALE, L_COUNT
+    L_VIEWPORT, L_SCISSOR, L_VERTEX, L_VS, L_VS_BRANCH, L_VS_UNMAPPED, L_VS_PENDING, L_VS_RANGE, L_VS_DESCRIPTOR, L_VS_PUSH,
+    L_VS_IMAGE, L_VS_INPUT, L_GEOMETRY, L_GEOMETRY_EDGE, L_CONDITIONAL, L_UNWRAPPED, L_OFF, L_STALE, L_COUNT
 };
 static const char* const loadNames[L_COUNT] = {
     "applied", "color-count", "flags", "inline", "pnext", "depth", "layers", "feedback", "area", "small", "order",
     "secondary", "draws", "barrier", "pipeline", "blend", "mask", "logic-op", "raster", "discard", "dynamic",
-    "viewport", "scissor", "vertex", "vs", "geometry", "geometry-edge", "conditional", "unwrapped", "off", "stale"};
+    "viewport", "scissor", "vertex", "vs", "vs-branch", "vs-ubo-unmapped", "vs-ubo-pending-write", "vs-ubo-range", "vs-descriptor",
+    "vs-push", "vs-image", "vs-input", "geometry", "geometry-edge", "conditional", "unwrapped", "off", "stale"};
 
 static uint64_t stats[S_COUNT], logged[S_COUNT];
 static uint64_t loads[L_COUNT], loadsLogged[L_COUNT];
@@ -443,6 +455,8 @@ typedef struct {
 
 #define MAX_VB 16
 #define MAX_ATTRS 32
+#define MAX_SETS 8 /* descriptor sets followed per command buffer */
+#define MAX_DYN 8  /* dynamic offsets per set */
 
 /* dynamic states: tracked here (D_*), harmless for the load skip, or neither */
 enum {
@@ -495,12 +509,16 @@ static int dynamicKind(VkDynamicState s) {
 
 #define MAX_VERTS 64
 
-/* the last vertex shader run of a pipeline: its inputs and what came of them */
+/* the last vertex shader run of a pipeline: its inputs (the vertices and the resources it read,
+ * serialized) and what came of them */
 typedef struct {
     SpvVertexIn in[MAX_VERTS];
     uint32_t count;
     int result;
     float pos[MAX_VERTS][4];
+    uint8_t* res;
+    uint32_t resSize;
+    uint64_t resHash;
 } VsCache;
 
 #define PART_VI VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT
@@ -573,6 +591,7 @@ static void pipeUnref(Pipe* p) {
     if (!p || __atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) return;
     spv_unref(p->vs);
     specFree(&p->vsSpec);
+    if (p->cache) free(p->cache->res);
     free(p->cache);
     free(p);
 }
@@ -615,6 +634,15 @@ typedef struct {
     VkDeviceSize ibOffset, ibSize;
     VkIndexType ibType;
     bool ibSet;
+    /* graphics descriptor sets as bound (setGen: the set's generation then), dynamic offsets */
+    VkDescriptorSet sets[MAX_SETS];
+    uint64_t setGen[MAX_SETS];
+    uint32_t setBound;
+    uint8_t dynCount[MAX_SETS];
+    uint32_t dyn[MAX_SETS][MAX_DYN];
+    /* push constants the vertex stage sees; pushKnown bit i: bytes 4i..4i+3 */
+    uint8_t push[SPV_PUSH_MAX];
+    uint64_t pushKnown;
 } RecState;
 
 typedef struct {
@@ -787,6 +815,9 @@ enum {
     W_SET_RESTART, W_SET_RASTER_DISCARD, W_SET_VERTEX_INPUT, W_SET_WRITE_ENABLE, W_SET_WRITE_MASK, W_SET_BLEND_ENABLE,
     W_SET_LOGIC_OP_ENABLE, W_SET_A2C, W_SET_SAMPLE_MASK, W_SET_SAMPLES, W_SET_POLYGON, W_SET_SAMPLE_LOCATIONS,
     W_SET_RASTER_STREAM, W_BEGIN_CONDITIONAL, W_END_CONDITIONAL,
+    W_CREATE_DSL, W_DESTROY_DSL, W_RESET_DPOOL, W_DESTROY_DPOOL, W_ALLOC_DSETS, W_FREE_DSETS, W_UPDATE_DSETS, W_CREATE_DUT,
+    W_DESTROY_DUT, W_UPDATE_DSET_TEMPLATE, W_BIND_DSETS, W_BIND_DSETS2, W_PUSH_CONSTANTS, W_PUSH_CONSTANTS2, W_PUSH_DSET,
+    W_PUSH_DSET2, W_PUSH_DSET_TEMPLATE, W_PUSH_DSET_TEMPLATE2, W_SET_DB_OFFSETS, W_SET_DB_OFFSETS2,
     W_COUNT
 };
 static const char* const wrapNames[W_COUNT] = {
@@ -819,7 +850,13 @@ static const char* const wrapNames[W_COUNT] = {
     "vkCmdSetVertexInputEXT", "vkCmdSetColorWriteEnableEXT", "vkCmdSetColorWriteMaskEXT", "vkCmdSetColorBlendEnableEXT",
     "vkCmdSetLogicOpEnableEXT", "vkCmdSetAlphaToCoverageEnableEXT", "vkCmdSetSampleMaskEXT", "vkCmdSetRasterizationSamplesEXT",
     "vkCmdSetPolygonModeEXT", "vkCmdSetSampleLocationsEnableEXT",
-    "vkCmdSetRasterizationStreamEXT", "vkCmdBeginConditionalRenderingEXT", "vkCmdEndConditionalRenderingEXT"};
+    "vkCmdSetRasterizationStreamEXT", "vkCmdBeginConditionalRenderingEXT", "vkCmdEndConditionalRenderingEXT",
+    "vkCreateDescriptorSetLayout", "vkDestroyDescriptorSetLayout", "vkResetDescriptorPool", "vkDestroyDescriptorPool",
+    "vkAllocateDescriptorSets", "vkFreeDescriptorSets", "vkUpdateDescriptorSets", "vkCreateDescriptorUpdateTemplate",
+    "vkDestroyDescriptorUpdateTemplate", "vkUpdateDescriptorSetWithTemplate", "vkCmdBindDescriptorSets", "vkCmdBindDescriptorSets2",
+    "vkCmdPushConstants", "vkCmdPushConstants2", "vkCmdPushDescriptorSet", "vkCmdPushDescriptorSet2",
+    "vkCmdPushDescriptorSetWithTemplate", "vkCmdPushDescriptorSetWithTemplate2", "vkCmdSetDescriptorBufferOffsetsEXT",
+    "vkCmdSetDescriptorBufferOffsets2EXT"};
 /* aliases handled by the same wrapper slot */
 static const struct {
     const char* name;
@@ -836,7 +873,11 @@ static const struct {
     {"vkCmdBindVertexBuffers2EXT", W_BIND_VERTEX_BUFFERS2}, {"vkCmdBindIndexBuffer2KHR", W_BIND_INDEX_BUFFER2},
     {"vkCmdSetViewportWithCountEXT", W_SET_VIEWPORT_COUNT}, {"vkCmdSetScissorWithCountEXT", W_SET_SCISSOR_COUNT},
     {"vkCmdSetCullModeEXT", W_SET_CULL}, {"vkCmdSetFrontFaceEXT", W_SET_FRONT}, {"vkCmdSetPrimitiveTopologyEXT", W_SET_TOPOLOGY},
-    {"vkCmdSetPrimitiveRestartEnableEXT", W_SET_RESTART}, {"vkCmdSetRasterizerDiscardEnableEXT", W_SET_RASTER_DISCARD}};
+    {"vkCmdSetPrimitiveRestartEnableEXT", W_SET_RESTART}, {"vkCmdSetRasterizerDiscardEnableEXT", W_SET_RASTER_DISCARD},
+    {"vkCreateDescriptorUpdateTemplateKHR", W_CREATE_DUT}, {"vkDestroyDescriptorUpdateTemplateKHR", W_DESTROY_DUT},
+    {"vkUpdateDescriptorSetWithTemplateKHR", W_UPDATE_DSET_TEMPLATE}, {"vkCmdBindDescriptorSets2KHR", W_BIND_DSETS2},
+    {"vkCmdPushConstants2KHR", W_PUSH_CONSTANTS2}, {"vkCmdPushDescriptorSetKHR", W_PUSH_DSET}, {"vkCmdPushDescriptorSet2KHR", W_PUSH_DSET2},
+    {"vkCmdPushDescriptorSetWithTemplateKHR", W_PUSH_DSET_TEMPLATE}, {"vkCmdPushDescriptorSetWithTemplate2KHR", W_PUSH_DSET_TEMPLATE2}};
 
 static PFN_vkVoidFunction nextFn[W_COUNT];
 #define N(i, type) ((type)__atomic_load_n(&nextFn[i], __ATOMIC_ACQUIRE))
@@ -1080,6 +1121,341 @@ static VkResult VKAPI_CALL UnmapMemory2(VkDevice d, const VkMemoryUnmapInfoKHR* 
     VkResult r = N(W_UNMAP_MEMORY2, PFN_vkUnmapMemory2KHR)(d, info);
     if (TRACK) pthread_mutex_unlock(&trk);
     return r;
+}
+
+/* ---- descriptor sets ----
+ * The buffer descriptors of every set (uniform and storage buffers, dynamic or not), as written by
+ * vkUpdateDescriptorSets and vkUpdateDescriptorSetWithTemplate, so that a pass can read what its
+ * vertex shader reads. Each write bumps the set's generation; a command buffer keeps the generation
+ * a set had when it was bound, and a set written since (or freed) is not read. Layouts with update
+ * after bind, push descriptors or descriptor buffers are not followed. Guarded by dsk. */
+
+static pthread_mutex_t dsk = PTHREAD_MUTEX_INITIALIZER;
+static Map setLayouts, descSets, descPools, templates;
+static uint64_t descGen;
+
+#define LAYOUT_BUFFERS 256 /* buffer descriptors kept per set */
+
+typedef struct {
+    uint32_t binding, count;
+    VkDescriptorType type;
+    uint32_t buf; /* its first element among the set's buffer descriptors; UINT32_MAX: not kept */
+    uint32_t dyn; /* its first dynamic offset */
+} DslBinding;
+
+typedef struct {
+    int refs;
+    bool unknown;
+    uint32_t count, buffers, dynamic;
+    DslBinding b[];
+} SetLayout;
+
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceSize offset, range;
+    VkDescriptorType type; /* as written; VK_DESCRIPTOR_TYPE_MAX_ENUM: none */
+} DescElem;
+
+typedef struct DescSet {
+    struct DescSet *prev, *next; /* in its pool */
+    VkDescriptorSet handle;
+    VkDescriptorPool pool;
+    SetLayout* layout;
+    uint64_t gen;
+    bool bad; /* a write this does not follow */
+    DescElem e[];
+} DescSet;
+
+typedef struct {
+    DescSet* head;
+} DescPool;
+
+typedef struct {
+    VkDescriptorUpdateTemplateType type;
+    uint32_t count;
+    VkDescriptorUpdateTemplateEntry e[];
+} Template;
+
+static bool bufferType(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+           t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+}
+
+static bool dynamicType(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+}
+
+static void layoutUnref(SetLayout* l) {
+    if (l && !--l->refs) free(l);
+}
+
+static int bindingCompare(const void* a, const void* b) {
+    uint32_t x = ((const DslBinding*)a)->binding, y = ((const DslBinding*)b)->binding;
+    return x < y ? -1 : x > y;
+}
+
+static const DslBinding* findBinding(const SetLayout* l, uint32_t binding, uint32_t* index) {
+    for (uint32_t i = 0; i < l->count; i++)
+        if (l->b[i].binding == binding) return *index = i, &l->b[i];
+    return NULL;
+}
+
+static VkResult VKAPI_CALL CreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo* info, const VkAllocationCallbacks* a,
+                                                     VkDescriptorSetLayout* layout) {
+    VkResult r = N(W_CREATE_DSL, PFN_vkCreateDescriptorSetLayout)(d, info, a, layout);
+    if (r != VK_SUCCESS || !TRACK || !info) return r;
+    uint32_t n = info->pBindings ? info->bindingCount : 0;
+    SetLayout* l = calloc(1, sizeof *l + n * sizeof l->b[0]);
+    if (l) {
+        l->refs = 1;
+        l->count = n;
+        if (info->flags & ~(VkDescriptorSetLayoutCreateFlags)VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_EXT) l->unknown = true;
+        const VkDescriptorSetLayoutBindingFlagsCreateInfo* bf =
+            findNext(info->pNext, VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
+        for (uint32_t i = 0; bf && bf->pBindingFlags && i < bf->bindingCount; i++)
+            if (bf->pBindingFlags[i] & (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT))
+                l->unknown = true;
+        for (uint32_t i = 0; i < n; i++)
+            l->b[i] = (DslBinding){info->pBindings[i].binding, info->pBindings[i].descriptorCount, info->pBindings[i].descriptorType, UINT32_MAX, 0};
+        qsort(l->b, n, sizeof l->b[0], bindingCompare);
+        for (uint32_t i = 0; i < n; i++) {
+            DslBinding* b = &l->b[i];
+            if (i && b->binding == l->b[i - 1].binding) l->unknown = true;
+            if (bufferType(b->type) || b->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+                if (b->count > LAYOUT_BUFFERS - l->buffers) {
+                    l->unknown = true;
+                    continue;
+                }
+                b->buf = l->buffers;
+                l->buffers += b->count;
+            }
+            if (dynamicType(b->type)) {
+                b->dyn = l->dynamic;
+                l->dynamic += b->count;
+            }
+        }
+    }
+    pthread_mutex_lock(&dsk);
+    layoutUnref(mapDel(&setLayouts, H(*layout)));
+    if (l && !mapPut(&setLayouts, H(*layout), l)) layoutUnref(l);
+    pthread_mutex_unlock(&dsk);
+    return r;
+}
+
+static void VKAPI_CALL DestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout layout, const VkAllocationCallbacks* a) {
+    if (TRACK && layout) {
+        pthread_mutex_lock(&dsk);
+        layoutUnref(mapDel(&setLayouts, H(layout)));
+        pthread_mutex_unlock(&dsk);
+    }
+    N(W_DESTROY_DSL, PFN_vkDestroyDescriptorSetLayout)(d, layout, a);
+}
+
+/* dsk held */
+static void setFree(DescSet* s) {
+    if (mapGet(&descSets, H(s->handle)) == s) mapDel(&descSets, H(s->handle));
+    DescPool* pool = mapGet(&descPools, H(s->pool));
+    if (s->prev) s->prev->next = s->next;
+    else if (pool && pool->head == s) pool->head = s->next;
+    if (s->next) s->next->prev = s->prev;
+    layoutUnref(s->layout);
+    free(s);
+}
+
+/* dsk held */
+static void poolEmpty(VkDescriptorPool handle, bool destroy) {
+    DescPool* pool = mapGet(&descPools, H(handle));
+    while (pool && pool->head) setFree(pool->head);
+    if (destroy) free(mapDel(&descPools, H(handle)));
+}
+
+static VkResult VKAPI_CALL ResetDescriptorPool(VkDevice d, VkDescriptorPool pool, VkDescriptorPoolResetFlags flags) {
+    if (TRACK && pool) {
+        pthread_mutex_lock(&dsk);
+        poolEmpty(pool, false);
+        pthread_mutex_unlock(&dsk);
+    }
+    return N(W_RESET_DPOOL, PFN_vkResetDescriptorPool)(d, pool, flags);
+}
+
+static void VKAPI_CALL DestroyDescriptorPool(VkDevice d, VkDescriptorPool pool, const VkAllocationCallbacks* a) {
+    if (TRACK && pool) {
+        pthread_mutex_lock(&dsk);
+        poolEmpty(pool, true);
+        pthread_mutex_unlock(&dsk);
+    }
+    N(W_DESTROY_DPOOL, PFN_vkDestroyDescriptorPool)(d, pool, a);
+}
+
+static VkResult VKAPI_CALL AllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
+    VkResult r = N(W_ALLOC_DSETS, PFN_vkAllocateDescriptorSets)(d, info, sets);
+    if (r != VK_SUCCESS || !TRACK || !info || !sets) return r;
+    pthread_mutex_lock(&dsk);
+    DescPool* pool = mapGet(&descPools, H(info->descriptorPool));
+    if (!pool && (pool = calloc(1, sizeof *pool)) && !mapPut(&descPools, H(info->descriptorPool), pool)) free(pool), pool = NULL;
+    for (uint32_t i = 0; i < info->descriptorSetCount; i++) {
+        DescSet* old = mapGet(&descSets, H(sets[i]));
+        if (old) setFree(old);
+        SetLayout* l = info->pSetLayouts ? mapGet(&setLayouts, H(info->pSetLayouts[i])) : NULL;
+        if (!l || !pool) continue;
+        DescSet* s = calloc(1, sizeof *s + l->buffers * sizeof s->e[0]);
+        if (!s) continue;
+        s->handle = sets[i], s->pool = info->descriptorPool, s->layout = l, s->gen = ++descGen;
+        l->refs++;
+        for (uint32_t k = 0; k < l->buffers; k++) s->e[k].type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+        if (!mapPut(&descSets, H(sets[i]), s)) {
+            layoutUnref(l);
+            free(s);
+            continue;
+        }
+        s->next = pool->head;
+        if (pool->head) pool->head->prev = s;
+        pool->head = s;
+    }
+    pthread_mutex_unlock(&dsk);
+    return r;
+}
+
+static VkResult VKAPI_CALL FreeDescriptorSets(VkDevice d, VkDescriptorPool pool, uint32_t n, const VkDescriptorSet* sets) {
+    if (TRACK && sets) {
+        pthread_mutex_lock(&dsk);
+        for (uint32_t i = 0; i < n; i++) {
+            DescSet* s = sets[i] ? mapGet(&descSets, H(sets[i])) : NULL;
+            if (s) setFree(s);
+        }
+        pthread_mutex_unlock(&dsk);
+    }
+    return N(W_FREE_DSETS, PFN_vkFreeDescriptorSets)(d, pool, n, sets);
+}
+
+/* dsk held. The element `index` of the binding at position *bi, rolled over into the following
+ * bindings as consecutive updates are; NULL past the last. */
+static const DslBinding* elemAt(const SetLayout* l, uint32_t* bi, uint32_t* index) {
+    while (*bi < l->count && *index >= l->b[*bi].count) *index -= l->b[*bi].count, (*bi)++;
+    return *bi < l->count ? &l->b[*bi] : NULL;
+}
+
+/* dsk held. count descriptors of `type` from (binding, element) on; buffer infos from info(ctx, i). */
+static void writeSet(DescSet* s, uint32_t binding, uint32_t element, uint32_t count, VkDescriptorType type,
+                     const VkDescriptorBufferInfo* (*info)(const void* ctx, uint32_t i), const void* ctx) {
+    s->gen = ++descGen;
+    uint32_t bi;
+    if (!findBinding(s->layout, binding, &bi)) {
+        s->bad = true;
+        return;
+    }
+    if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+        /* bytes, not descriptors: no buffer descriptor is touched unless it rolls over */
+        if (element > s->layout->b[bi].count || count > s->layout->b[bi].count - element) s->bad = true;
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t index = element + i, at = bi;
+        const DslBinding* b = elemAt(s->layout, &at, &index);
+        if (!b) {
+            s->bad = true;
+            return;
+        }
+        if (b->buf == UINT32_MAX) continue;
+        DescElem* e = &s->e[b->buf + index];
+        const VkDescriptorBufferInfo* bi2 = bufferType(type) ? info(ctx, i) : NULL;
+        if (bi2) *e = (DescElem){bi2->buffer, bi2->offset, bi2->range, type};
+        else e->type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+    }
+}
+
+static const VkDescriptorBufferInfo* writeInfo(const void* ctx, uint32_t i) {
+    const VkWriteDescriptorSet* w = ctx;
+    return w->pBufferInfo ? &w->pBufferInfo[i] : NULL;
+}
+
+typedef struct {
+    const VkDescriptorUpdateTemplateEntry* e;
+    const uint8_t* data;
+} TemplateCtx;
+
+static const VkDescriptorBufferInfo* templateInfo(const void* ctx, uint32_t i) {
+    const TemplateCtx* t = ctx;
+    return t->data ? (const VkDescriptorBufferInfo*)(t->data + t->e->offset + (size_t)i * t->e->stride) : NULL;
+}
+
+static void VKAPI_CALL UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteDescriptorSet* writes, uint32_t nc,
+                                            const VkCopyDescriptorSet* copies) {
+    if (TRACK) {
+        pthread_mutex_lock(&dsk);
+        for (uint32_t i = 0; writes && i < nw; i++) {
+            DescSet* s = mapGet(&descSets, H(writes[i].dstSet));
+            if (s) writeSet(s, writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, writeInfo, &writes[i]);
+        }
+        for (uint32_t i = 0; copies && i < nc; i++) {
+            const VkCopyDescriptorSet* c = &copies[i];
+            DescSet* dst = mapGet(&descSets, H(c->dstSet));
+            const DescSet* src = mapGet(&descSets, H(c->srcSet));
+            if (!dst) continue;
+            dst->gen = ++descGen;
+            uint32_t sbi, dbi;
+            if (!src || src->bad || !findBinding(src->layout, c->srcBinding, &sbi) || !findBinding(dst->layout, c->dstBinding, &dbi)) {
+                dst->bad = true;
+                continue;
+            }
+            for (uint32_t k = 0; k < c->descriptorCount; k++) {
+                uint32_t si = c->srcArrayElement + k, di = c->dstArrayElement + k, sat = sbi, dat = dbi;
+                const DslBinding* sb = elemAt(src->layout, &sat, &si);
+                const DslBinding* db = elemAt(dst->layout, &dat, &di);
+                if (!sb || !db || sb->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK || db->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+                    dst->bad = true;
+                    break;
+                }
+                if (db->buf == UINT32_MAX) continue;
+                DescElem* e = &dst->e[db->buf + di];
+                if (sb->buf != UINT32_MAX) *e = src->e[sb->buf + si];
+                else e->type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+            }
+        }
+        pthread_mutex_unlock(&dsk);
+    }
+    N(W_UPDATE_DSETS, PFN_vkUpdateDescriptorSets)(d, nw, writes, nc, copies);
+}
+
+static VkResult VKAPI_CALL CreateDescriptorUpdateTemplate(VkDevice d, const VkDescriptorUpdateTemplateCreateInfo* info,
+                                                          const VkAllocationCallbacks* a, VkDescriptorUpdateTemplate* t) {
+    VkResult r = N(W_CREATE_DUT, PFN_vkCreateDescriptorUpdateTemplate)(d, info, a, t);
+    if (r != VK_SUCCESS || !TRACK || !info) return r;
+    uint32_t n = info->pDescriptorUpdateEntries ? info->descriptorUpdateEntryCount : 0;
+    Template* tp = malloc(sizeof *tp + n * sizeof tp->e[0]);
+    if (tp) {
+        tp->type = info->templateType, tp->count = n;
+        if (n) memcpy(tp->e, info->pDescriptorUpdateEntries, n * sizeof tp->e[0]);
+    }
+    pthread_mutex_lock(&dsk);
+    free(mapDel(&templates, H(*t)));
+    if (tp && !mapPut(&templates, H(*t), tp)) free(tp);
+    pthread_mutex_unlock(&dsk);
+    return r;
+}
+
+static void VKAPI_CALL DestroyDescriptorUpdateTemplate(VkDevice d, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* a) {
+    if (TRACK && t) {
+        pthread_mutex_lock(&dsk);
+        free(mapDel(&templates, H(t)));
+        pthread_mutex_unlock(&dsk);
+    }
+    N(W_DESTROY_DUT, PFN_vkDestroyDescriptorUpdateTemplate)(d, t, a);
+}
+
+static void VKAPI_CALL UpdateDescriptorSetWithTemplate(VkDevice d, VkDescriptorSet set, VkDescriptorUpdateTemplate t, const void* data) {
+    if (TRACK) {
+        pthread_mutex_lock(&dsk);
+        DescSet* s = mapGet(&descSets, H(set));
+        const Template* tp = mapGet(&templates, H(t));
+        if (s && (!tp || tp->type != VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET)) s->gen = ++descGen, s->bad = true;
+        for (uint32_t i = 0; s && tp && tp->type == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET && i < tp->count; i++) {
+            TemplateCtx ctx = {&tp->e[i], data};
+            writeSet(s, tp->e[i].dstBinding, tp->e[i].dstArrayElement, tp->e[i].descriptorCount, tp->e[i].descriptorType, templateInfo, &ctx);
+        }
+        pthread_mutex_unlock(&dsk);
+    }
+    N(W_UPDATE_DSET_TEMPLATE, PFN_vkUpdateDescriptorSetWithTemplate)(d, set, t, data);
 }
 
 /* ---- pipelines ---- */
@@ -1969,6 +2345,111 @@ static void VKAPI_CALL CmdSetRasterizationStreamEXT(VkCommandBuffer cb, uint32_t
     N(W_SET_RASTER_STREAM, PFN_vkCmdSetRasterizationStreamEXT)(cb, stream);
 }
 
+/* ---- descriptor sets and push constants as bound ---- */
+
+/* State only (like the vkCmdBind* and vkCmdPush* not wrapped): a held-back begin stays held back. */
+static Cb* stateOf(VkCommandBuffer cb) {
+    return TRACK ? cbOf(cb) : NULL;
+}
+
+#define GRAPHICS_STAGES (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)
+
+/* graphics sets [first, first + count): bound, their generations and dynamic offsets kept */
+static void setsBound(Cb* c, uint32_t first, uint32_t count, const VkDescriptorSet* sets, uint32_t dynCount, const uint32_t* dyn) {
+    if (!c || !TRACK || !sets) return;
+    RecState* st = &c->st;
+    pthread_mutex_lock(&dsk);
+    uint32_t used = 0;
+    bool lost = false; /* a set whose layout is not known: the offsets after it cannot be told apart */
+    for (uint32_t i = 0; i < count; i++) {
+        const DescSet* ds = sets[i] ? mapGet(&descSets, H(sets[i])) : NULL;
+        uint32_t need = ds ? ds->layout->dynamic : 0;
+        if (sets[i] && !ds && dynCount) lost = true;
+        uint32_t s = first + i;
+        if (s < MAX_SETS) {
+            st->sets[s] = sets[i];
+            st->setGen[s] = ds && !ds->bad ? ds->gen : 0;
+            st->dynCount[s] = 0;
+            st->setBound |= 1u << s;
+            if (lost || need > MAX_DYN || need > dynCount - used || (need && !dyn)) st->setBound &= ~(1u << s);
+            else if (need) memcpy(st->dyn[s], dyn + used, need * sizeof *dyn), st->dynCount[s] = (uint8_t)need;
+        }
+        used = need > dynCount - used ? dynCount : used + need;
+    }
+    pthread_mutex_unlock(&dsk);
+}
+
+/* sets [first, first + count) bound in a way not followed */
+static void setsLost(Cb* c, uint32_t first, uint32_t count) {
+    if (!c) return;
+    for (uint32_t s = first; s < MAX_SETS && s - first < count; s++) c->st.setBound &= ~(1u << s);
+}
+
+static void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t first, uint32_t count,
+                                             const VkDescriptorSet* sets, uint32_t dynCount, const uint32_t* dyn) {
+    Cb* c = stateOf(cb);
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) setsBound(c, first, count, sets, dynCount, dyn);
+    N(W_BIND_DSETS, PFN_vkCmdBindDescriptorSets)(cb, bp, layout, first, count, sets, dynCount, dyn);
+}
+static void VKAPI_CALL CmdBindDescriptorSets2(VkCommandBuffer cb, const VkBindDescriptorSetsInfoKHR* info) {
+    Cb* c = stateOf(cb);
+    if (info && (info->stageFlags & GRAPHICS_STAGES))
+        setsBound(c, info->firstSet, info->descriptorSetCount, info->pDescriptorSets, info->dynamicOffsetCount, info->pDynamicOffsets);
+    N(W_BIND_DSETS2, PFN_vkCmdBindDescriptorSets2KHR)(cb, info);
+}
+
+static void pushed(Cb* c, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* values) {
+    if (!c || !TRACK || !(stages & VK_SHADER_STAGE_VERTEX_BIT) || !values) return;
+    RecState* st = &c->st;
+    for (uint32_t i = 0; i < size && offset < SPV_PUSH_MAX && i < SPV_PUSH_MAX - offset; i++) st->push[offset + i] = ((const uint8_t*)values)[i];
+    /* offset and size are multiples of 4 */
+    for (uint32_t w = offset / 4; w < 64 && w < (offset + (uint64_t)size) / 4; w++) st->pushKnown |= 1ull << w;
+}
+static void VKAPI_CALL CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size,
+                                        const void* values) {
+    pushed(stateOf(cb), stages, offset, size, values);
+    N(W_PUSH_CONSTANTS, PFN_vkCmdPushConstants)(cb, layout, stages, offset, size, values);
+}
+static void VKAPI_CALL CmdPushConstants2(VkCommandBuffer cb, const VkPushConstantsInfoKHR* info) {
+    Cb* c = stateOf(cb);
+    if (info) pushed(c, info->stageFlags, info->offset, info->size, info->pValues);
+    N(W_PUSH_CONSTANTS2, PFN_vkCmdPushConstants2KHR)(cb, info);
+}
+
+/* push descriptors and descriptor buffers: the sets they replace are not followed */
+static void VKAPI_CALL CmdPushDescriptorSet(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set, uint32_t n,
+                                            const VkWriteDescriptorSet* writes) {
+    Cb* c = stateOf(cb);
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) setsLost(c, set, 1);
+    N(W_PUSH_DSET, PFN_vkCmdPushDescriptorSetKHR)(cb, bp, layout, set, n, writes);
+}
+static void VKAPI_CALL CmdPushDescriptorSet2(VkCommandBuffer cb, const VkPushDescriptorSetInfoKHR* info) {
+    Cb* c = stateOf(cb);
+    if (info && (info->stageFlags & GRAPHICS_STAGES)) setsLost(c, info->set, 1);
+    N(W_PUSH_DSET2, PFN_vkCmdPushDescriptorSet2KHR)(cb, info);
+}
+static void VKAPI_CALL CmdPushDescriptorSetWithTemplate(VkCommandBuffer cb, VkDescriptorUpdateTemplate t, VkPipelineLayout layout, uint32_t set,
+                                                        const void* data) {
+    setsLost(stateOf(cb), set, 1);
+    N(W_PUSH_DSET_TEMPLATE, PFN_vkCmdPushDescriptorSetWithTemplateKHR)(cb, t, layout, set, data);
+}
+static void VKAPI_CALL CmdPushDescriptorSetWithTemplate2(VkCommandBuffer cb, const VkPushDescriptorSetWithTemplateInfoKHR* info) {
+    Cb* c = stateOf(cb);
+    if (info) setsLost(c, info->set, 1);
+    N(W_PUSH_DSET_TEMPLATE2, PFN_vkCmdPushDescriptorSetWithTemplate2KHR)(cb, info);
+}
+static void VKAPI_CALL CmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t first,
+                                                        uint32_t count, const uint32_t* indices, const VkDeviceSize* offsets) {
+    Cb* c = stateOf(cb);
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) setsLost(c, first, count);
+    N(W_SET_DB_OFFSETS, PFN_vkCmdSetDescriptorBufferOffsetsEXT)(cb, bp, layout, first, count, indices, offsets);
+}
+static void VKAPI_CALL CmdSetDescriptorBufferOffsets2EXT(VkCommandBuffer cb, const VkSetDescriptorBufferOffsetsInfoEXT* info) {
+    Cb* c = stateOf(cb);
+    if (info && (info->stageFlags & GRAPHICS_STAGES)) setsLost(c, info->firstSet, info->setCount);
+    N(W_SET_DB_OFFSETS2, PFN_vkCmdSetDescriptorBufferOffsets2EXT)(cb, info);
+}
+
 /* A pass begun inside conditional rendering may draw nothing; in a secondary it is not followed. */
 static void VKAPI_CALL CmdBeginConditionalRenderingEXT(VkCommandBuffer cb, const VkConditionalRenderingBeginInfoEXT* info) {
     Cb* c = rec(cb);
@@ -1986,25 +2467,29 @@ static void VKAPI_CALL CmdEndConditionalRenderingEXT(VkCommandBuffer cb) {
 
 /* ---- the decision ---- */
 
-/* trk held. Reads `size` bytes of buffer memory at buffer offset `offset`; false when they are
- * not host-mapped, out of the buffer, or may be written by the GPU. */
-static bool readBuffer(Cb* primary, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, void* out) {
+enum { RB_OK, RB_UNMAPPED, RB_PENDING, RB_RANGE };
+
+/* trk held. Reads `size` bytes of buffer memory at buffer offset `offset` (RB_OK), unless they are
+ * not host-mapped (or the buffer is not known), may be written by the GPU, or are out of the buffer.
+ * What is read is kept to be read again at the submission. */
+static int readBuffer(Cb* primary, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, void* out) {
     const BufInfo* b = mapGet(&buffers, H(buffer));
-    if (!b || !b->memory || offset > b->size || size > b->size - offset) return false;
+    if (!b || !b->memory) return RB_UNMAPPED;
+    if (offset > b->size || size > b->size - offset) return RB_RANGE;
     const MemInfo* m = mapGet(&memories, H(b->memory));
     VkDeviceSize at = b->offset + offset;
-    if (!m || !m->ptr || at < m->mapOffset || at - m->mapOffset > m->mapSize || size > m->mapSize - (at - m->mapOffset)) return false;
-    if (tainted(b->memory, at, size)) return false;
+    if (!m || !m->ptr || at < m->mapOffset || at - m->mapOffset > m->mapSize || size > m->mapSize - (at - m->mapOffset)) return RB_UNMAPPED;
+    if (tainted(b->memory, at, size)) return RB_PENDING;
     const uint8_t* src = m->ptr + (at - m->mapOffset);
-    memcpy(out, src, size);
     if (primary->depCount == primary->depCap) {
         uint32_t cap = primary->depCap ? primary->depCap * 2 : 16;
         Dep* d = realloc(primary->deps, cap * sizeof *d);
-        if (!d) return false;
+        if (!d) return RB_UNMAPPED;
         primary->deps = d, primary->depCap = cap;
     }
+    memcpy(out, src, size);
     primary->deps[primary->depCount++] = (Dep){b->memory, at, size, fnv(src, size)};
-    return true;
+    return RB_OK;
 }
 
 /* trk held. The vertices of the snapshot's draw (instance firstInstance) as the shader gets them,
@@ -2027,7 +2512,7 @@ static int gather(Cb* primary, const DrawSnap* d, const Pipe* p, SpvVertexIn* in
         uint8_t raw[4 * MAX_VERTS];
         VkDeviceSize off = st->ibOffset + (VkDeviceSize)d->first * size, bytes = (VkDeviceSize)d->count * size;
         if (st->ibSize != VK_WHOLE_SIZE && (VkDeviceSize)(d->first + d->count) * size > st->ibSize) return L_VERTEX;
-        if (!readBuffer(primary, st->ib, off, bytes, raw)) return L_VERTEX;
+        if (readBuffer(primary, st->ib, off, bytes, raw) != RB_OK) return L_VERTEX;
         uint32_t restartValue = size == 1 ? 0xffu : size == 2 ? 0xffffu : 0xffffffffu;
         for (uint32_t i = 0; i < d->count; i++) {
             uint32_t v = raw[i];
@@ -2097,13 +2582,122 @@ static int gather(Cb* primary, const DrawSnap* d, const Pipe* p, SpvVertexIn* in
             if (!bytes) return L_VERTEX;
             VkDeviceSize at = st->vbOffset[binding] + (VkDeviceSize)element * stride + offset;
             if (st->vbSize[binding] != VK_WHOLE_SIZE && (VkDeviceSize)element * stride + offset + bytes > st->vbSize[binding]) return L_VERTEX;
-            if (!readBuffer(primary, st->vb[binding], at, bytes, raw)) return L_VERTEX;
+            if (readBuffer(primary, st->vb[binding], at, bytes, raw) != RB_OK) return L_VERTEX;
             ls_decode(format, raw, &attr);
             v->location[loc] = attr;
         }
     }
     *vcount = d->count;
     return L_APPLIED;
+}
+
+/* The buffer behind element 0 of (set, binding) as bound in st: 0, or SPV_WHY_DESCRIPTOR. */
+static uint8_t descriptorBuffer(const RecState* st, const SpvBufferUse* u, VkBuffer* buffer, VkDeviceSize* offset, VkDeviceSize* range) {
+    if (u->arrayed || u->set >= MAX_SETS || !(st->setBound & (1u << u->set)) || !st->sets[u->set]) return SPV_WHY_DESCRIPTOR;
+    uint8_t why = SPV_WHY_DESCRIPTOR;
+    pthread_mutex_lock(&dsk);
+    const DescSet* ds = mapGet(&descSets, H(st->sets[u->set]));
+    uint32_t bi;
+    const DslBinding* b = ds && !ds->bad && ds->gen == st->setGen[u->set] && !ds->layout->unknown ? findBinding(ds->layout, u->binding, &bi) : NULL;
+    if (b && b->buf != UINT32_MAX && b->count) {
+        const DescElem* e = &ds->e[b->buf];
+        bool uniform = e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        bool storage = e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        if ((u->kind == SPV_BUF_UNIFORM ? uniform : storage) && e->buffer) {
+            *buffer = e->buffer, *offset = e->offset, *range = e->range;
+            if (!dynamicType(b->type)) why = 0;
+            else if (b->dyn < st->dynCount[u->set]) *offset += st->dyn[u->set][b->dyn], why = 0;
+        }
+    }
+    pthread_mutex_unlock(&dsk);
+    return why;
+}
+
+#define RES_BUFFERS 16
+#define RES_BUFFER_BYTES 16384u /* read of one buffer; past it values are unknown */
+#define RES_BYTES 65536u
+#define RES_BLOB (RES_BUFFERS * 16u + RES_BYTES + 8u + SPV_PUSH_MAX)
+
+typedef struct {
+    SpvBuffer buffers[RES_BUFFERS];
+    SpvResources res;
+    const uint8_t* blob; /* what was read, serialized: the vertex shader run's other input */
+    uint32_t size;
+} Resources;
+
+static __thread uint8_t* tlBlob;
+
+/* The buffers and push constants the vertex shader declares, as bound in the snapshot: read (dsk and
+ * trk taken here) into the blob; what cannot be read is given with the reason. */
+static bool resources(Cb* primary, const RecState* st, const SpvProgram* vs, Resources* r) {
+    if (!tlBlob && !(tlBlob = malloc(RES_BLOB))) return false;
+    memset(r, 0, sizeof *r);
+    uint8_t* blob = tlBlob;
+    uint32_t at = 0, total = 0;
+    SpvBufferUse uses[RES_BUFFERS];
+    uint32_t n = spv_buffers(vs, uses, RES_BUFFERS);
+    bool push = false;
+    for (uint32_t i = 0; i < n && i < RES_BUFFERS; i++) {
+        const SpvBufferUse* u = &uses[i];
+        if (u->kind == SPV_BUF_PUSH) {
+            push = true;
+            continue;
+        }
+        SpvBuffer* b = &r->buffers[r->res.bufferCount++];
+        b->set = u->set, b->binding = u->binding;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0, range = 0;
+        uint8_t why = descriptorBuffer(st, u, &buffer, &offset, &range);
+        uint32_t header = at;
+        at += 16;
+        if (!why) {
+            uint32_t want = u->bytes < RES_BUFFER_BYTES ? u->bytes : RES_BUFFER_BYTES;
+            if (want > RES_BYTES - total) want = RES_BYTES - total;
+            pthread_mutex_lock(&trk);
+            const BufInfo* bi = mapGet(&buffers, H(buffer));
+            int rb = RB_UNMAPPED;
+            if (bi && offset > bi->size) rb = RB_RANGE;
+            else if (bi) {
+                VkDeviceSize avail = range == VK_WHOLE_SIZE || range > bi->size - offset ? bi->size - offset : range;
+                uint32_t len = avail < want ? (uint32_t)avail : want;
+                rb = len ? readBuffer(primary, buffer, offset, len, blob + at) : RB_OK;
+                if (rb == RB_OK) b->data = blob + at, b->size = len, at += len, total += len;
+            }
+            pthread_mutex_unlock(&trk);
+            why = rb == RB_OK ? 0 : rb == RB_PENDING ? SPV_WHY_PENDING : rb == RB_RANGE ? SPV_WHY_DESCRIPTOR : SPV_WHY_UNMAPPED;
+        }
+        b->why = why;
+        uint32_t h[4] = {b->set, b->binding, b->size, (uint32_t)why | (b->data ? 0x100u : 0)};
+        memcpy(blob + header, h, sizeof h);
+    }
+    if (push) {
+        memcpy(blob + at, &st->pushKnown, 8);
+        at += 8;
+        for (uint32_t w = 0; w < SPV_PUSH_MAX / 4; w++) {
+            if (st->pushKnown >> w & 1) memcpy(blob + at + 4 * w, st->push + 4 * w, 4);
+            else memset(blob + at + 4 * w, 0, 4);
+        }
+        r->res.push = blob + at;
+        r->res.pushKnown = st->pushKnown;
+        at += SPV_PUSH_MAX;
+    }
+    r->res.buffers = r->buffers;
+    r->blob = blob;
+    r->size = at;
+    return true;
+}
+
+static int whyReason(uint8_t why) {
+    switch (why) {
+    case SPV_WHY_UNMAPPED: return L_VS_UNMAPPED;
+    case SPV_WHY_PENDING: return L_VS_PENDING;
+    case SPV_WHY_DESCRIPTOR: return L_VS_DESCRIPTOR;
+    case SPV_WHY_RANGE: return L_VS_RANGE;
+    case SPV_WHY_PUSH: return L_VS_PUSH;
+    case SPV_WHY_IMAGE: return L_VS_IMAGE;
+    case SPV_WHY_INPUT: return L_VS_INPUT;
+    default: return L_VS;
+    }
 }
 
 static int decide(Cb* primary, const Pending* pb, uint32_t n, const VkCommandBuffer* list) {
@@ -2159,35 +2753,64 @@ static int decide(Cb* primary, const Pending* pb, uint32_t n, const VkCommandBuf
         primary->depCount = deps;
         return r;
     }
+    /* the buffers and push constants it declares */
+    Resources res;
+    if (!resources(primary, st, p->vs, &res)) {
+        primary->depCount = deps;
+        return L_VS;
+    }
+    uint64_t resHash = fnv(res.blob, res.size);
     float pos[MAX_VERTS][4];
     pthread_mutex_lock(&trk);
-    const VsCache* hit = p->cache && p->cache->count == vcount && !memcmp(p->cache->in, in, vcount * sizeof *in) ? p->cache : NULL;
+    const VsCache* c = p->cache;
+    const VsCache* hit = c && c->count == vcount && !memcmp(c->in, in, vcount * sizeof *in) && c->resSize == res.size && c->resHash == resHash &&
+                                 (!res.size || !memcmp(c->res, res.blob, res.size))
+                             ? c
+                             : NULL;
     if (hit) r = hit->result, memcpy(pos, hit->pos, vcount * sizeof pos[0]);
     pthread_mutex_unlock(&trk);
-    if (!hit && spv_vs_run(p->vs, p->vsEntry, p->vsSpec.entries ? &p->vsSpec.info : NULL, in, vcount, out) != SPV_RUN_OK) r = L_VS;
+    if (!hit) {
+        uint8_t why = 0;
+        int run = spv_vs_run(p->vs, p->vsEntry, p->vsSpec.entries ? &p->vsSpec.info : NULL, &res.res, in, vcount, out, &why);
+        if (run == SPV_RUN_CONTROL) r = why ? whyReason(why) : L_VS_BRANCH;
+        else if (run != SPV_RUN_OK) r = L_VS;
+    }
     for (uint32_t i = 0; !hit && r == L_APPLIED && i < vcount; i++) {
         const SpvVertexOut* o = &out[i];
-        if (!o->positionKnown || o->clipCount > SPV_CLIP_MAX || o->cullCount > SPV_CLIP_MAX || o->layerState == 2 ||
-            (o->layerState == 1 && o->layer) || o->viewportState == 2 || (o->viewportState == 1 && o->viewport)) {
+        if (!o->positionKnown || o->layerState == 2 || o->viewportState == 2) {
+            r = whyReason(o->why);
+            break;
+        }
+        if (o->clipCount > SPV_CLIP_MAX || o->cullCount > SPV_CLIP_MAX || (o->layerState == 1 && o->layer) ||
+            (o->viewportState == 1 && o->viewport)) {
             r = L_VS;
             break;
         }
         for (uint32_t k = 0; k < o->clipCount && r == L_APPLIED; k++)
-            if (o->clipState[k] == 2 || (o->clipState[k] == 1 && !(o->clip[k] >= 0.0f))) r = L_VS;
+            if (o->clipState[k] == 2) r = whyReason(o->why);
+            else if (o->clipState[k] == 1 && !(o->clip[k] >= 0.0f)) r = L_VS;
         for (uint32_t k = 0; k < o->cullCount && r == L_APPLIED; k++)
-            if (o->cullState[k] == 2 || (o->cullState[k] == 1 && !(o->cull[k] >= 0.0f))) r = L_VS;
+            if (o->cullState[k] == 2) r = whyReason(o->why);
+            else if (o->cullState[k] == 1 && !(o->cull[k] >= 0.0f)) r = L_VS;
         memcpy(pos[i], o->position, sizeof pos[i]);
     }
     if (!hit) {
+        uint8_t* copy = res.size ? malloc(res.size) : NULL;
+        if (copy) memcpy(copy, res.blob, res.size);
         pthread_mutex_lock(&trk);
         Pipe* writable = (Pipe*)p;
-        if (!writable->cache) writable->cache = malloc(sizeof *writable->cache);
+        if (!writable->cache) writable->cache = calloc(1, sizeof *writable->cache);
         if (writable->cache) {
-            memcpy(writable->cache->in, in, vcount * sizeof *in);
-            writable->cache->count = vcount, writable->cache->result = r;
-            memcpy(writable->cache->pos, pos, vcount * sizeof pos[0]);
+            VsCache* w = writable->cache;
+            memcpy(w->in, in, vcount * sizeof *in);
+            w->count = res.size && !copy ? 0 : vcount, w->result = r;
+            memcpy(w->pos, pos, vcount * sizeof pos[0]);
+            free(w->res);
+            w->res = copy, w->resSize = res.size, w->resHash = resHash;
+            copy = NULL;
         }
         pthread_mutex_unlock(&trk);
+        free(copy);
     }
     if (r == L_APPLIED) {
         int cover = ls_cover((const float(*)[4])pos, vcount, (const uint32_t(*)[3])tris, tcount, &vp, pb->info.renderArea, cull, front,
@@ -2700,7 +3323,15 @@ static const PFN_vkVoidFunction wrappers[W_COUNT] = {
     WR(W_SET_A2C, CmdSetAlphaToCoverageEnableEXT), WR(W_SET_SAMPLE_MASK, CmdSetSampleMaskEXT),
     WR(W_SET_SAMPLES, CmdSetRasterizationSamplesEXT), WR(W_SET_POLYGON, CmdSetPolygonModeEXT),
     WR(W_SET_SAMPLE_LOCATIONS, CmdSetSampleLocationsEnableEXT), WR(W_SET_RASTER_STREAM, CmdSetRasterizationStreamEXT),
-    WR(W_BEGIN_CONDITIONAL, CmdBeginConditionalRenderingEXT), WR(W_END_CONDITIONAL, CmdEndConditionalRenderingEXT)};
+    WR(W_BEGIN_CONDITIONAL, CmdBeginConditionalRenderingEXT), WR(W_END_CONDITIONAL, CmdEndConditionalRenderingEXT),
+    WR(W_CREATE_DSL, CreateDescriptorSetLayout), WR(W_DESTROY_DSL, DestroyDescriptorSetLayout), WR(W_RESET_DPOOL, ResetDescriptorPool),
+    WR(W_DESTROY_DPOOL, DestroyDescriptorPool), WR(W_ALLOC_DSETS, AllocateDescriptorSets), WR(W_FREE_DSETS, FreeDescriptorSets),
+    WR(W_UPDATE_DSETS, UpdateDescriptorSets), WR(W_CREATE_DUT, CreateDescriptorUpdateTemplate),
+    WR(W_DESTROY_DUT, DestroyDescriptorUpdateTemplate), WR(W_UPDATE_DSET_TEMPLATE, UpdateDescriptorSetWithTemplate),
+    WR(W_BIND_DSETS, CmdBindDescriptorSets), WR(W_BIND_DSETS2, CmdBindDescriptorSets2), WR(W_PUSH_CONSTANTS, CmdPushConstants),
+    WR(W_PUSH_CONSTANTS2, CmdPushConstants2), WR(W_PUSH_DSET, CmdPushDescriptorSet), WR(W_PUSH_DSET2, CmdPushDescriptorSet2),
+    WR(W_PUSH_DSET_TEMPLATE, CmdPushDescriptorSetWithTemplate), WR(W_PUSH_DSET_TEMPLATE2, CmdPushDescriptorSetWithTemplate2),
+    WR(W_SET_DB_OFFSETS, CmdSetDescriptorBufferOffsetsEXT), WR(W_SET_DB_OFFSETS2, CmdSetDescriptorBufferOffsets2EXT)};
 
 _Static_assert(ARRAY_LEN(statNames) == S_COUNT, "statNames");
 _Static_assert(ARRAY_LEN(loadNames) == L_COUNT, "loadNames");

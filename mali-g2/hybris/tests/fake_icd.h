@@ -39,6 +39,7 @@ typedef struct {
     uint64_t testInts[8];
     double testFloats[10];
     uint32_t lastStream;
+    int descriptorWrites, descriptorBinds, pushes;
 } FakeIcd;
 
 typedef void(VKAPI_PTR* PFN_vkCmdTestArgsFAKE)(VkCommandBuffer cb, uint64_t a1, uint32_t a2, uint64_t a3, uint32_t a4, uint64_t a5,

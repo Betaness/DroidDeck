@@ -72,6 +72,63 @@ layout(location = 1) in vec2 uv;
 layout(location = 0) out vec2 outUv;
 void main() { gl_Position = vec4(position.xy * scale, position.zw); outUv = uv; }
 GLSL
+# moved by push constants (at byte 16)
+shader vs_push vert <<'GLSL'
+#version 450
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec2 uv;
+layout(push_constant) uniform Push { layout(offset = 16) vec4 offset; };
+layout(location = 0) out vec2 outUv;
+void main() { gl_Position = position + offset; outUv = uv; }
+GLSL
+# row- and column-major matrices from a uniform buffer, chosen by an integer read from it
+shader vs_mat vert <<'GLSL'
+#version 450
+layout(location = 0) in vec4 position;
+layout(set = 0, binding = 0, std140) uniform M { layout(row_major) mat4 rm; layout(column_major) mat4 cm; int sel; };
+void main() {
+    if (sel == 0) gl_Position = rm * position;
+    else gl_Position = cm * position;
+}
+GLSL
+# the position moved by a texel: an image
+shader vs_image vert <<'GLSL'
+#version 450
+layout(location = 0) in vec4 position;
+layout(set = 0, binding = 1) uniform sampler2D tex;
+void main() { gl_Position = position + textureLod(tex, vec2(0.5), 0.0); }
+GLSL
+# a branch on a value the run does not compute (a square root)
+shader vs_branch vert <<'GLSL'
+#version 450
+layout(location = 0) in vec4 position;
+void main() {
+    if (sqrt(abs(position.x)) > 5.0) gl_Position = vec4(0.0);
+    else gl_Position = position;
+}
+GLSL
+# the shape of DXVK's D3D9 vertex shaders (dxbc-spirv, SSA): c0..c3 as the rows of a matrix in a
+# block of vec4 members (dp4 oPos, v0, cN), a 16-bit push data member widened to 32 bits, a bit
+# field of a specialization constant read in a function and branched on
+shader vs_dxso vert ssa <<'GLSL'
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+layout(constant_id = 0) const uint commonState = 0u;
+layout(location = 0) in vec4 v0;
+layout(location = 1) in vec2 v1;
+layout(set = 1, binding = 3, std140) uniform c_buf { vec4 c0; vec4 c1; vec4 c2; vec4 c3; vec4 c4; } c;
+layout(push_constant) uniform push_data_t { uint16_t cFSize; uint16_t wScale; } pd;
+layout(location = 0) out vec2 o0;
+uint clipPlaneCount() { return bitfieldExtract(commonState, 0, 3); }
+void main() {
+    vec4 r0 = vec4(dot(v0, c.c0), dot(v0, c.c1), dot(v0, c.c2), dot(v0, c.c3));
+    r0.w *= float(uint(pd.wScale));
+    if (clipPlaneCount() != 0u) r0.z = r0.w;
+    gl_Position = r0;
+    o0 = v1 * c.c4.xy;
+}
+GLSL
 shader fs_plain frag <<'GLSL'
 #version 450
 layout(binding = 1) uniform sampler2D tex;

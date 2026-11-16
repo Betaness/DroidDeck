@@ -11,11 +11,16 @@
  *                        (OpConstant*, OpSpecConstant* with the pipeline's values, and what folds
  *                        from them). Memory loads, inputs and resources are not constants.
  *   spv_vs_run           the vertex shader run on the CPU for given vertices: its inputs are the
- *                        vertex attributes and the index built-ins; anything it reads from memory
- *                        (uniforms, push constants, buffers, images) is unknown, and a branch on an
- *                        unknown value stops the run. The outputs that decide where a triangle is
- *                        drawn are given back: Position, ClipDistance, CullDistance, Layer,
- *                        ViewportIndex. 32-bit integer and float arithmetic in IEEE single precision.
+ *                        vertex attributes, the index built-ins, the specialization constants and
+ *                        what the caller read for it (SpvResources): the bytes of its uniform and
+ *                        storage buffers by descriptor set and binding, laid out by their Offset,
+ *                        ArrayStride, MatrixStride and RowMajor decorations, and the push constants.
+ *                        Anything else (images, buffers or bytes not given) is unknown, and a branch
+ *                        on an unknown value stops the run. An unknown value carries where it came
+ *                        from (SPV_WHY_*). The outputs that decide where a triangle is drawn are
+ *                        given back: Position, ClipDistance, CullDistance, Layer, ViewportIndex.
+ *                        32-bit integer and float arithmetic in IEEE single precision; 8- and
+ *                        16-bit integers read from buffers only as far as a conversion to 32 bits.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
@@ -67,10 +72,51 @@ typedef struct {
     uint32_t vertexIndex, instanceIndex, baseVertex, baseInstance, drawIndex;
 } SpvVertexIn;
 
+/* Where an unknown value came from. */
+enum {
+    SPV_WHY_NONE,        /* computed by what the run does not follow, or nothing in particular */
+    SPV_WHY_UNMAPPED,    /* a buffer whose memory is not host-mapped (or not known) */
+    SPV_WHY_PENDING,     /* a buffer the GPU may still write */
+    SPV_WHY_DESCRIPTOR,  /* no buffer for the descriptor set and binding (not bound, not followed) */
+    SPV_WHY_RANGE,       /* bytes past what was given of a buffer */
+    SPV_WHY_PUSH,        /* push constant bytes not set */
+    SPV_WHY_IMAGE,       /* images, samplers, texel buffers */
+    SPV_WHY_INPUT,       /* a vertex attribute not given or of another kind */
+    SPV_WHY_COUNT
+};
+
+/* A uniform or storage buffer block, or the push constant block, the module declares. */
+enum { SPV_BUF_UNIFORM, SPV_BUF_STORAGE, SPV_BUF_PUSH };
+typedef struct {
+    uint32_t set, binding;
+    uint32_t bytes; /* the extent of what the block's layout can read; 0: nothing (no layout) */
+    uint8_t kind;   /* SPV_BUF_* */
+    bool arrayed;   /* an array of blocks: not read */
+} SpvBufferUse;
+
+/* At most `max` of them into out; the count there are. */
+uint32_t spv_buffers(const SpvProgram* p, SpvBufferUse* out, uint32_t max);
+
+#define SPV_PUSH_MAX 256
+typedef struct {
+    uint32_t set, binding;
+    const uint8_t* data; /* from the descriptor's offset; NULL: none, why says */
+    uint32_t size;
+    uint8_t why;
+} SpvBuffer;
+
+typedef struct {
+    const SpvBuffer* buffers;
+    uint32_t bufferCount;
+    const uint8_t* push; /* SPV_PUSH_MAX bytes, NULL: none */
+    uint64_t pushKnown;  /* bit i: bytes 4i to 4i + 3 set */
+} SpvResources;
+
 #define SPV_CLIP_MAX 8
 typedef struct {
     float position[4];
     bool positionKnown;
+    uint8_t why; /* of the first unknown output among those below */
     /* per ClipDistance / CullDistance element: 0 never written, 1 known, 2 unknown */
     uint8_t clipState[SPV_CLIP_MAX], cullState[SPV_CLIP_MAX];
     float clip[SPV_CLIP_MAX], cull[SPV_CLIP_MAX];
@@ -86,9 +132,10 @@ enum {
     SPV_RUN_BUDGET,       /* too many instructions or too much memory */
     SPV_RUN_UNSUPPORTED,  /* an instruction or type the run cannot follow where it matters */
 };
-/* Runs `entry` for count vertices. */
-int spv_vs_run(const SpvProgram* p, const char* entry, const VkSpecializationInfo* spec, const SpvVertexIn* in, uint32_t count,
-               SpvVertexOut* out);
+/* Runs `entry` for count vertices. res may be NULL. SPV_RUN_CONTROL: *why (when not NULL) is where the
+ * unknown value a branch depended on came from. */
+int spv_vs_run(const SpvProgram* p, const char* entry, const VkSpecializationInfo* spec, const SpvResources* res,
+               const SpvVertexIn* in, uint32_t count, SpvVertexOut* out, uint8_t* why);
 
 /* Locations the vertex entry point's Input variables use and the scalar kind each expects
  * (SPV_ATTR_*; NONE where not used). 64-bit or 16-bit inputs are NONE too. */

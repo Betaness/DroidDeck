@@ -60,6 +60,114 @@ static void setPosition(SpvVertexIn* v, float x, float y, float z, float w) {
     v->location[1].kind = SPV_ATTR_FLOAT;
 }
 
+static bool near(float a, float b) {
+    return a - b < 1e-6f && b - a < 1e-6f;
+}
+
+/* what spv_vs_run reads beyond the vertex: buffers by set and binding, push constants */
+static void resourceTests(SpvProgram* ubo) {
+    SpvVertexIn in[1];
+    SpvVertexOut out[1];
+    uint8_t why;
+    SpvBufferUse uses[4];
+    CHECK(spv_buffers(ubo, uses, 4) == 1 && uses[0].set == 0 && uses[0].binding == 0 && uses[0].bytes == 16 && uses[0].kind == SPV_BUF_UNIFORM &&
+              !uses[0].arrayed,
+          "the uniform block declared");
+    const float offset[4] = {0.25f, -0.5f, 0, 0};
+    SpvBuffer buffer = {0, 0, (const uint8_t*)offset, sizeof offset, 0};
+    SpvResources res = {&buffer, 1, NULL, 0};
+    setPosition(&in[0], 0.5f, 0.5f, 0, 1);
+    CHECK(spv_vs_run(ubo, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && out[0].positionKnown && out[0].position[0] == 0.75f &&
+              out[0].position[1] == 0 && out[0].position[3] == 1,
+          "uniform offset read");
+    buffer.size = 8;
+    CHECK(spv_vs_run(ubo, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_RANGE,
+          "half the block given: the rest unknown");
+    buffer = (SpvBuffer){0, 0, NULL, 0, SPV_WHY_PENDING};
+    CHECK(spv_vs_run(ubo, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_PENDING,
+          "a buffer the GPU may write: unknown, and why");
+    buffer = (SpvBuffer){0, 1, (const uint8_t*)offset, sizeof offset, 0};
+    CHECK(spv_vs_run(ubo, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_DESCRIPTOR,
+          "another binding: not this block");
+
+    SpvProgram* push = PROG(ls_vs_push);
+    CHECK(push && spv_buffers(push, uses, 4) == 1 && uses[0].kind == SPV_BUF_PUSH && uses[0].bytes == 32, "the push constant block declared");
+    uint8_t bytes[SPV_PUSH_MAX] = {0};
+    memcpy(bytes + 16, offset, sizeof offset);
+    res = (SpvResources){NULL, 0, bytes, 0xf0};
+    CHECK(spv_vs_run(push, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && out[0].positionKnown && out[0].position[0] == 0.75f &&
+              out[0].position[1] == 0,
+          "push constants read");
+    res.pushKnown = 0x70;
+    CHECK(spv_vs_run(push, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_PUSH,
+          "a push constant word not set: unknown");
+
+    /* explicit layouts: row_major rm, column_major cm (MatrixStride 16), an int after them */
+    SpvProgram* mat = PROG(ls_vs_mat);
+    CHECK(mat && spv_buffers(mat, uses, 4) == 1 && uses[0].bytes == 132, "the matrix block: 2 * 64 + 4 bytes");
+    float m[33] = {0};
+    const float rows[4][4] = {{2, 0, 0, -1}, {0, 2, 0, -1}, {0, 0, 1, 0}, {0, 0, 0, 1}}; /* x' = 2x - 1, y' = 2y - 1 */
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) m[4 * r + c] = rows[r][c], m[16 + 4 * c + r] = rows[r][c] * 0.5f;
+    int32_t sel = 0;
+    memcpy(&m[32], &sel, 4);
+    buffer = (SpvBuffer){0, 0, (const uint8_t*)m, sizeof m, 0};
+    res = (SpvResources){&buffer, 1, NULL, 0};
+    setPosition(&in[0], 1, 0.25f, 0.5f, 1);
+    CHECK(spv_vs_run(mat, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && out[0].positionKnown && out[0].position[0] == 1 &&
+              out[0].position[1] == -0.5f && out[0].position[2] == 0.5f && out[0].position[3] == 1,
+          "row-major matrix: (%g %g %g %g)", out[0].position[0], out[0].position[1], out[0].position[2], out[0].position[3]);
+    sel = 1;
+    memcpy(&m[32], &sel, 4);
+    CHECK(spv_vs_run(mat, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && out[0].positionKnown && out[0].position[0] == 0.5f &&
+              out[0].position[1] == -0.25f && out[0].position[3] == 0.5f,
+          "column-major matrix, chosen by an integer from the buffer");
+    buffer.size = 128;
+    CHECK(spv_vs_run(mat, "main", NULL, &res, in, 1, out, &why) == SPV_RUN_CONTROL && why == SPV_WHY_RANGE, "a branch on bytes not given");
+    res.bufferCount = 0;
+    CHECK(spv_vs_run(mat, "main", NULL, &res, in, 1, out, &why) == SPV_RUN_CONTROL && why == SPV_WHY_DESCRIPTOR, "a branch on a buffer not bound");
+
+    SpvProgram* image = PROG(ls_vs_image);
+    CHECK(image && spv_vs_run(image, "main", NULL, NULL, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_IMAGE,
+          "a texel: unknown, an image");
+    SpvProgram* branch = PROG(ls_vs_branch);
+    CHECK(branch && spv_vs_run(branch, "main", NULL, NULL, in, 1, out, &why) == SPV_RUN_CONTROL && why == SPV_WHY_NONE,
+          "a branch on a square root: control, no source");
+
+    /* the DXVK-shaped shader: the matrix in c0..c3 maps [0, 1] to [-1, 1] */
+    SpvProgram* dxso = PROG(ls_vs_dxso);
+    CHECK(dxso && spv_buffers(dxso, uses, 4) == 2, "the D3D9 shader declares a uniform and a push block");
+    float c[5][4];
+    memcpy(c, rows, sizeof rows);
+    c[2][2] = 0, c[4][0] = c[4][1] = 1, c[4][2] = c[4][3] = 0;
+    SpvBuffer cb = {1, 3, (const uint8_t*)c, sizeof c, 0};
+    memset(bytes, 0, sizeof bytes);
+    const uint16_t wScale = 1;
+    memcpy(bytes + 2, &wScale, 2);
+    res = (SpvResources){&cb, 1, bytes, 1};
+    SpvVertexIn quad[4];
+    SpvVertexOut qout[4];
+    const float corners[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    for (int i = 0; i < 4; i++) setPosition(&quad[i], corners[i][0], corners[i][1], 0, 1);
+    CHECK(spv_vs_run(dxso, "main", NULL, &res, quad, 4, qout, NULL) == SPV_RUN_OK && qout[0].positionKnown && qout[0].position[0] == -1 &&
+              qout[0].position[1] == -1 && qout[2].position[0] == 1 && qout[2].position[1] == 1 && qout[2].position[2] == 0 &&
+              qout[2].position[3] == 1,
+          "D3D9 shape: c0..c3 transform the quad");
+    const uint32_t clipOne = 1;
+    VkSpecializationMapEntry stateEntry = {0, 0, 4};
+    VkSpecializationInfo state = {1, &stateEntry, 4, &clipOne};
+    CHECK(spv_vs_run(dxso, "main", &state, &res, quad, 1, qout, NULL) == SPV_RUN_OK && qout[0].position[2] == 1,
+          "D3D9 shape: the specialized branch taken");
+    res.pushKnown = 0;
+    CHECK(spv_vs_run(dxso, "main", NULL, &res, quad, 1, qout, NULL) == SPV_RUN_OK && !qout[0].positionKnown && qout[0].why == SPV_WHY_PUSH,
+          "D3D9 shape: the 16-bit push member not set");
+    const uint16_t wTwo = 2;
+    memcpy(bytes + 2, &wTwo, 2);
+    res.pushKnown = 1;
+    CHECK(spv_vs_run(dxso, "main", NULL, &res, quad, 1, qout, NULL) == SPV_RUN_OK && near(qout[0].position[3], 2), "D3D9 shape: w scaled by 2");
+    spv_unref(push), spv_unref(mat), spv_unref(image), spv_unref(branch), spv_unref(dxso);
+}
+
 static void evaluatorTests(void) {
     SpvProgram* plain = PROG(ls_fs_plain);
     SpvProgram* discard = PROG(ls_fs_discard);
@@ -85,26 +193,29 @@ static void evaluatorTests(void) {
     setPosition(&in[0], -1, -1, 0, 1);
     setPosition(&in[1], 3, -1, 0.5f, 1);
     setPosition(&in[2], -1, 3, 1, 2);
-    CHECK(pass && spv_vs_run(pass, "main", NULL, in, 3, out) == SPV_RUN_OK, "pass-through runs");
+    CHECK(pass && spv_vs_run(pass, "main", NULL, NULL, in, 3, out, NULL) == SPV_RUN_OK, "pass-through runs");
     CHECK(out[1].positionKnown && out[1].position[0] == 3 && out[1].position[2] == 0.5f && out[2].position[3] == 2, "pass-through position");
     uint8_t kinds[SPV_LOCATIONS];
     spv_vs_inputs(pass, "main", kinds);
     CHECK(kinds[0] == SPV_ATTR_FLOAT && kinds[1] == SPV_ATTR_FLOAT && kinds[2] == SPV_ATTR_NONE, "inputs");
     in[0].location[0].kind = SPV_ATTR_SINT;
-    CHECK(spv_vs_run(pass, "main", NULL, in, 1, out) == SPV_RUN_OK && !out[0].positionKnown, "an integer attribute for a float input: unknown");
+    CHECK(spv_vs_run(pass, "main", NULL, NULL, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_INPUT,
+          "an integer attribute for a float input: unknown");
 
     SpvProgram* tri = PROG(ls_vs_tri);
     for (int i = 0; i < 3; i++) memset(&in[i], 0, sizeof in[i]), in[i].vertexIndex = (uint32_t)i;
-    CHECK(tri && spv_vs_run(tri, "main", NULL, in, 3, out) == SPV_RUN_OK, "vertex index triangle runs");
+    CHECK(tri && spv_vs_run(tri, "main", NULL, NULL, in, 3, out, NULL) == SPV_RUN_OK, "vertex index triangle runs");
     CHECK(out[0].position[0] == -1 && out[0].position[1] == -1 && out[1].position[1] == 3 && out[2].position[0] == 3 && out[2].position[3] == 1,
           "vertex index triangle: (-1,-1) (-1,3) (3,-1)");
 
     SpvProgram* ubo = PROG(ls_vs_ubo);
     setPosition(&in[0], 0, 0, 0, 1);
-    CHECK(ubo && spv_vs_run(ubo, "main", NULL, in, 1, out) == SPV_RUN_OK && !out[0].positionKnown, "uniform offset: unknown");
+    CHECK(ubo && spv_vs_run(ubo, "main", NULL, NULL, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown && out[0].why == SPV_WHY_DESCRIPTOR,
+          "uniform offset without its buffer: unknown");
+    resourceTests(ubo);
     SpvProgram* clip = PROG(ls_vs_clip);
     setPosition(&in[0], -0.5f, 0, 0, 1);
-    CHECK(clip && spv_vs_run(clip, "main", NULL, in, 1, out) == SPV_RUN_OK && out[0].clipCount == 1 && out[0].clipState[0] == 1 &&
+    CHECK(clip && spv_vs_run(clip, "main", NULL, NULL, in, 1, out, NULL) == SPV_RUN_OK && out[0].clipCount == 1 && out[0].clipState[0] == 1 &&
               out[0].clip[0] == -0.5f,
           "clip distance");
     SpvProgram* scaled = PROG(ls_vs_spec);
@@ -112,9 +223,9 @@ static void evaluatorTests(void) {
     VkSpecializationMapEntry scaleEntry = {3, 0, 4};
     VkSpecializationInfo scale = {1, &scaleEntry, 4, &half};
     setPosition(&in[0], -1, 1, 0, 1);
-    CHECK(scaled && spv_vs_run(scaled, "main", &scale, in, 1, out) == SPV_RUN_OK && out[0].position[0] == -0.5f && out[0].position[1] == 0.5f,
+    CHECK(scaled && spv_vs_run(scaled, "main", &scale, NULL, in, 1, out, NULL) == SPV_RUN_OK && out[0].position[0] == -0.5f && out[0].position[1] == 0.5f,
           "specialized scale");
-    CHECK(spv_vs_run(scaled, "main", NULL, in, 1, out) == SPV_RUN_OK && out[0].position[0] == -1, "default scale");
+    CHECK(spv_vs_run(scaled, "main", NULL, NULL, in, 1, out, NULL) == SPV_RUN_OK && out[0].position[0] == -1, "default scale");
     CHECK(!spv_parse(ls_vs_pass, 16) && !spv_parse((const uint32_t*)"not spir-v at all", 16), "not SPIR-V");
     CHECK(spv_code_writes_memory(ls_cs_write, sizeof ls_cs_write) && !spv_code_writes_memory(ls_fs_plain, sizeof ls_fs_plain) &&
               spv_code_writes_memory((const uint32_t*)"not spir-v at all", 16),
@@ -276,7 +387,22 @@ typedef struct {
     uint32_t stream;         /* rasterization stream, static */
     bool dynStream;          /* dynamic, set to `stream` */
     const char* order;       /* the trace expected; NULL: the usual */
+    int ubo;                 /* the vertex shader's uniform block bound through a descriptor set: UBO_* */
+    int push;                /* its push constants pushed: 1 vkCmdPushConstants, 2 vkCmdPushConstants2KHR */
+    float shift;             /* added to x by the uniform or push data */
+    bool uboUnmapped, uboPending, uboStale, writtenAfterBind, pushDescriptor;
+    bool bindBetween;        /* sets bound and constants pushed on the primary between the begin and the execute */
+    bool shiftSecond;        /* with twice: the second pass's set points at data that shifts x by 1 */
 } Case;
+
+enum { UBO_NONE, UBO_SET, UBO_DYNAMIC, UBO_TEMPLATE, UBO_BIND2, UBO_DXSO };
+
+/* the descriptor sets a secondary binds */
+typedef struct {
+    VkDescriptorSet sets[2];
+    uint32_t first, count, dynamic;
+    VkDescriptorSetLayout layout0;
+} Bound;
 
 static VkShaderModule module(const uint32_t* code, size_t size) {
     VkShaderModuleCreateInfo info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -373,9 +499,39 @@ typedef struct {
     char trace[64];
 } Run;
 
-static void recordDraw(const Case* k, VkCommandBuffer cb, VkPipeline pipe, VkBuffer vb, VkBuffer ib) {
+static void recordDraw(const Case* k, VkCommandBuffer cb, VkPipeline pipe, VkBuffer vb, VkBuffer ib, const Bound* bound) {
     uint32_t w = k->width ? k->width : W, h = k->height ? k->height : H;
     DEV(CmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (bound && bound->count) {
+        uint32_t dyn = 256;
+        if (k->ubo == UBO_BIND2) {
+            VkBindDescriptorSetsInfoKHR info = {VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR, NULL, VK_SHADER_STAGE_ALL_GRAPHICS, VK_NULL_HANDLE,
+                                                bound->first, bound->count, bound->sets, 0, NULL};
+            DEV(CmdBindDescriptorSets2KHR)(cb, &info);
+        } else {
+            DEV(CmdBindDescriptorSets)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE, bound->first, bound->count, bound->sets,
+                                       bound->dynamic, &dyn);
+        }
+        if (k->pushDescriptor) {
+            VkDescriptorBufferInfo none = {VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                          NULL, &none, NULL};
+            DEV(CmdPushDescriptorSetKHR)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE, bound->first, 1, &write);
+        }
+    }
+    if (k->push) {
+        /* vs_push: a vec4 at byte 16; vs_dxso: two 16-bit members, the second scaling w */
+        const float offset[4] = {k->shift, 0, 0, 0};
+        const uint16_t dxso[2] = {0, 1};
+        uint32_t at = k->ubo == UBO_DXSO ? 0 : 16, size = k->ubo == UBO_DXSO ? 4 : 16;
+        const void* data = k->ubo == UBO_DXSO ? (const void*)dxso : (const void*)offset;
+        if (k->push == 2) {
+            VkPushConstantsInfoKHR info = {VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR, NULL, VK_NULL_HANDLE, VK_SHADER_STAGE_VERTEX_BIT, at, size, data};
+            DEV(CmdPushConstants2KHR)(cb, &info);
+        } else {
+            DEV(CmdPushConstants)(cb, VK_NULL_HANDLE, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, at, size, data);
+        }
+    }
     if (k->dynStream) DEV(CmdSetRasterizationStreamEXT)(cb, k->stream);
     float vs = k->viewportScale ? k->viewportScale : 1, ss = k->scissorScale ? k->scissorScale : 1;
     VkViewport vp = {0, 0, w * vs, h, 0, 1};
@@ -450,7 +606,74 @@ static void runCase(void* ctx) {
     const uint16_t indices[6] = {0, 1, 2, 0, 2, 3};
     memcpy(ptr, vertices, sizeof vertices);
     memcpy((char*)ptr + 1024, indices, sizeof indices);
+
+    /* the uniform data at 2048 of the same memory (or of memory not mapped): an offset (shift, 0, 0, 0)
+     * for vs_ubo, at 2048 + 256 for the dynamic offset (2048 itself holds a bad one), at 2048 + 512 the
+     * second pass's with shiftSecond; vs_dxso: c0..c4 mapping [0, 1] to [-1, 1] */
+    VkDeviceMemory uboMemory = memory;
+    VkDeviceSize uboBase = 2048;
+    void* uboPtr = (char*)ptr + 2048;
+    if (k->uboUnmapped) {
+        CHECK(DEV(AllocateMemory)(device, &mi, NULL, &uboMemory) == VK_SUCCESS && DEV(MapMemory)(device, uboMemory, 0, VK_WHOLE_SIZE, 0, &uboPtr) == VK_SUCCESS,
+              "uniform memory");
+        uboBase = 0;
+    }
+    VkBuffer ub;
+    bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    CHECK(DEV(CreateBuffer)(device, &bi, NULL, &ub) == VK_SUCCESS && DEV(BindBufferMemory)(device, ub, uboMemory, uboBase) == VK_SUCCESS, "uniform buffer");
+    if (k->ubo == UBO_DXSO) {
+        const float c[5][4] = {{2, 0, 0, -1 + k->shift}, {0, 2, 0, -1}, {0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 0, 0}};
+        memcpy(uboPtr, c, sizeof c);
+    } else {
+        const float good[4] = {k->shift, 0, 0, 0}, bad[4] = {1, 0, 0, 0};
+        memcpy(uboPtr, k->ubo == UBO_DYNAMIC ? bad : good, sizeof good);
+        memcpy((char*)uboPtr + 256, good, sizeof good);
+        memcpy((char*)uboPtr + 512, bad, sizeof bad);
+    }
+    if (k->uboUnmapped) DEV(UnmapMemory)(device, uboMemory);
     if (k->unmapped) DEV(UnmapMemory)(device, memory);
+
+    /* descriptor sets: one per pass (the second at 512 with shiftSecond); vs_dxso's at set 1, binding 3,
+     * behind a set 0 of a sampler */
+    Bound bound[2] = {{{0}}};
+    VkDescriptorSetLayout layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkDescriptorUpdateTemplate tmpl = VK_NULL_HANDLE;
+    if (k->ubo) {
+        VkDescriptorSetLayoutBinding b = {k->ubo == UBO_DXSO ? 3 : 0, k->ubo == UBO_DYNAMIC ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                          1, VK_SHADER_STAGE_VERTEX_BIT, NULL};
+        VkDescriptorSetLayoutBinding sampler = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b};
+        CHECK(DEV(CreateDescriptorSetLayout)(device, &li, NULL, &layouts[1]) == VK_SUCCESS, "set layout");
+        li.pBindings = &sampler;
+        CHECK(DEV(CreateDescriptorSetLayout)(device, &li, NULL, &layouts[0]) == VK_SUCCESS, "sampler set layout");
+        VkDescriptorPoolSize sizes[2] = {{b.descriptorType, 4}, {sampler.descriptorType, 4}};
+        VkDescriptorPoolCreateInfo pi2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 8, 2, sizes};
+        CHECK(DEV(CreateDescriptorPool)(device, &pi2, NULL, &dpool) == VK_SUCCESS, "descriptor pool");
+        if (k->ubo == UBO_TEMPLATE) {
+            VkDescriptorUpdateTemplateEntry e = {0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, sizeof(VkDescriptorBufferInfo)};
+            VkDescriptorUpdateTemplateCreateInfo ti = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO, NULL, 0, 1, &e,
+                                                       VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET, layouts[1]};
+            CHECK(DEV(CreateDescriptorUpdateTemplate)(device, &ti, NULL, &tmpl) == VK_SUCCESS, "template");
+        }
+        for (int i = 0; i < (k->twice ? 2 : 1); i++) {
+            Bound* bd = &bound[i];
+            bool dxso = k->ubo == UBO_DXSO;
+            VkDescriptorSetLayout want[2] = {layouts[0], layouts[1]};
+            VkDescriptorSetAllocateInfo ai2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dpool, dxso ? 2 : 1, dxso ? want : &want[1]};
+            CHECK(DEV(AllocateDescriptorSets)(device, &ai2, bd->sets) == VK_SUCCESS, "sets");
+            bd->first = 0, bd->count = dxso ? 2 : 1, bd->dynamic = k->ubo == UBO_DYNAMIC;
+            VkDescriptorBufferInfo info = {ub, i && k->shiftSecond ? 512 : k->ubo == UBO_DYNAMIC || k->ubo == UBO_DXSO ? 0 : 256,
+                                           k->ubo == UBO_DXSO ? 80 : 16};
+            VkDescriptorSet target = bd->sets[dxso ? 1 : 0];
+            if (k->ubo == UBO_TEMPLATE) {
+                DEV(UpdateDescriptorSetWithTemplate)(device, target, tmpl, &info);
+            } else {
+                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, target, b.binding, 0, 1, b.descriptorType, NULL, &info, NULL};
+                DEV(UpdateDescriptorSets)(device, 1, &write, 0, NULL);
+            }
+        }
+    }
 
     VkShaderModule vs = module(k->vs ? k->vs : k->triangle ? ls_vs_tri : ls_vs_pass,
                                k->vs ? k->vsSize : k->triangle ? sizeof ls_vs_tri : sizeof ls_vs_pass);
@@ -468,11 +691,14 @@ static void runCase(void* ctx) {
 
     /* another command buffer, recorded and not reset: what it writes stays written by the GPU */
     VkCommandBufferBeginInfo once = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    if (k->gpuCopy || k->computeWrite) {
+    if (k->gpuCopy || k->computeWrite || k->uboPending) {
         DEV(BeginCommandBuffer)(primary[1], &once);
         if (k->gpuCopy) {
             VkBufferCopy region = {0, 0, 96};
             DEV(CmdCopyBuffer)(primary[1], ib, vb, 1, &region);
+        } else if (k->uboPending) {
+            VkBufferCopy region = {0, 256, 16};
+            DEV(CmdCopyBuffer)(primary[1], ib, ub, 1, &region);
         } else {
             VkShaderModule cs = module(ls_cs_write, sizeof ls_cs_write);
             VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -506,8 +732,14 @@ static void runCase(void* ctx) {
     sb.pInheritanceInfo = &inherit;
     for (int i = 0; !k->inlineDraw && i < (k->twice ? 2 : 1); i++) {
         DEV(BeginCommandBuffer)(secondaries[i], &sb);
-        recordDraw(k, secondaries[i], pipe, vb, ib);
+        recordDraw(k, secondaries[i], pipe, vb, ib, &bound[i]);
         DEV(EndCommandBuffer)(secondaries[i]);
+        if (k->writtenAfterBind) {
+            VkDescriptorBufferInfo info = {ub, 256, 16};
+            VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, bound[i].sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                          NULL, &info, NULL};
+            DEV(UpdateDescriptorSets)(device, 1, &write, 0, NULL);
+        }
     }
 
     DEV(BeginCommandBuffer)(primary[0], &once);
@@ -538,11 +770,16 @@ static void runCase(void* ctx) {
     for (int i = 0; i < (k->twice ? 2 : 1); i++) {
         DEV(CmdBeginRendering)(primary[0], &ri);
         if (k->unknownBetween) DEV(CmdBeginTransformFeedbackEXT)(primary[0], 0, 0, NULL, NULL);
+        if (k->bindBetween) {
+            const float bad[4] = {1, 0, 0, 0};
+            DEV(CmdBindDescriptorSets)(primary[0], VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE, 0, 1, bound[0].sets, 0, NULL);
+            DEV(CmdPushConstants)(primary[0], VK_NULL_HANDLE, VK_SHADER_STAGE_VERTEX_BIT, 16, 16, bad);
+        }
         if (k->orderBreak) {
             VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
             DEV(CmdSetViewport)(primary[0], 0, 1, &vp);
         }
-        if (k->inlineDraw) recordDraw(k, primary[0], pipe, vb, ib);
+        if (k->inlineDraw) recordDraw(k, primary[0], pipe, vb, ib, NULL);
         else DEV(CmdExecuteCommands)(primary[0], 1, &secondaries[i]);
         DEV(CmdEndRendering)(primary[0]);
         if (i == 0) run->load = fk->lastColorLoad;
@@ -555,6 +792,10 @@ static void runCase(void* ctx) {
         float moved = 0.5f;
         memcpy(ptr, &moved, sizeof moved);
     }
+    if (k->uboStale) {
+        float moved = 0.5f;
+        memcpy((char*)uboPtr + 256, &moved, sizeof moved);
+    }
     VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1, submit.pCommandBuffers = &primary[0];
     CHECK(DEV(QueueSubmit)(queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS, "submit");
@@ -565,6 +806,12 @@ static void runCase(void* ctx) {
     DEV(DestroyCommandPool)(device, pool, NULL);
     DEV(DestroyBuffer)(device, vb, NULL);
     DEV(DestroyBuffer)(device, ib, NULL);
+    DEV(DestroyBuffer)(device, ub, NULL);
+    if (dpool) DEV(DestroyDescriptorPool)(device, dpool, NULL);
+    if (tmpl) DEV(DestroyDescriptorUpdateTemplate)(device, tmpl, NULL);
+    for (int i = 0; i < 2; i++)
+        if (layouts[i]) DEV(DestroyDescriptorSetLayout)(device, layouts[i], NULL);
+    if (uboMemory != memory) DEV(FreeMemory)(device, uboMemory, NULL);
     DEV(FreeMemory)(device, memory, NULL);
     DEV(DestroyImageView)(device, view, NULL);
     DEV(DestroyImageView)(device, view2, NULL);
@@ -593,7 +840,7 @@ static void check(const Case* k, bool skipOn) {
     if (applied) snprintf(want, sizeof want, ", applied %d,", passes);
     else snprintf(want, sizeof want, ", %s %d", k->reason, passes);
     CHECK(line && strstr(line, want), "%s: \"%s\" in %s", k->name, want, line ? line : log);
-    CHECK(!line || !strstr(line, k->stale ? ", stale 0" : ", stale 1"), "%s: stale count: %s", k->name, line ? line : "");
+    CHECK(!line || !strstr(line, k->stale || k->uboStale ? ", stale 0" : ", stale 1"), "%s: stale count: %s", k->name, line ? line : "");
     if (getenv("LOAD_SKIP_TEST_VERBOSE")) fprintf(stderr, "%s: %.*s\n", k->name, (int)strcspn(line ? line : log, "\n"), line ? line : log);
 }
 
@@ -650,7 +897,27 @@ static const Case allCases[] = {
     {"vertex memory not mapped", "vertex", .unmapped = true},
     {"vertex buffer written by a copy", "vertex", .gpuCopy = true},
     {"a shader writing memory", "vertex", .computeWrite = true},
-    {"position from a uniform", "vs", VS(ls_vs_ubo)},
+    {"position from a uniform not bound", "vs-descriptor", VS(ls_vs_ubo)},
+    {"uniform through a descriptor set", NULL, VS(ls_vs_ubo), .ubo = UBO_SET},
+    {"uniform shifting the quad", "geometry", VS(ls_vs_ubo), .ubo = UBO_SET, .shift = 0.5f},
+    {"uniform at a dynamic offset", NULL, VS(ls_vs_ubo), .ubo = UBO_DYNAMIC},
+    {"uniform written through a template", NULL, VS(ls_vs_ubo), .ubo = UBO_TEMPLATE},
+    {"uniform bound by vkCmdBindDescriptorSets2KHR", NULL, VS(ls_vs_ubo), .ubo = UBO_BIND2},
+    {"uniform memory not mapped", "vs-ubo-unmapped", VS(ls_vs_ubo), .ubo = UBO_SET, .uboUnmapped = true},
+    {"uniform buffer written by a copy", "vs-ubo-pending-write", VS(ls_vs_ubo), .ubo = UBO_SET, .uboPending = true},
+    {"set written after it was bound", "vs-descriptor", VS(ls_vs_ubo), .ubo = UBO_SET, .writtenAfterBind = true},
+    {"a push descriptor over the set", "vs-descriptor", VS(ls_vs_ubo), .ubo = UBO_SET, .pushDescriptor = true},
+    {"two passes, uniforms from the cache", NULL, VS(ls_vs_ubo), .ubo = UBO_SET, .twice = true},
+    {"sets bound and constants pushed on the primary meanwhile", NULL, VS(ls_vs_ubo), .ubo = UBO_SET, .bindBetween = true},
+    {"push constants", NULL, VS(ls_vs_push), .push = 1},
+    {"push constants through vkCmdPushConstants2KHR", NULL, VS(ls_vs_push), .push = 2},
+    {"push constants shifting the quad", "geometry", VS(ls_vs_push), .push = 1, .shift = 0.5f},
+    {"push constants not pushed", "vs-push", VS(ls_vs_push)},
+    {"D3D9 shape: c0..c3 transform the quad", NULL, VS(ls_vs_dxso), .ubo = UBO_DXSO, .push = 1, .quad = {0, 0, 1, 1}},
+    {"D3D9 shape, translated", "geometry", VS(ls_vs_dxso), .ubo = UBO_DXSO, .push = 1, .quad = {0, 0, 1, 1}, .shift = 0.5f},
+    {"D3D9 shape, push data not pushed", "vs-push", VS(ls_vs_dxso), .ubo = UBO_DXSO, .quad = {0, 0, 1, 1}},
+    {"position moved by a texel", "vs-image", VS(ls_vs_image)},
+    {"a branch on a square root", "vs-branch", VS(ls_vs_branch)},
     {"negative clip distance", "vs", VS(ls_vs_clip)},
     {"left half", "geometry", .quad = {-1, -1, 0, 1}},
     {"culled", "geometry", .cull = VK_CULL_MODE_BACK_BIT},
@@ -726,6 +993,15 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < sizeof allCases / sizeof allCases[0]; i++) check(&allCases[i], true);
         const Case stale = {"data changed before the submission", NULL, .stale = true};
         check(&stale, true);
+        const Case uboStale = {"uniform changed before the submission", NULL, VS(ls_vs_ubo), .ubo = UBO_SET, .uboStale = true};
+        check(&uboStale, true);
+        /* the same pipeline and vertices, other uniform data: not the cached run */
+        const Case second = {"second pass's uniform shifted", NULL, VS(ls_vs_ubo), .ubo = UBO_SET, .twice = true, .shiftSecond = true};
+        Run two = {&second};
+        char twoLog[16384];
+        captured(runCase, &two, twoLog, sizeof twoLog);
+        const char* twoLine = strstr(twoLog, "hybris-icd: load skip: ");
+        CHECK(twoLine && strstr(twoLine, ", applied 1,") && strstr(twoLine, ", geometry 1"), "%s: %s", second.name, twoLine ? twoLine : twoLog);
         /* the statistics line */
         Run run = {&allCases[0]};
         char log[16384];

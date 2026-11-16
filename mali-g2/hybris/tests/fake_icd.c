@@ -4,7 +4,7 @@
  * device-local heap of FAKE_HEAP_MB and a host heap, no extensions. Waits, idle waits, query reads
  * and event status queries play their FakeScript; vkEndCommandBuffer and pipeline creation fault
  * on demand. Objects are distinct handles; memory maps to host memory of its size; recorded
- * commands do nothing but leave a trace of passes.
+ * commands do nothing but leave a trace of passes (and count descriptor writes, binds and pushes).
  */
 #include "fake_icd.h"
 
@@ -333,6 +333,60 @@ static void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d,
 static void VKAPI_CALL CmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a, uint32_t rn, const VkClearRect* r) {
 }
 
+static VkResult VKAPI_CALL CreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo* i, const VkAllocationCallbacks* a,
+                                                     VkDescriptorSetLayout* l) {
+    *l = NEW(VkDescriptorSetLayout);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout l, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL CreateDescriptorPool(VkDevice d, const VkDescriptorPoolCreateInfo* i, const VkAllocationCallbacks* a, VkDescriptorPool* p) {
+    *p = NEW(VkDescriptorPool);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyDescriptorPool(VkDevice d, VkDescriptorPool p, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL ResetDescriptorPool(VkDevice d, VkDescriptorPool p, VkDescriptorPoolResetFlags f) {
+    return VK_SUCCESS;
+}
+static VkResult VKAPI_CALL AllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* sets) {
+    for (uint32_t i = 0; i < info->descriptorSetCount; i++) sets[i] = NEW(VkDescriptorSet);
+    return VK_SUCCESS;
+}
+static VkResult VKAPI_CALL FreeDescriptorSets(VkDevice d, VkDescriptorPool p, uint32_t n, const VkDescriptorSet* s) {
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL UpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteDescriptorSet* w, uint32_t nc, const VkCopyDescriptorSet* c) {
+    fake_icd.descriptorWrites += nw;
+}
+static VkResult VKAPI_CALL CreateDescriptorUpdateTemplate(VkDevice d, const VkDescriptorUpdateTemplateCreateInfo* i, const VkAllocationCallbacks* a,
+                                                          VkDescriptorUpdateTemplate* t) {
+    *t = NEW(VkDescriptorUpdateTemplate);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyDescriptorUpdateTemplate(VkDevice d, VkDescriptorUpdateTemplate t, const VkAllocationCallbacks* a) {
+}
+static void VKAPI_CALL UpdateDescriptorSetWithTemplate(VkDevice d, VkDescriptorSet s, VkDescriptorUpdateTemplate t, const void* data) {
+    fake_icd.descriptorWrites++;
+}
+static void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n,
+                                             const VkDescriptorSet* s, uint32_t dn, const uint32_t* d) {
+    fake_icd.descriptorBinds++;
+}
+static void VKAPI_CALL CmdBindDescriptorSets2(VkCommandBuffer cb, const VkBindDescriptorSetsInfoKHR* info) {
+    fake_icd.descriptorBinds++;
+}
+static void VKAPI_CALL CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags s, uint32_t o, uint32_t n, const void* v) {
+    fake_icd.pushes++;
+}
+static void VKAPI_CALL CmdPushConstants2(VkCommandBuffer cb, const VkPushConstantsInfoKHR* info) {
+    fake_icd.pushes++;
+}
+static void VKAPI_CALL CmdPushDescriptorSet(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t set, uint32_t n,
+                                            const VkWriteDescriptorSet* w) {
+    fake_icd.descriptorBinds++;
+}
+
 static void VKAPI_CALL CmdBeginConditionalRenderingEXT(VkCommandBuffer cb, const VkConditionalRenderingBeginInfoEXT* info) {
 }
 static void VKAPI_CALL CmdEndConditionalRenderingEXT(VkCommandBuffer cb) {
@@ -387,6 +441,14 @@ static const struct {
     F("CmdClearAttachments", CmdClearAttachments), F("CmdBeginConditionalRenderingEXT", CmdBeginConditionalRenderingEXT),
     F("CmdEndConditionalRenderingEXT", CmdEndConditionalRenderingEXT), F("CmdBeginTransformFeedbackEXT", CmdBeginTransformFeedbackEXT),
     F("CmdSetRasterizationStreamEXT", CmdSetRasterizationStreamEXT), F("CmdTestArgsFAKE", CmdTestArgsFAKE),
+    F("CreateDescriptorSetLayout", CreateDescriptorSetLayout), F("DestroyDescriptorSetLayout", DestroyDescriptorSetLayout),
+    F("CreateDescriptorPool", CreateDescriptorPool), F("DestroyDescriptorPool", DestroyDescriptorPool),
+    F("ResetDescriptorPool", ResetDescriptorPool), F("AllocateDescriptorSets", AllocateDescriptorSets),
+    F("FreeDescriptorSets", FreeDescriptorSets), F("UpdateDescriptorSets", UpdateDescriptorSets),
+    F("CreateDescriptorUpdateTemplate", CreateDescriptorUpdateTemplate), F("DestroyDescriptorUpdateTemplate", DestroyDescriptorUpdateTemplate),
+    F("UpdateDescriptorSetWithTemplate", UpdateDescriptorSetWithTemplate), F("CmdBindDescriptorSets", CmdBindDescriptorSets),
+    F("CmdBindDescriptorSets2KHR", CmdBindDescriptorSets2), F("CmdPushConstants", CmdPushConstants),
+    F("CmdPushConstants2KHR", CmdPushConstants2), F("CmdPushDescriptorSetKHR", CmdPushDescriptorSet),
 };
 
 EXPORT PFN_vkVoidFunction fake_icd_device_proc(const char* name) {
