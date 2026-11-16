@@ -120,4 +120,47 @@ layout(local_size_x = 1) in;
 layout(binding = 0) buffer Out { uint words[]; };
 void main() { words[gl_GlobalInvocationID.x] = 1u; }
 GLSL
+# reads the attachment's old contents (dynamic rendering local read)
+shader fs_input frag <<'GLSL'
+#version 450
+layout(input_attachment_index = 0, set = 0, binding = 0) uniform subpassInput prev;
+layout(location = 0) out vec4 color;
+void main() { color = subpassLoad(prev) * 0.5; }
+GLSL
+# a kill reached through case 0 of a switch on a 64-bit constant (two words per case literal)
+cat > "$T/fs_switch64.spvasm" <<'ASM'
+               OpCapability Shader
+               OpCapability Int64
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %color
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %color Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+      %ptr = OpTypePointer Output %v4float
+      %color = OpVariable %ptr Output
+       %long = OpTypeInt 64 1
+     %long_0 = OpConstant %long 0
+    %float_1 = OpConstant %float 1
+        %one = OpConstantComposite %v4float %float_1 %float_1 %float_1 %float_1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+               OpStore %color %one
+               OpSelectionMerge %merge None
+               OpSwitch %long_0 %merge 0 %kill
+       %kill = OpLabel
+               OpKill
+      %merge = OpLabel
+               OpReturn
+               OpFunctionEnd
+ASM
+spirv-as --target-env vulkan1.1 -o "$T/fs_switch64.spv" "$T/fs_switch64.spvasm"
+python3 -c 'import struct,sys
+w=open(sys.argv[1],"rb").read()
+w=struct.unpack("<%dI"%(len(w)//4),w)
+print("const uint32_t ls_%s[] = {"%sys.argv[2])
+for i in range(0,len(w),8): print("\t"+",".join("0x%08x"%x for x in w[i:i+8])+",")
+print("};")' "$T/fs_switch64.spv" fs_switch64 >> "$T/all.h"
 mv "$T/all.h" load_skip_spv.h

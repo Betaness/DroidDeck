@@ -127,6 +127,21 @@ static void evaluatorTests(void) {
     odd[at] = (1u << 16) | 0x7ffe;
     memcpy(odd + at + 1, ls_fs_plain + at, sizeof ls_fs_plain - at * 4);
     CHECK(!spv_parse(odd, sizeof odd) && !spv_code_writes_memory(odd, sizeof odd), "unknown instruction: no parse, no writes");
+    /* a one-word OpStore at the end: a write, nothing read past it */
+    uint32_t* cut = malloc(sizeof ls_fs_plain + 4);
+    memcpy(cut, ls_fs_plain, sizeof ls_fs_plain);
+    cut[sizeof ls_fs_plain / 4] = (1u << 16) | 62;
+    SpvProgram* cutProg = spv_parse(cut, sizeof ls_fs_plain + 4);
+    CHECK(!cutProg || spv_writes_memory(cutProg), "one-word OpStore");
+    spv_unref(cutProg);
+    free(cut);
+    SpvProgram* sw64 = PROG(ls_fs_switch64);
+    CHECK(sw64 && spv_fs_may_discard(sw64, "main", NULL) == SPV_DISCARD_MAY, "kill through case 0 of a 64-bit switch: may");
+    SpvProgram* input = PROG(ls_fs_input);
+    CHECK(input && spv_reads_attachments(input) && !spv_reads_attachments(plain) && !spv_reads_attachments(alpha),
+          "input attachment read");
+    CHECK(input && spv_fs_may_discard(input, "main", NULL) == SPV_DISCARD_NO, "input attachment: no discard");
+    spv_unref(sw64), spv_unref(input);
 
     /* coverage */
     const VkRect2D area = {{0, 0}, {64, 32}};
@@ -144,6 +159,11 @@ static void evaluatorTests(void) {
     const float behind[3][4] = {{-1, -1, -0.5f, 1}, {3, -1, 0, 1}, {-1, 3, 0, 1}};
     CHECK(ls_cover(behind, 3, one, 1, &vp, area, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, false) == LS_COVER_CLIP, "near plane");
     CHECK(ls_cover(behind, 3, one, 1, &vp, area, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, true) == LS_COVER_YES, "-w <= z");
+    const float inf = __builtin_inff();
+    const float infinite[3][4] = {{inf, inf, 0, 1}, {inf, -inf, 0, 1}, {-inf, inf, 0, 1}};
+    CHECK(ls_cover(infinite, 3, one, 1, &vp, area, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, false) == LS_COVER_CLIP, "infinite");
+    const float huge[3][4] = {{-1, -1, 0, 1}, {3e7f, -1, 0, 1}, {-1, 3e7f, 0, 1}};
+    CHECK(ls_cover(huge, 3, one, 1, &vp, area, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, false) == LS_COVER_CLIP, "past 1e6 w");
     const VkViewport dxvk = {0.5f, 32.5f, 64, -32, 0, 1};
     CHECK(ls_viewport_covers(&dxvk, area), "DXVK's half-pixel viewport covers the centres");
     CHECK(ls_cover(quad, 4, two, 2, &dxvk, area, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, false) == LS_COVER_EDGE,
@@ -248,6 +268,14 @@ typedef struct {
     float viewportScale, scissorScale;
     bool unmapped, gpuCopy, computeWrite, stale;
     bool twice; /* two passes, the second from the pipeline's cached vertex shader run */
+    bool conditional;        /* the pass inside conditional rendering on the primary */
+    bool inheritConditional; /* the secondary begun with inherited conditional rendering */
+    bool inheritUnknown;     /* a structure in the inheritance pNext not known */
+    bool unknownBetween;     /* a command not wrapped by name between the begin and the execute */
+    bool unknownInSecondary;
+    uint32_t stream;         /* rasterization stream, static */
+    bool dynStream;          /* dynamic, set to `stream` */
+    const char* order;       /* the trace expected; NULL: the usual */
 } Case;
 
 static VkShaderModule module(const uint32_t* code, size_t size) {
@@ -278,6 +306,9 @@ static VkPipeline pipeline(const Case* k, VkShaderModule vs, VkShaderModule fs) 
     vp.viewportCount = k->withCount ? 0 : 1, vp.scissorCount = k->withCount ? 0 : 1;
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = k->cull, rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, rs.lineWidth = 1;
+    VkPipelineRasterizationStateStreamCreateInfoEXT stream = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT};
+    stream.rasterizationStream = k->stream;
+    if (k->stream && !k->dynStream) rs.pNext = &stream;
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT, ms.alphaToCoverageEnable = k->a2c;
     VkPipelineColorBlendAttachmentState att = {0};
@@ -293,6 +324,7 @@ static VkPipeline pipeline(const Case* k, VkShaderModule vs, VkShaderModule fs) 
     if (k->dynCull) dyn[dynCount++] = VK_DYNAMIC_STATE_CULL_MODE;
     if (k->dynUntracked) dyn[dynCount++] = VK_DYNAMIC_STATE_DISCARD_RECTANGLE_EXT;
     if (k->dynStride) dyn[dynCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+    if (k->dynStream) dyn[dynCount++] = VK_DYNAMIC_STATE_RASTERIZATION_STREAM_EXT;
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = dynCount, dy.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -344,6 +376,7 @@ typedef struct {
 static void recordDraw(const Case* k, VkCommandBuffer cb, VkPipeline pipe, VkBuffer vb, VkBuffer ib) {
     uint32_t w = k->width ? k->width : W, h = k->height ? k->height : H;
     DEV(CmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    if (k->dynStream) DEV(CmdSetRasterizationStreamEXT)(cb, k->stream);
     float vs = k->viewportScale ? k->viewportScale : 1, ss = k->scissorScale ? k->scissorScale : 1;
     VkViewport vp = {0, 0, w * vs, h, 0, 1};
     if (k->dxvkViewport) vp = (VkViewport){0.5f, h + 0.5f, w * vs, -(float)h, 0, 1};
@@ -364,6 +397,7 @@ static void recordDraw(const Case* k, VkCommandBuffer cb, VkPipeline pipe, VkBuf
         DEV(CmdBindIndexBuffer)(cb, ib, 0, VK_INDEX_TYPE_UINT16);
         DEV(CmdDrawIndexed)(cb, 6, 1, 0, 0, 0);
     }
+    if (k->unknownInSecondary) DEV(CmdBeginTransformFeedbackEXT)(cb, 0, 0, NULL, NULL);
     if (k->twoDraws) DEV(CmdDraw)(cb, 3, 1, 0, 0);
     if (k->barrier) {
         VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -456,6 +490,17 @@ static void runCase(void* ctx) {
     inheritRendering.colorAttachmentCount = 1, inheritRendering.pColorAttachmentFormats = &colorFormat;
     inheritRendering.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkCommandBufferInheritanceInfo inherit = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &inheritRendering};
+    VkCommandBufferInheritanceConditionalRenderingInfoEXT inheritCond = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT};
+    inheritCond.conditionalRenderingEnable = k->inheritConditional;
+    inheritRendering.pNext = &inheritCond; /* disabled: no effect */
+    /* VkRenderingAttachmentLocationInfoKHR, all locations unused */
+    struct {
+        VkStructureType sType;
+        const void* pNext;
+        uint32_t count;
+        const uint32_t* locations;
+    } locations = {(VkStructureType)1000232001, NULL, 1, (const uint32_t[]){VK_ATTACHMENT_UNUSED}};
+    if (k->inheritUnknown) inheritCond.pNext = &locations;
     VkCommandBufferBeginInfo sb = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     sb.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT | (k->reusable ? 0 : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
     sb.pInheritanceInfo = &inherit;
@@ -488,8 +533,11 @@ static void runCase(void* ctx) {
     fk->traceLen = 0;
     fk->trace[0] = 0;
     fk->lastColorLoad = VK_ATTACHMENT_LOAD_OP_MAX_ENUM;
+    VkConditionalRenderingBeginInfoEXT cond = {VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT, NULL, vb, 0};
+    if (k->conditional) DEV(CmdBeginConditionalRenderingEXT)(primary[0], &cond);
     for (int i = 0; i < (k->twice ? 2 : 1); i++) {
         DEV(CmdBeginRendering)(primary[0], &ri);
+        if (k->unknownBetween) DEV(CmdBeginTransformFeedbackEXT)(primary[0], 0, 0, NULL, NULL);
         if (k->orderBreak) {
             VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
             DEV(CmdSetViewport)(primary[0], 0, 1, &vp);
@@ -499,6 +547,7 @@ static void runCase(void* ctx) {
         DEV(CmdEndRendering)(primary[0]);
         if (i == 0) run->load = fk->lastColorLoad;
     }
+    if (k->conditional) DEV(CmdEndConditionalRenderingEXT)(primary[0]);
     DEV(EndCommandBuffer)(primary[0]);
     if (run->load != fk->lastColorLoad) run->load = VK_ATTACHMENT_LOAD_OP_MAX_ENUM;
     strcpy(run->trace, fk->trace);
@@ -533,7 +582,7 @@ static void check(const Case* k, bool skipOn) {
     char want[128];
     bool applied = skipOn && !k->reason;
     CHECK(run.load == (applied ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD), "%s: load op %d", k->name, run.load);
-    CHECK(!strcmp(run.trace, k->inlineDraw ? "BDE" : k->twice ? "BXEBXE" : "BXE"), "%s: order %s", k->name, run.trace);
+    CHECK(!strcmp(run.trace, k->order ? k->order : k->inlineDraw ? "BDE" : k->twice ? "BXEBXE" : "BXE"), "%s: order %s", k->name, run.trace);
     if (!skipOn) {
         CHECK(!line, "%s: no load skip line when off", k->name);
         return;
@@ -607,14 +656,68 @@ static const Case allCases[] = {
     {"culled", "geometry", .cull = VK_CULL_MODE_BACK_BIT},
     {"specialized scale", "geometry", VS(ls_vs_spec), .vsSpec = &scaleSpec},
     {"edge on the first centres", "geometry-edge", .dxvkViewport = true},
+    {"inside conditional rendering", "conditional", .conditional = true},
+    {"inherited conditional rendering", "secondary", .inheritConditional = true},
+    {"attachment locations inherited", "secondary", .inheritUnknown = true},
+    {"an unwrapped command before execute", "order", .unknownBetween = true, .order = "BTXE"},
+    {"an unwrapped command in the secondary", "secondary", .unknownInSecondary = true},
+    {"rasterization stream 1", "raster", .stream = 1},
+    {"dynamic rasterization stream 1", "raster", .stream = 1, .dynStream = true},
+    {"dynamic rasterization stream 0", NULL, .dynStream = true},
+    {"input attachment read", "feedback", FS(ls_fs_input)},
 };
+
+/* An unwrapped command through the generic stub: every argument arrives. */
+static void testArgs(bool wrapped) {
+    openDevice();
+    PFN_vkCmdTestArgsFAKE fn = (PFN_vkCmdTestArgsFAKE)gdpa(device, "vkCmdTestArgsFAKE");
+    CHECK(fn && (fn != (PFN_vkCmdTestArgsFAKE)FAKE(CmdTestArgsFAKE)) == wrapped, "vkCmdTestArgsFAKE %s", wrapped ? "wrapped" : "not wrapped");
+    PFN_vkCmdTestArgsFAKE again = (PFN_vkCmdTestArgsFAKE)gdpa(device, "vkCmdTestArgsFAKE");
+    CHECK(again == fn, "the same stub again");
+    CHECK((gdpa(device, "vkCmdSetCullMode") != FAKE(CmdSetCullMode)) == wrapped, "a tracked state command");
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    VkCommandPool pool;
+    DEV(CreateCommandPool)(device, &pi, NULL, &pool);
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    DEV(AllocateCommandBuffers)(device, &ai, &cb);
+    fk->testCalls = 0;
+    if (fn) fn(cb, 0x1111111111111111ull, 0x22222222u, 0x3333333333333333ull, 0x44444444u, 0x5555555555555555ull, 0x66666666u,
+               0x7777777777777777ull, 0x8888888888888888ull, 0.5f, 1.25, 2.5f, 3.75, 4.5f, 5.25, 6.5f, 7.75, 8.5f, 9.25);
+    const uint64_t ints[8] = {0x1111111111111111ull, 0x22222222u, 0x3333333333333333ull, 0x44444444u, 0x5555555555555555ull, 0x66666666u,
+                              0x7777777777777777ull, 0x8888888888888888ull};
+    const double floats[10] = {0.5, 1.25, 2.5, 3.75, 4.5, 5.25, 6.5, 7.75, 8.5, 9.25};
+    CHECK(fk->testCalls == 1 && fk->testCb == cb && !memcmp(fk->testInts, ints, sizeof ints) && !memcmp(fk->testFloats, floats, sizeof floats),
+          "the arguments through the stub");
+    DEV(DestroyCommandPool)(device, pool, NULL);
+    DEV(DestroyDevice)(device, NULL);
+}
+
+static void writeMode(const char* path, const char* mode) {
+    FILE* f = fopen(path, "w");
+    if (f) fputs(mode, f), fclose(f);
+}
+
+/* a pass and its submission, after the file's next read is due: the mode it says applies from then */
+static void switchMode(void) {
+    usleep(600000);
+    Run run = {&(Case){"switch", NULL}};
+    char log[16384];
+    captured(runCase, &run, log, sizeof log);
+}
 
 int main(int argc, char** argv) {
     const char* mode = argc > 1 ? argv[1] : "all";
     unsetenv("DROIDDECK_HYBRIS_CMD_STATS");
     unsetenv("DROIDDECK_HYBRIS_LOAD_SKIP");
     unsetenv("DROIDDECK_HYBRIS_CMD_STATS_FULL");
-    if (!strcmp(mode, "all")) setenv("DROIDDECK_HYBRIS_LOAD_SKIP", "all", 1), setenv("DROIDDECK_HYBRIS_CMD_STATS", "1", 1);
+    char modeFile[64];
+    snprintf(modeFile, sizeof modeFile, "/tmp/load_skip_test_mode.%d", (int)getpid());
+    unlink(modeFile);
+    unsetenv("DROIDDECK_HYBRIS_LOAD_SKIP_FILE");
+    if (!strcmp(mode, "all"))
+        setenv("DROIDDECK_HYBRIS_LOAD_SKIP", "all", 1), setenv("DROIDDECK_HYBRIS_CMD_STATS", "1", 1),
+            setenv("DROIDDECK_HYBRIS_LOAD_SKIP_FILE", modeFile, 1);
     else if (!strcmp(mode, "full")) setenv("DROIDDECK_HYBRIS_LOAD_SKIP", "full", 1);
     else if (strcmp(mode, "off")) return fprintf(stderr, "usage: load_skip_test all|full|off\n"), 2;
     evaluatorTests();
@@ -630,6 +733,25 @@ int main(int argc, char** argv) {
         const char* line = strstr(log, "hybris-icd: cmd stats: ");
         CHECK(line && strstr(line, ", rendering 1,") && strstr(line, ", sec-pass 1, sec-1draw 1") && strstr(line, ", draw-indexed 1"),
               "cmd stats line: %s", line ? line : log);
+        testArgs(true);
+        /* the mode file: off, then full, then gone (the environment's all again) */
+        writeMode(modeFile, "off\n");
+        switchMode();
+        const Case off = {"mode file off", "off"};
+        check(&off, true);
+        captured(runCase, &run, log, sizeof log);
+        CHECK(strstr(log, "load skip: mode off, "), "mode in the line: %s", log);
+        writeMode(modeFile, "full");
+        switchMode();
+        const Case big = {"mode file full, full size", NULL, .width = 2 * W, .height = 2 * H};
+        const Case small = {"mode file full, half size", "small"};
+        check(&big, true);
+        check(&small, true);
+        unlink(modeFile);
+        switchMode();
+        check(&allCases[0], true);
+        captured(runCase, &run, log, sizeof log);
+        CHECK(strstr(log, "load skip: mode all, "), "back to all: %s", log);
     } else if (!strcmp(mode, "full")) {
         const Case big = {"full size", NULL, .width = 2 * W, .height = 2 * H};
         const Case small = {"half size", "small"};
@@ -648,6 +770,7 @@ int main(int argc, char** argv) {
               "off: the driver's functions handed out");
         DEV(DestroyDevice)(device, NULL);
         check(&allCases[0], false);
+        testArgs(false);
     }
     fprintf(stderr, "load_skip_test %s: %d checks, %d failures\n", mode, checks, failures);
     return failures ? 1 : 0;

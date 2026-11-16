@@ -33,7 +33,17 @@ typedef struct {
     VkAttachmentLoadOp lastColorLoad;
     char trace[64];
     int traceLen;
+    /* vkCmdTestArgsFAKE: an unknown command with arguments in every kind of register and on the stack */
+    int testCalls;
+    VkCommandBuffer testCb;
+    uint64_t testInts[8];
+    double testFloats[10];
+    uint32_t lastStream;
 } FakeIcd;
+
+typedef void(VKAPI_PTR* PFN_vkCmdTestArgsFAKE)(VkCommandBuffer cb, uint64_t a1, uint32_t a2, uint64_t a3, uint32_t a4, uint64_t a5,
+                                              uint32_t a6, uint64_t a7, uint64_t a8, float f0, double f1, float f2, double f3,
+                                              float f4, double f5, float f6, double f7, float f8, double f9);
 
 extern FakeIcd fake_icd;
 

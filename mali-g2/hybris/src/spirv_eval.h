@@ -43,6 +43,10 @@ bool spv_has_entry(const SpvProgram* p, const char* name, uint32_t model);
  * Output or Workgroup storage, or OpImageWrite. */
 bool spv_writes_memory(const SpvProgram* p);
 
+/* Whether the module may read an attachment's contents: the InputAttachment or tile image read
+ * capabilities, or a SubpassData or tile image type. */
+bool spv_reads_attachments(const SpvProgram* p);
+
 /* The same for code spv_parse does not take (instructions it does not know are skipped; a store
  * through a pointer whose type is not known counts as a write); also true for what is not SPIR-V. */
 bool spv_code_writes_memory(const uint32_t* code, size_t bytes);

@@ -27,24 +27,30 @@
  *               VkRenderingAttachmentFlagsInfoKHR (without input attachment feedback); layout
  *               GENERAL, ATTACHMENT_OPTIMAL or COLOR_ATTACHMENT_OPTIMAL; render area the whole image
  *               view at its mip level; one sample; nothing recorded between the begin and one
- *               vkCmdExecuteCommands of one secondary.
+ *               vkCmdExecuteCommands of one secondary; not inside conditional rendering. Every
+ *               vkCmd* not wrapped here by name, other than pure state (vkCmdSet*, vkCmdBind*,
+ *               vkCmdPush*), goes through a generic stub (aarch64) that hands the held-back begin to
+ *               the driver first; without the stubs nothing is held back (unwrapped).
  *   secondary   begun and ended through this library, one-time submit like the primary, nothing
- *               in it this library does not follow (shader objects, nested secondaries); exactly
+ *               in its inheritance pNext but VkCommandBufferInheritanceRenderingInfo and disabled
+ *               conditional rendering, nothing in it this library does not follow (shader
+ *               objects, nested secondaries, commands through the generic stub); exactly
  *               one vkCmdDraw or vkCmdDrawIndexed, no other draw, clear or barrier.
  *   pipeline    created through this library with all four parts (or linked from libraries that
  *               have them), no tessellation, geometry or mesh stages, no feedback loop flags, no
  *               pNext it does not know; blending off, colour write mask complete for the format and
  *               writes enabled, logic op off, rasterizer discard off, polygon mode fill, one sample,
- *               sample mask bit 0 set, alpha to coverage off, sample locations off, no discard
+ *               sample mask bit 0 set, alpha to coverage off, sample locations off, rasterization
+ *               stream 0, no discard
  *               rectangles, no underestimating conservative rasterization; every dynamic state
  *               either harmless here or tracked and set in the secondary before the draw.
  *   fragment    the shader cannot reach a discard, demote or terminate with the pipeline's
  *               specialization constants (DXVK's D3D9 alpha test is one), nor write SampleMask
- *               (spv_fs_may_discard).
+ *               (spv_fs_may_discard), nor read attachments (input attachments, tile images).
  *   viewport    viewport 0 contains every pixel centre of the render area, scissor 0 the area.
  *   geometry    the draw's vertices, read from host-mapped memory where the vertex and index buffers
  *               are bound, are run through the vertex shader on the CPU (spv_vs_run): every
- *               position is known, clip and cull distances never written or not negative, Layer and
+ *               position is known, finite and within 1e6 w, clip and cull distances never written or not negative, Layer and
  *               ViewportIndex never written or 0, and the triangles cover every pixel centre
  *               (ls_cover: one triangle, or a quad of two triangles sharing an edge, with a margin).
  *               A pipeline keeps its last run: the same inputs, byte for byte, are not run again.
@@ -55,13 +61,15 @@
  *               again and a change is counted (stale).
  * Every DROIDDECK_HYBRIS_CMD_STATS_LOG_S seconds of presents a line "hybris-icd: load skip: ..."
  * counts the passes that had a colour LOAD: applied, and the ones kept by the first check that
- * failed (its reason).
+ * failed (its reason). DROIDDECK_HYBRIS_LOAD_SKIP_FILE=<path>: "off", "full" or "all" in that file
+ * applies instead (read at most twice a second at submissions and presents), for A/B runs.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.
  */
 #include "icd.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -150,17 +158,22 @@ static const char* const statNames[S_COUNT] = {
 enum {
     L_APPLIED, L_COLOR_COUNT, L_FLAGS, L_INLINE, L_PNEXT, L_DEPTH, L_LAYERS, L_FEEDBACK, L_AREA, L_SMALL, L_ORDER,
     L_SECONDARY, L_DRAWS, L_BARRIER, L_PIPELINE, L_BLEND, L_MASK, L_LOGIC_OP, L_RASTER, L_DISCARD, L_DYNAMIC,
-    L_VIEWPORT, L_SCISSOR, L_VERTEX, L_VS, L_GEOMETRY, L_GEOMETRY_EDGE, L_STALE, L_COUNT
+    L_VIEWPORT, L_SCISSOR, L_VERTEX, L_VS, L_GEOMETRY, L_GEOMETRY_EDGE, L_CONDITIONAL, L_UNWRAPPED, L_OFF, L_STALE, L_COUNT
 };
 static const char* const loadNames[L_COUNT] = {
     "applied", "color-count", "flags", "inline", "pnext", "depth", "layers", "feedback", "area", "small", "order",
     "secondary", "draws", "barrier", "pipeline", "blend", "mask", "logic-op", "raster", "discard", "dynamic",
-    "viewport", "scissor", "vertex", "vs", "geometry", "geometry-edge", "stale"};
+    "viewport", "scissor", "vertex", "vs", "geometry", "geometry-edge", "conditional", "unwrapped", "off", "stale"};
 
 static uint64_t stats[S_COUNT], logged[S_COUNT];
 static uint64_t loads[L_COUNT], loadsLogged[L_COUNT];
 static int statsOn = -1;
 static int skipMode; /* 0 off, 1 full, 2 all */
+static int skipApply; /* the same, or what DROIDDECK_HYBRIS_LOAD_SKIP_FILE says */
+static const char* skipFile;
+static uint64_t skipFileNs;
+static bool genMissing; /* a vkCmd* was handed out without the generic wrapper */
+static const char* const modeNames[3] = {"off", "full", "all"};
 static uint32_t logSeconds = 10;
 static uint64_t fullArea; /* pixels; 0: the largest seen */
 static uint64_t maxArea;
@@ -233,6 +246,20 @@ static int currentLabel(void) {
 
 /* ---- switches ---- */
 
+/* DROIDDECK_HYBRIS_LOAD_SKIP_FILE: "off", "full" or "all" in it; skipMode when missing or anything else */
+static int skipFileMode(void) {
+    char buf[16];
+    int fd = skipFile ? open(skipFile, O_RDONLY | O_CLOEXEC) : -1;
+    if (fd < 0) return skipMode;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    buf[n > 0 ? n : 0] = 0;
+    buf[strcspn(buf, " \t\r\n")] = 0;
+    for (int i = 0; i < 3; i++)
+        if (!strcmp(buf, modeNames[i])) return i;
+    return skipMode;
+}
+
 static void readEnv(void) {
     const char* on = getenv("DROIDDECK_HYBRIS_CMD_STATS");
     statsOn = on && *on && strcmp(on, "0") ? 1 : 0;
@@ -247,11 +274,24 @@ static void readEnv(void) {
     unsigned w = 0, h = 0;
     if (full && sscanf(full, "%ux%u", &w, &h) == 2) fullArea = (uint64_t)w * h;
     startNs = lastLogNs = icd_now_ns();
+    skipApply = skipMode;
+    if (skipMode) {
+        skipFile = getenv("DROIDDECK_HYBRIS_LOAD_SKIP_FILE");
+        if (skipFile && !*skipFile) skipFile = NULL;
+        skipApply = skipFileMode();
+    }
     if (statsOn)
         fprintf(stderr, "hybris-icd: DROIDDECK_HYBRIS_CMD_STATS on, every %u s, full area %llu\n", logSeconds, (unsigned long long)fullArea);
     if (skipMode)
         fprintf(stderr, "hybris-icd: DROIDDECK_HYBRIS_LOAD_SKIP=%s: colour LOAD -> DONT_CARE in %s passes whose one draw covers the attachment, every %u s a line\n",
                 skipMode == 1 ? "full" : "all", skipMode == 1 ? "full-size" : "all", logSeconds);
+    if (skipFile)
+        fprintf(stderr, "hybris-icd: DROIDDECK_HYBRIS_LOAD_SKIP_FILE=%s: off, full or all in it applies instead (now %s)\n", skipFile,
+                modeNames[skipApply]);
+}
+
+static int applyMode(void) {
+    return __atomic_load_n(&skipApply, __ATOMIC_RELAXED);
 }
 
 static pthread_once_t envOnce = PTHREAD_ONCE_INIT;
@@ -408,7 +448,7 @@ typedef struct {
 enum {
     D_VIEWPORT, D_SCISSOR, D_CULL, D_FRONT, D_TOPOLOGY, D_RESTART, D_RASTER_DISCARD, D_VERTEX_INPUT, D_STRIDE,
     D_WRITE_ENABLE, D_WRITE_MASK, D_BLEND_ENABLE, D_LOGIC_OP_ENABLE, D_A2C, D_SAMPLE_MASK, D_SAMPLES, D_POLYGON, D_SAMPLE_LOCATIONS,
-    D_COUNT
+    D_RASTER_STREAM, D_COUNT
 };
 
 static int dynamicKind(VkDynamicState s) {
@@ -431,6 +471,7 @@ static int dynamicKind(VkDynamicState s) {
     case VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT: return D_SAMPLES;
     case VK_DYNAMIC_STATE_POLYGON_MODE_EXT: return D_POLYGON;
     case VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT: return D_SAMPLE_LOCATIONS;
+    case VK_DYNAMIC_STATE_RASTERIZATION_STREAM_EXT: return D_RASTER_STREAM;
     /* the locations matter only when enabled, which is checked */
     case VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT:
     /* no effect on which pixels one opaque, depth-less, single-sampled triangle draw writes */
@@ -441,7 +482,7 @@ static int dynamicKind(VkDynamicState s) {
     case VK_DYNAMIC_STATE_STENCIL_OP: case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: case VK_DYNAMIC_STATE_LOGIC_OP_EXT:
     case VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT: case VK_DYNAMIC_STATE_TESSELLATION_DOMAIN_ORIGIN_EXT:
     case VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT: case VK_DYNAMIC_STATE_ALPHA_TO_ONE_ENABLE_EXT:
-    case VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT: case VK_DYNAMIC_STATE_RASTERIZATION_STREAM_EXT:
+    case VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT:
     case VK_DYNAMIC_STATE_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT: case VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT:
     case VK_DYNAMIC_STATE_COLOR_BLEND_ADVANCED_EXT: case VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT:
     case VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT: case VK_DYNAMIC_STATE_LINE_STIPPLE_ENABLE_EXT:
@@ -495,6 +536,7 @@ typedef struct Pipe {
     VkPolygonMode polygon;
     VkCullModeFlags cull;
     VkFrontFace front;
+    uint32_t rasterStream;
     /* fragment shader */
     int fsDiscard; /* SPV_DISCARD_* */
     /* fragment output */
@@ -560,6 +602,7 @@ typedef struct {
     VkSampleCountFlagBits samples;
     VkSampleMask sampleMask0;
     VkPolygonMode polygon;
+    uint32_t rasterStream;
     uint32_t viBindingCount, viAttrCount;
     VkVertexInputBindingDescription2EXT viBindings[MAX_VB];
     VkVertexInputAttributeDescription2EXT viAttrs[MAX_ATTRS];
@@ -601,6 +644,7 @@ typedef struct Cb {
     VkCommandPool pool;
     bool recording, ended, ours, secondary, oneTime;
     bool unknown;     /* a command this library does not follow */
+    uint32_t conditional; /* open conditional rendering blocks */
     RecState st;
     uint32_t draws, others, barriers;
     DrawSnap snap;
@@ -742,6 +786,7 @@ enum {
     W_SET_VIEWPORT, W_SET_VIEWPORT_COUNT, W_SET_SCISSOR, W_SET_SCISSOR_COUNT, W_SET_CULL, W_SET_FRONT, W_SET_TOPOLOGY,
     W_SET_RESTART, W_SET_RASTER_DISCARD, W_SET_VERTEX_INPUT, W_SET_WRITE_ENABLE, W_SET_WRITE_MASK, W_SET_BLEND_ENABLE,
     W_SET_LOGIC_OP_ENABLE, W_SET_A2C, W_SET_SAMPLE_MASK, W_SET_SAMPLES, W_SET_POLYGON, W_SET_SAMPLE_LOCATIONS,
+    W_SET_RASTER_STREAM, W_BEGIN_CONDITIONAL, W_END_CONDITIONAL,
     W_COUNT
 };
 static const char* const wrapNames[W_COUNT] = {
@@ -773,7 +818,8 @@ static const char* const wrapNames[W_COUNT] = {
     "vkCmdSetFrontFace", "vkCmdSetPrimitiveTopology", "vkCmdSetPrimitiveRestartEnable", "vkCmdSetRasterizerDiscardEnable",
     "vkCmdSetVertexInputEXT", "vkCmdSetColorWriteEnableEXT", "vkCmdSetColorWriteMaskEXT", "vkCmdSetColorBlendEnableEXT",
     "vkCmdSetLogicOpEnableEXT", "vkCmdSetAlphaToCoverageEnableEXT", "vkCmdSetSampleMaskEXT", "vkCmdSetRasterizationSamplesEXT",
-    "vkCmdSetPolygonModeEXT", "vkCmdSetSampleLocationsEnableEXT"};
+    "vkCmdSetPolygonModeEXT", "vkCmdSetSampleLocationsEnableEXT",
+    "vkCmdSetRasterizationStreamEXT", "vkCmdBeginConditionalRenderingEXT", "vkCmdEndConditionalRenderingEXT"};
 /* aliases handled by the same wrapper slot */
 static const struct {
     const char* name;
@@ -1089,6 +1135,7 @@ static void copyPart(Pipe* p, const Pipe* lib, uint32_t part) {
         p->viewport = lib->viewport, p->scissor = lib->scissor;
         p->rasterDiscard = lib->rasterDiscard, p->negativeOneToOne = lib->negativeOneToOne;
         p->polygon = lib->polygon, p->cull = lib->cull, p->front = lib->front;
+        p->rasterStream = lib->rasterStream;
     } else if (part == PART_FS) {
         p->fsDiscard = lib->fsDiscard;
     } else {
@@ -1198,10 +1245,11 @@ static Pipe* pipeFromInfo(const VkGraphicsPipelineCreateInfo* ci) {
                     if (((const VkPipelineRasterizationConservativeStateCreateInfoEXT*)s)->conservativeRasterizationMode ==
                         VK_CONSERVATIVE_RASTERIZATION_MODE_UNDERESTIMATE_EXT)
                         p->unknown = true;
+                } else if (s->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT) {
+                    p->rasterStream = ((const VkPipelineRasterizationStateStreamCreateInfoEXT*)s)->rasterizationStream;
                 } else if (s->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT &&
                            s->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT &&
-                           s->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT &&
-                           s->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT) {
+                           s->sType != VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT) {
                     p->unknown = true;
                 }
             }
@@ -1222,6 +1270,8 @@ static Pipe* pipeFromInfo(const VkGraphicsPipelineCreateInfo* ci) {
             SpvProgram* prog = stageProgram(s, &writes);
             p->writes |= writes;
             p->fsDiscard = prog && s->pName ? spv_fs_may_discard(prog, s->pName, s->pSpecializationInfo) : SPV_DISCARD_UNKNOWN;
+            /* input attachments (dynamic rendering local read) or tile images: the attachment's old contents */
+            if (prog && spv_reads_attachments(prog)) p->feedbackLoop = true;
             spv_unref(prog);
         }
     }
@@ -1380,10 +1430,16 @@ static VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer cb, const VkComman
             c->ours = true;
             c->secondary = info && info->pInheritanceInfo && (info->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
             c->oneTime = info && (info->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-            /* inheritance with a legacy render pass or inherited viewports: not followed */
+            /* inheritance with a legacy render pass, inherited conditional rendering, attachment locations,
+             * viewports or anything else not known: not followed */
             if (c->secondary && info->pInheritanceInfo->renderPass) c->unknown = true;
-            if (c->secondary && findNext(info->pInheritanceInfo->pNext, VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_VIEWPORT_SCISSOR_INFO_NV))
+            for (const VkBaseInStructure* s = c->secondary ? info->pInheritanceInfo->pNext : NULL; s; s = s->pNext) {
+                if (s->sType == VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO) continue;
+                if (s->sType == VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT &&
+                    !((const VkCommandBufferInheritanceConditionalRenderingInfoEXT*)s)->conditionalRenderingEnable)
+                    continue;
                 c->unknown = true;
+            }
         }
     }
     return N(W_BEGIN_CB, PFN_vkBeginCommandBuffer)(cb, info);
@@ -1498,7 +1554,7 @@ static uint32_t formatComponents(VkFormat f) {
 }
 
 /* L_APPLIED when the pass may be held back for its secondary. */
-static int passChecks(const VkRenderingInfo* info, ViewInfo* view) {
+static int passChecks(const VkRenderingInfo* info, ViewInfo* view, int apply) {
     if (info->colorAttachmentCount != 1 || !info->pColorAttachments) return L_COLOR_COUNT;
     const VkRenderingAttachmentInfo* c = &info->pColorAttachments[0];
     if (info->flags & ~(VkRenderingFlags)VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) return L_FLAGS;
@@ -1530,7 +1586,7 @@ static int passChecks(const VkRenderingInfo* info, ViewInfo* view) {
         info->renderArea.extent.height != view->height)
         return L_AREA;
     if (view->samples != VK_SAMPLE_COUNT_1_BIT) return L_RASTER;
-    if (skipMode == 1 && !isFull((uint64_t)view->width * view->height)) return L_SMALL;
+    if (apply == 1 && !isFull((uint64_t)view->width * view->height)) return L_SMALL;
     return L_APPLIED;
 }
 
@@ -1557,7 +1613,8 @@ static void beginRendering(VkCommandBuffer cb, const VkRenderingInfo* info, bool
         return;
     }
     ViewInfo view;
-    int reason = passChecks(info, &view);
+    int apply = applyMode();
+    int reason = !apply ? L_OFF : c->conditional ? L_CONDITIONAL : genMissing ? L_UNWRAPPED : passChecks(info, &view, apply);
     if (reason != L_APPLIED) {
         LOADC(reason);
         forwardBegin(cb, info, khr);
@@ -1907,6 +1964,25 @@ static void VKAPI_CALL CmdSetSampleLocationsEnableEXT(VkCommandBuffer cb, VkBool
     SET(cb, D_SAMPLE_LOCATIONS) c->st.sampleLocations = e;
     N(W_SET_SAMPLE_LOCATIONS, PFN_vkCmdSetSampleLocationsEnableEXT)(cb, e);
 }
+static void VKAPI_CALL CmdSetRasterizationStreamEXT(VkCommandBuffer cb, uint32_t stream) {
+    SET(cb, D_RASTER_STREAM) c->st.rasterStream = stream;
+    N(W_SET_RASTER_STREAM, PFN_vkCmdSetRasterizationStreamEXT)(cb, stream);
+}
+
+/* A pass begun inside conditional rendering may draw nothing; in a secondary it is not followed. */
+static void VKAPI_CALL CmdBeginConditionalRenderingEXT(VkCommandBuffer cb, const VkConditionalRenderingBeginInfoEXT* info) {
+    Cb* c = rec(cb);
+    if (c) {
+        if (c->secondary) c->unknown = true;
+        c->conditional++;
+    }
+    N(W_BEGIN_CONDITIONAL, PFN_vkCmdBeginConditionalRenderingEXT)(cb, info);
+}
+static void VKAPI_CALL CmdEndConditionalRenderingEXT(VkCommandBuffer cb) {
+    Cb* c = rec(cb);
+    if (c && c->conditional) c->conditional--;
+    N(W_END_CONDITIONAL, PFN_vkCmdEndConditionalRenderingEXT)(cb);
+}
 
 /* ---- the decision ---- */
 
@@ -2061,7 +2137,7 @@ static int decide(Cb* primary, const Pending* pb, uint32_t n, const VkCommandBuf
         DYN(D_SAMPLES, samples) != VK_SAMPLE_COUNT_1_BIT || DYN(D_A2C, a2c))
         return L_RASTER;
     if ((p->dynamic & (1u << D_SAMPLE_MASK)) ? !(st->sampleMask0 & 1) : p->sampleMaskOff) return L_RASTER;
-    if (DYN(D_SAMPLE_LOCATIONS, sampleLocations)) return L_RASTER;
+    if (DYN(D_SAMPLE_LOCATIONS, sampleLocations) || DYN(D_RASTER_STREAM, rasterStream)) return L_RASTER;
     if (p->fsDiscard != SPV_DISCARD_NO) return L_DISCARD;
     VkViewport vp = DYN(D_VIEWPORT, viewport);
     VkRect2D sc = DYN(D_SCISSOR, scissor);
@@ -2429,7 +2505,10 @@ static void checkDeps(VkCommandBuffer cb) {
     pthread_mutex_unlock(&trk);
 }
 
+static void readSkipFile(void);
+
 static VkResult VKAPI_CALL QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+    readSkipFile();
     INC(S_SUBMIT);
     for (uint32_t i = 0; s && i < n; i++) {
         ADD(S_SUBMIT_CMDBUFS, s[i].commandBufferCount);
@@ -2438,6 +2517,7 @@ static VkResult VKAPI_CALL QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo
     return N(W_SUBMIT, PFN_vkQueueSubmit)(q, n, s, f);
 }
 static void submit2(uint32_t n, const VkSubmitInfo2* s) {
+    readSkipFile();
     INC(S_SUBMIT);
     for (uint32_t i = 0; s && i < n; i++) {
         ADD(S_SUBMIT_CMDBUFS, s[i].commandBufferInfoCount);
@@ -2515,8 +2595,9 @@ static void statsLog(bool force) {
             loadsLogged[i] = v;
             if (i != L_STALE) total += delta[i];
         }
-        int n = snprintf(line, sizeof line, "hybris-icd: load skip: dp %llu, passes %llu, applied %llu, stale %llu, kept %llu",
-                         (unsigned long long)(p - loggedPresents), (unsigned long long)total, (unsigned long long)delta[L_APPLIED],
+        int n = snprintf(line, sizeof line, "hybris-icd: load skip: mode %s, dt %.2f, dp %llu, passes %llu, applied %llu, stale %llu, kept %llu",
+                         modeNames[applyMode()], (now - lastLogNs) / 1e9, (unsigned long long)(p - loggedPresents), (unsigned long long)total,
+                         (unsigned long long)delta[L_APPLIED],
                          (unsigned long long)delta[L_STALE], (unsigned long long)(total - delta[L_APPLIED]));
         for (int i = L_APPLIED + 1; i < L_COUNT && n > 0 && n < (int)sizeof line - 64; i++)
             if (i != L_STALE && delta[i]) n += snprintf(line + n, sizeof line - n, ", %s %llu", loadNames[i], (unsigned long long)delta[i]);
@@ -2527,9 +2608,23 @@ static void statsLog(bool force) {
     pthread_mutex_unlock(&logLock);
 }
 
+/* At submissions and presents, at most twice a second: the file's mode; a change ends the interval of the old one. */
+static void readSkipFile(void) {
+    if (!skipFile) return;
+    uint64_t now = icd_now_ns(), last = __atomic_load_n(&skipFileNs, __ATOMIC_RELAXED);
+    if (now - last < 500000000ull || !__atomic_compare_exchange_n(&skipFileNs, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    int mode = skipFileMode();
+    if (mode == applyMode()) return;
+    statsLog(true);
+    __atomic_store_n(&skipApply, mode, __ATOMIC_RELAXED);
+    fprintf(stderr, "hybris-icd: load skip: mode %s\n", modeNames[mode]);
+}
+
 static VkResult VKAPI_CALL QueuePresentKHR(VkQueue q, const VkPresentInfoKHR* info) {
     VkResult r = N(W_PRESENT, PFN_vkQueuePresentKHR)(q, info);
     __atomic_add_fetch(&presents, 1, __ATOMIC_RELAXED);
+    readSkipFile();
     statsLog(false);
     return r;
 }
@@ -2604,12 +2699,128 @@ static const PFN_vkVoidFunction wrappers[W_COUNT] = {
     WR(W_SET_BLEND_ENABLE, CmdSetColorBlendEnableEXT), WR(W_SET_LOGIC_OP_ENABLE, CmdSetLogicOpEnableEXT),
     WR(W_SET_A2C, CmdSetAlphaToCoverageEnableEXT), WR(W_SET_SAMPLE_MASK, CmdSetSampleMaskEXT),
     WR(W_SET_SAMPLES, CmdSetRasterizationSamplesEXT), WR(W_SET_POLYGON, CmdSetPolygonModeEXT),
-    WR(W_SET_SAMPLE_LOCATIONS, CmdSetSampleLocationsEnableEXT)};
+    WR(W_SET_SAMPLE_LOCATIONS, CmdSetSampleLocationsEnableEXT), WR(W_SET_RASTER_STREAM, CmdSetRasterizationStreamEXT),
+    WR(W_BEGIN_CONDITIONAL, CmdBeginConditionalRenderingEXT), WR(W_END_CONDITIONAL, CmdEndConditionalRenderingEXT)};
 
 _Static_assert(ARRAY_LEN(statNames) == S_COUNT, "statNames");
 _Static_assert(ARRAY_LEN(loadNames) == L_COUNT, "loadNames");
 _Static_assert(ARRAY_LEN(wrapNames) == W_COUNT, "wrapNames");
 _Static_assert(ARRAY_LEN(wrappers) == W_COUNT, "wrappers");
+
+/* ---- every other command ----
+ * With the load skip on, any other vkCmd* that is not pure state goes through a stub: a held-back
+ * vkCmdBeginRendering goes to the driver first (so nothing overtakes it), it may write any memory
+ * (unless known not to), and a secondary recording it is not followed. The stubs are signature-free:
+ * the argument registers are kept across the call and the driver's function is branched to. */
+
+/* pure state, harmless out of order and checked through the pipeline's dynamic states */
+static bool stateOnly(const char* name) {
+    static const char* const notState[] = {"vkCmdSetRenderingAttachmentLocations", "vkCmdSetRenderingInputAttachmentIndices",
+                                           "vkCmdSetEvent", "vkCmdSetDeviceMask", "vkCmdSetExclusiveScissor",
+                                           "vkCmdSetViewportShadingRatePalette", "vkCmdSetCoarseSampleOrder",
+                                           "vkCmdBindShadingRateImage", "vkCmdBindInvocationMask"};
+    for (size_t i = 0; i < ARRAY_LEN(notState); i++)
+        if (!strncmp(name, notState[i], strlen(notState[i]))) return false;
+    return !strncmp(name, "vkCmdSet", 8) || !strncmp(name, "vkCmdBind", 9) || !strncmp(name, "vkCmdPush", 9);
+}
+
+static bool writesNothing(const char* name) {
+    static const char* const none[] = {"vkCmdDebugMarker", "vkCmdResetEvent", "vkCmdEndRenderPass", "vkCmdNextSubpass",
+                                       "vkCmdSetRenderingAttachmentLocations", "vkCmdSetRenderingInputAttachmentIndices",
+                                       "vkCmdSetEvent", "vkCmdSetDeviceMask"};
+    for (size_t i = 0; i < ARRAY_LEN(none); i++)
+        if (!strncmp(name, none[i], strlen(none[i]))) return true;
+    return false;
+}
+
+#define GEN_SLOTS 512
+#define GEN_STUB 16
+static char* genNames[GEN_SLOTS];
+static PFN_vkVoidFunction genNext[GEN_SLOTS];
+static bool genWrites[GEN_SLOTS];
+static uint32_t genCount;
+static pthread_mutex_t genLock = PTHREAD_MUTEX_INITIALIZER;
+
+#if defined(__aarch64__)
+__attribute__((used, visibility("hidden"))) PFN_vkVoidFunction dd_cmd_gen_enter(VkCommandBuffer cb, uint64_t slot);
+PFN_vkVoidFunction dd_cmd_gen_enter(VkCommandBuffer cb, uint64_t slot) {
+    PFN_vkVoidFunction next = __atomic_load_n(&genNext[slot], __ATOMIC_ACQUIRE);
+    Cb* c = rec(cb);
+    if (c) {
+        if (genWrites[slot] && TRACK) taintEverything(c);
+        if (c->secondary) c->unknown = true;
+    }
+    return next;
+}
+
+/* stub i: bti c; x17 = i; to the common part, which keeps x0-x8 and v0-v7 around dd_cmd_gen_enter */
+extern const char dd_cmd_gen_stubs[] __attribute__((visibility("hidden")));
+__asm__(".text\n"
+        ".p2align 4\n"
+        ".globl dd_cmd_gen_stubs\n"
+        ".hidden dd_cmd_gen_stubs\n"
+        ".type dd_cmd_gen_stubs, %function\n"
+        "dd_cmd_gen_stubs:\n"
+        ".set dd_cmd_gen_i, 0\n"
+        ".rept 512\n"
+        "hint #34\n"
+        "movz x17, #dd_cmd_gen_i\n"
+        "b dd_cmd_gen_common\n"
+        "nop\n"
+        ".set dd_cmd_gen_i, dd_cmd_gen_i + 1\n"
+        ".endr\n"
+        "dd_cmd_gen_common:\n"
+        "stp x29, x30, [sp, #-224]!\n"
+        "mov x29, sp\n"
+        "stp x0, x1, [sp, #16]\n"
+        "stp x2, x3, [sp, #32]\n"
+        "stp x4, x5, [sp, #48]\n"
+        "stp x6, x7, [sp, #64]\n"
+        "stp x8, x17, [sp, #80]\n"
+        "stp q0, q1, [sp, #96]\n"
+        "stp q2, q3, [sp, #128]\n"
+        "stp q4, q5, [sp, #160]\n"
+        "stp q6, q7, [sp, #192]\n"
+        "mov x1, x17\n"
+        "bl dd_cmd_gen_enter\n"
+        "mov x16, x0\n"
+        "ldp q6, q7, [sp, #192]\n"
+        "ldp q4, q5, [sp, #160]\n"
+        "ldp q2, q3, [sp, #128]\n"
+        "ldp q0, q1, [sp, #96]\n"
+        "ldp x8, x17, [sp, #80]\n"
+        "ldp x6, x7, [sp, #64]\n"
+        "ldp x4, x5, [sp, #48]\n"
+        "ldp x2, x3, [sp, #32]\n"
+        "ldp x0, x1, [sp, #16]\n"
+        "ldp x29, x30, [sp], #224\n"
+        "br x16\n"
+        ".size dd_cmd_gen_stubs, . - dd_cmd_gen_stubs\n");
+_Static_assert(GEN_SLOTS == 512 && GEN_STUB == 16, "the stubs above");
+#define GEN_STUB_AT(i) ((PFN_vkVoidFunction)(uintptr_t)(dd_cmd_gen_stubs + (size_t)(i) * GEN_STUB))
+#endif
+
+static PFN_vkVoidFunction genWrap(const char* name, PFN_vkVoidFunction next) {
+#if defined(__aarch64__)
+    pthread_mutex_lock(&genLock);
+    uint32_t i = 0;
+    while (i < genCount && strcmp(genNames[i], name)) i++;
+    if (i == genCount && (genCount == GEN_SLOTS || !(genNames[i] = strdup(name)))) {
+        genMissing = true;
+        pthread_mutex_unlock(&genLock);
+        fprintf(stderr, "hybris-icd: load skip: %s not wrapped; LOAD stays\n", name);
+        return next;
+    }
+    if (i == genCount) genWrites[i] = !writesNothing(name), genCount++;
+    PFN_vkVoidFunction stub = GEN_STUB_AT(i);
+    if (next != stub) __atomic_store_n(&genNext[i], next, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&genLock);
+    return stub;
+#else
+    genMissing = true;
+    return next;
+#endif
+}
 
 /* The wrapper in front of `next` (what vkGetDeviceProcAddr would hand out) for the commands here. */
 PFN_vkVoidFunction cmd_stats_wrap(const char* name, PFN_vkVoidFunction next) {
@@ -2619,6 +2830,7 @@ PFN_vkVoidFunction cmd_stats_wrap(const char* name, PFN_vkVoidFunction next) {
         if (!strcmp(name, wrapNames[i])) index = i;
     for (size_t i = 0; i < ARRAY_LEN(aliases) && index < 0; i++)
         if (!strcmp(name, aliases[i].name)) index = aliases[i].index;
+    if (index < 0 && TRACK && !strncmp(name, "vkCmd", 5) && !stateOnly(name)) return genWrap(name, next);
     if (index < 0 || !wrappers[index]) return next;
     if (next == wrappers[index]) return next;
     __atomic_store_n(&nextFn[index], next, __ATOMIC_RELEASE);

@@ -27,6 +27,7 @@
 #ifndef DROIDDECK_LOAD_SKIP_H
 #define DROIDDECK_LOAD_SKIP_H
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -107,7 +108,9 @@ static inline int ls_cover(const float (*positions)[4], uint32_t count, const ui
             if (v >= count) return LS_COVER_NO;
             const float* p = positions[v];
             double x = p[0], y = p[1], z = p[2], w = p[3];
-            if (!(w > 1e-20) || !(w < 1e30) || !(x == x) || !(y == y) || !(z <= w) || !(negativeOneToOne ? z >= -w : z >= 0))
+            /* finite and well inside any guard band; the comparisons are false for NaN */
+            if (!(w > 1e-20) || !(w < 1e30) || !(fabs(x) <= 1e6 * w) || !(fabs(y) <= 1e6 * w) || !(z <= w) ||
+                !(negativeOneToOne ? z >= -w : z >= 0))
                 return LS_COVER_CLIP;
             fb[3 * t + k] = (LsPoint){vp->x + vp->width * 0.5 * (x / w + 1.0), vp->y + vp->height * 0.5 * (y / w + 1.0)};
         }

@@ -353,7 +353,10 @@ SpvProgram* spv_parse(const uint32_t* code, size_t bytes) {
         uint32_t ptr = 0;
         bool check = false;
         if (op == OpImageWrite) p->writes = true;
-        else if (op == OpStore || op == OpCopyMemory || op == OpCopyMemorySized || op == OpAtomicStore) ptr = w[1], check = true;
+        else if (op == OpStore || op == OpCopyMemory || op == OpCopyMemorySized || op == OpAtomicStore) {
+            if (n < 2) p->writes = true;
+            else ptr = w[1], check = true;
+        }
         else if ((op > OpAtomicLoad && op <= OpAtomicFlagClear) || op == OpAtomicFMinEXT || op == OpAtomicFMaxEXT || op == OpAtomicFAddEXT)
             ptr = n > 3 ? w[3] : 0, check = true;
         if (check) {
@@ -385,6 +388,19 @@ void spv_unref(SpvProgram* p) {
 
 bool spv_writes_memory(const SpvProgram* p) {
     return !p || p->writes;
+}
+
+bool spv_reads_attachments(const SpvProgram* p) {
+    if (!p) return true;
+    for (uint32_t pos = 5; pos < p->words;) {
+        uint32_t n, op;
+        const uint32_t* w = insn(p, pos, &n, &op);
+        /* InputAttachment, TileImage{Color,Depth,Stencil}ReadAccessEXT; Dim SubpassData, TileImageDataEXT */
+        if (op == 17 /* OpCapability */ && n >= 2 && (w[1] == 40 || (w[1] >= 4166 && w[1] <= 4168))) return true;
+        if (op == 25 /* OpTypeImage */ && n >= 4 && (w[3] == 6 || w[3] == 4173)) return true;
+        pos += n;
+    }
+    return false;
 }
 
 bool spv_code_writes_memory(const uint32_t* code, size_t bytes) {
@@ -1210,6 +1226,14 @@ static uint32_t rootVariable(const SpvProgram* p, uint32_t id) {
     return 0;
 }
 
+/* Words per OpSwitch case literal for selector `sel`; 0 when its width is not known. */
+static uint32_t switchLiteralWords(const Ctx* c, uint32_t sel) {
+    const IdInfo* i = idOf(c, sel);
+    const IdInfo* t = i ? idOf(c, i->type) : NULL;
+    if (!t || t->kind != T_INT) return 0;
+    return t->width <= 32 ? 1 : t->width == 64 ? 2 : 0;
+}
+
 /* Whether the edge from block `from` (executable) to `to` is taken with what is known now. */
 static bool edgeFeasible(Ctx* c, const uint8_t* exec, uint32_t from, uint32_t to) {
     const IdInfo* f = idOf(c, from);
@@ -1228,11 +1252,13 @@ static bool edgeFeasible(Ctx* c, const uint8_t* exec, uint32_t from, uint32_t to
         if (n < 3) return false;
         const Cell* sel = V(c, w[1]);
         if (!sel) return false;
-        uint32_t width = valueCells(c, w[1]) == 1 && classOf(c, idOf(c, w[1])->type) == C_I32 ? 1 : 0;
-        if (!(sel->f & F_K) || !width) {
+        uint32_t lw = switchLiteralWords(c, w[1]);
+        if (!lw) return true;
+        bool known = (sel->f & F_K) && lw == 1 && valueCells(c, w[1]) == 1 && classOf(c, idOf(c, w[1])->type) == C_I32;
+        if (!known) {
             if (w[2] == to) return true;
-            for (uint32_t i = 3; i + 1 < n; i += 2)
-                if (w[i + 1] == to) return true;
+            for (uint32_t i = 3; i + lw < n; i += lw + 1)
+                if (w[i + lw] == to) return true;
             return false;
         }
         for (uint32_t i = 3; i + 1 < n; i += 2)
@@ -1283,6 +1309,10 @@ int spv_fs_may_discard(const SpvProgram* p, const char* entry, const VkSpecializ
                     result = SPV_DISCARD_MAY;
                     goto out;
                 case OpStore: case OpCopyMemory: case OpCopyMemorySized: {
+                    if (n < 2) {
+                        result = SPV_DISCARD_UNKNOWN;
+                        goto out;
+                    }
                     uint32_t var = rootVariable(p, w[1]);
                     if (!var && n >= 2) { /* a store through a pointer not traced to a variable */
                         uint32_t pt = idOf(c, w[1]) ? p->ids[w[1]].type : 0;
@@ -1334,8 +1364,13 @@ int spv_fs_may_discard(const SpvProgram* p, const char* entry, const VkSpecializ
                     uint32_t targets[2] = {w[2], op == OpBranchConditional && n >= 4 ? w[3] : 0};
                     for (int i = 0; i < 2; i++)
                         if (targets[i] && edgeFeasible(c, exec, block, targets[i])) markBlock(c, exec, targets[i]);
-                    for (uint32_t i = 3; op == OpSwitch && i + 1 < n; i += 2)
-                        if (edgeFeasible(c, exec, block, w[i + 1])) markBlock(c, exec, w[i + 1]);
+                    uint32_t lw = op == OpSwitch ? switchLiteralWords(c, w[1]) : 0;
+                    if (op == OpSwitch && !lw) {
+                        result = SPV_DISCARD_UNKNOWN;
+                        goto out;
+                    }
+                    for (uint32_t i = 3; op == OpSwitch && i + lw < n; i += lw + 1)
+                        if (edgeFeasible(c, exec, block, w[i + lw])) markBlock(c, exec, w[i + lw]);
                     break;
                 }
                 case OpReturnValue: {

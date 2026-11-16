@@ -333,6 +333,27 @@ static void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d,
 static void VKAPI_CALL CmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a, uint32_t rn, const VkClearRect* r) {
 }
 
+static void VKAPI_CALL CmdBeginConditionalRenderingEXT(VkCommandBuffer cb, const VkConditionalRenderingBeginInfoEXT* info) {
+}
+static void VKAPI_CALL CmdEndConditionalRenderingEXT(VkCommandBuffer cb) {
+}
+static void VKAPI_CALL CmdBeginTransformFeedbackEXT(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer* b, const VkDeviceSize* o) {
+    trace('T');
+}
+static void VKAPI_CALL CmdSetRasterizationStreamEXT(VkCommandBuffer cb, uint32_t stream) {
+    fake_icd.lastStream = stream;
+}
+static void VKAPI_CALL CmdTestArgsFAKE(VkCommandBuffer cb, uint64_t a1, uint32_t a2, uint64_t a3, uint32_t a4, uint64_t a5, uint32_t a6,
+                                       uint64_t a7, uint64_t a8, float f0, double f1, float f2, double f3, float f4, double f5, float f6,
+                                       double f7, float f8, double f9) {
+    fake_icd.testCalls++;
+    fake_icd.testCb = cb;
+    const uint64_t ints[8] = {a1, a2, a3, a4, a5, a6, a7, a8};
+    const double floats[10] = {f0, f1, f2, f3, f4, f5, f6, f7, f8, f9};
+    memcpy(fake_icd.testInts, ints, sizeof ints);
+    memcpy(fake_icd.testFloats, floats, sizeof floats);
+}
+
 #define F(name, fn) {"vk" name, (PFN_vkVoidFunction)fn}
 static const struct {
     const char* name;
@@ -363,7 +384,9 @@ static const struct {
     F("CmdBindIndexBuffer", CmdBindIndexBuffer), F("CmdSetViewport", CmdSetViewport), F("CmdSetScissor", CmdSetScissor),
     F("CmdSetViewportWithCount", CmdSetViewportWithCount), F("CmdSetScissorWithCount", CmdSetScissorWithCount),
     F("CmdSetCullMode", CmdSetCullMode), F("CmdPipelineBarrier2", CmdPipelineBarrier2), F("CmdCopyBuffer", CmdCopyBuffer),
-    F("CmdClearAttachments", CmdClearAttachments),
+    F("CmdClearAttachments", CmdClearAttachments), F("CmdBeginConditionalRenderingEXT", CmdBeginConditionalRenderingEXT),
+    F("CmdEndConditionalRenderingEXT", CmdEndConditionalRenderingEXT), F("CmdBeginTransformFeedbackEXT", CmdBeginTransformFeedbackEXT),
+    F("CmdSetRasterizationStreamEXT", CmdSetRasterizationStreamEXT), F("CmdTestArgsFAKE", CmdTestArgsFAKE),
 };
 
 EXPORT PFN_vkVoidFunction fake_icd_device_proc(const char* name) {
