@@ -144,6 +144,10 @@ object SessionState {
     @Volatile
     var outputSize: Pair<Int, Int> = Pair(1920, 1080)
 
+    /** The resolution choice the running session's output was started with; null before the first output of a session. */
+    @Volatile
+    var resolutionChoice: String? = null
+
     @Volatile
     var followScreen = false
     var followScale = 1f

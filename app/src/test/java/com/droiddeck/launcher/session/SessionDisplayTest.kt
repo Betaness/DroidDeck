@@ -200,4 +200,26 @@ class SessionDisplayTest {
         assertFalse(SessionPrefs.upscalerHasSharpness(2))
         for (mode in 3..8) assertTrue(SessionPrefs.upscalerHasSharpness(mode))
     }
+
+    @Test fun aRunningSessionKeepsTheChoiceItStartedWith() {
+        val panel = 3408 to 2272
+        var reads = 0
+        val saved = { reads++; SessionDisplay.MATCH_SCREEN }
+        val choice = SessionDisplay.sessionChoice(SessionDisplay.HALF_SCREEN, saved)
+        assertEquals(SessionDisplay.HALF_SCREEN, choice)
+        assertEquals(0, reads)
+        assertEquals(1704 to 1136, SessionDisplay.resolveChoice(panel, choice))
+    }
+
+    @Test fun withoutARecordedChoiceTheSavedSettingIsUsed() {
+        assertEquals("900p", SessionDisplay.sessionChoice(null) { "900p" })
+        assertEquals(SessionDisplay.MATCH_SCREEN, SessionDisplay.sessionChoice(null) { SessionDisplay.MATCH_SCREEN })
+    }
+
+    @Test fun panelProgramsWithoutASavedChoiceStartAtTheScreenSize() {
+        assertEquals(SessionDisplay.MATCH_SCREEN, SessionDisplay.startChoice(runMode = true, drawsAtPanel = true, chosen = false, saved = "720p"))
+        assertEquals("720p", SessionDisplay.startChoice(runMode = true, drawsAtPanel = true, chosen = true, saved = "720p"))
+        assertEquals("720p", SessionDisplay.startChoice(runMode = true, drawsAtPanel = false, chosen = false, saved = "720p"))
+        assertEquals(SessionDisplay.HALF_SCREEN, SessionDisplay.startChoice(runMode = false, drawsAtPanel = true, chosen = false, saved = SessionDisplay.HALF_SCREEN))
+    }
 }

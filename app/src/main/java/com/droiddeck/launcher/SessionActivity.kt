@@ -740,6 +740,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             SessionState.secondScreenAutomatic = false
             SessionState.gameOnBottom = false
             gameOnBottom = false
+            SessionState.resolutionChoice = null
         }
         if (!SessionState.running && SessionState.phase in setOf(SessionPhase.IDLE, SessionPhase.FAILED)) {
             SessionState.program = intent.getStringExtra(SessionService.EXTRA_PROGRAM)
@@ -2224,6 +2225,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         val driverId = if (CompositorHost.isStarted) null else turnip.install()
 
+        if (!SessionState.running) SessionState.resolutionChoice = savedResolutionChoice()
         val previous = SessionState.outputSize
         val live = windowOutputSize(holder.surfaceFrame.width(), holder.surfaceFrame.height())
         val size = live ?: if (SessionState.running) previous else glassesOutputSize() ?: outputSize()
@@ -2412,13 +2414,16 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         com.droiddeck.launcher.session.SessionDisplay.resolveChoice(com.droiddeck.launcher.session.SessionDisplay.panelSize(this),
             resolutionChoice(), SessionPrefs.portrait(this) && !controlsBelowWanted())
 
-    private fun resolutionChoice(): String {
+    private fun resolutionChoice(): String =
+        com.droiddeck.launcher.session.SessionDisplay.sessionChoice(SessionState.resolutionChoice, ::savedResolutionChoice)
+
+    private fun savedResolutionChoice(): String {
         val mode = displayMode()
-        val program = intent.getStringExtra(SessionService.EXTRA_PROGRAM)
-        return if (intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_RUN &&
-            Library.drawsAtPanel(program) && !SessionPrefs.resolutionChosen(this, mode))
-            com.droiddeck.launcher.session.SessionDisplay.MATCH_SCREEN
-        else SessionPrefs.resolutionChoice(this, mode, com.droiddeck.launcher.session.SessionDisplay.panelSize(this))
+        return com.droiddeck.launcher.session.SessionDisplay.startChoice(
+            intent.getStringExtra(SessionService.EXTRA_MODE) == SessionService.MODE_RUN,
+            Library.drawsAtPanel(intent.getStringExtra(SessionService.EXTRA_PROGRAM)),
+            SessionPrefs.resolutionChosen(this, mode),
+            SessionPrefs.resolutionChoice(this, mode, com.droiddeck.launcher.session.SessionDisplay.panelSize(this)))
     }
 
     private fun refreshHz(): Float = refreshHz(null)

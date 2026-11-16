@@ -46,6 +46,13 @@ object SessionDisplay {
         else -> null
     }
 
+    /** A program that draws at the panel and has no saved choice for its mode runs at the screen size. */
+    fun startChoice(runMode: Boolean, drawsAtPanel: Boolean, chosen: Boolean, saved: String): String =
+        if (runMode && drawsAtPanel && !chosen) MATCH_SCREEN else saved
+
+    /** A running session sizes its output with the choice it started with; [saved] is read only when none was recorded. */
+    fun sessionChoice(started: String?, saved: () -> String): String = started ?: saved()
+
     fun screenSize(panel: Pair<Int, Int>): Pair<Int, Int> =
         (maxOf(panel.first, panel.second) and 1.inv()) to (minOf(panel.first, panel.second) and 1.inv())
 

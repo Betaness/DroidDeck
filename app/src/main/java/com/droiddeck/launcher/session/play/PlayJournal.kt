@@ -404,7 +404,7 @@ object PlayJournal {
         val panel = panelMode?.let { "${it.physicalWidth}x${it.physicalHeight}" }
         val size = SessionState.outputSize
         // The setting the session read (MODE_RUN reads Steam's or the desktop's), its default when never chosen.
-        val choice = runCatching {
+        val choice = SessionState.resolutionChoice ?: runCatching {
             val m = SessionPrefs.displayMode(ctx, SessionState.mode, program)
             SessionPrefs.resolutionChoice(ctx, m, (panelMode?.physicalWidth ?: size.first) to (panelMode?.physicalHeight ?: size.second))
         }.getOrNull()
