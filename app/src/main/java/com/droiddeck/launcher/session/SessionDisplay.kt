@@ -53,6 +53,10 @@ object SessionDisplay {
     /** A running session sizes its output with the choice it started with; [saved] is read only when none was recorded. */
     fun sessionChoice(started: String?, saved: () -> String): String = started ?: saved()
 
+    /** A running guest that does not follow the output keeps the orientation it started with; [live] is read otherwise. */
+    fun sessionPortrait(started: Boolean?, guestFollows: Boolean, live: () -> Boolean): Boolean =
+        if (started != null && !guestFollows) started else live()
+
     fun screenSize(panel: Pair<Int, Int>): Pair<Int, Int> =
         (maxOf(panel.first, panel.second) and 1.inv()) to (minOf(panel.first, panel.second) and 1.inv())
 

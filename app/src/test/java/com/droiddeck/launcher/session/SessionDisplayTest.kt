@@ -222,4 +222,19 @@ class SessionDisplayTest {
         assertEquals("720p", SessionDisplay.startChoice(runMode = true, drawsAtPanel = false, chosen = false, saved = "720p"))
         assertEquals(SessionDisplay.HALF_SCREEN, SessionDisplay.startChoice(runMode = false, drawsAtPanel = true, chosen = false, saved = SessionDisplay.HALF_SCREEN))
     }
+
+    @Test fun aGuestThatDoesNotFollowKeepsItsStartingOrientation() {
+        val panel = 3408 to 2272
+        var reads = 0
+        val live = { reads++; true }
+        val portrait = SessionDisplay.sessionPortrait(started = false, guestFollows = false, live = live)
+        assertEquals(false, portrait)
+        assertEquals(0, reads)
+        assertEquals(1704 to 1136, SessionDisplay.resolveChoice(panel, SessionDisplay.HALF_SCREEN, portrait))
+    }
+
+    @Test fun aFollowingGuestOrAnUnrecordedSessionUsesTheLiveOrientation() {
+        assertEquals(true, SessionDisplay.sessionPortrait(started = false, guestFollows = true) { true })
+        assertEquals(true, SessionDisplay.sessionPortrait(started = null, guestFollows = false) { true })
+    }
 }

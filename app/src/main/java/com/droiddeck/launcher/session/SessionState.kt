@@ -148,6 +148,14 @@ object SessionState {
     @Volatile
     var resolutionChoice: String? = null
 
+    /** Whether the running session's output was started in portrait; null before the first output of a session. */
+    @Volatile
+    var outputPortrait: Boolean? = null
+
+    /** Whether the guest was started with BL_FOLLOW_OUTPUT and resizes itself to follow the output. */
+    @Volatile
+    var guestFollowsOutput = false
+
     @Volatile
     var followScreen = false
     var followScale = 1f

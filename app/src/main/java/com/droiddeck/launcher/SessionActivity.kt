@@ -741,6 +741,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             SessionState.gameOnBottom = false
             gameOnBottom = false
             SessionState.resolutionChoice = null
+            SessionState.outputPortrait = null
+            SessionState.guestFollowsOutput = false
         }
         if (!SessionState.running && SessionState.phase in setOf(SessionPhase.IDLE, SessionPhase.FAILED)) {
             SessionState.program = intent.getStringExtra(SessionService.EXTRA_PROGRAM)
@@ -2225,7 +2227,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         }
         val driverId = if (CompositorHost.isStarted) null else turnip.install()
 
-        if (!SessionState.running) SessionState.resolutionChoice = savedResolutionChoice()
+        if (!SessionState.running) {
+            SessionState.resolutionChoice = savedResolutionChoice()
+            SessionState.outputPortrait = livePortrait()
+        }
         val previous = SessionState.outputSize
         val live = windowOutputSize(holder.surfaceFrame.width(), holder.surfaceFrame.height())
         val size = live ?: if (SessionState.running) previous else glassesOutputSize() ?: outputSize()
@@ -2412,7 +2417,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun outputSize(): Pair<Int, Int> =
         com.droiddeck.launcher.session.SessionDisplay.resolveChoice(com.droiddeck.launcher.session.SessionDisplay.panelSize(this),
-            resolutionChoice(), SessionPrefs.portrait(this) && !controlsBelowWanted())
+            resolutionChoice(), com.droiddeck.launcher.session.SessionDisplay.sessionPortrait(
+                SessionState.outputPortrait, SessionState.guestFollowsOutput, ::livePortrait))
+
+    private fun livePortrait(): Boolean = SessionPrefs.portrait(this) && !controlsBelowWanted()
 
     private fun resolutionChoice(): String =
         com.droiddeck.launcher.session.SessionDisplay.sessionChoice(SessionState.resolutionChoice, ::savedResolutionChoice)
