@@ -2,8 +2,9 @@
 # Builds and runs the GPU-free unit tests of guards.c and its pieces: tests/guards_test.c (heap_cap.h,
 # wait_retry.h, query_stuck.h), tests/crash_guard_test.c (src/crash_guard.c, with tests/fake_mali.c
 # as libfake_mali.so standing in for the driver), tests/guards_icd_test.c and tests/event_sleep_test.c
-# (the ICD built from src/ without libhybris, over tests/fake_icd.c as libfake_mali_icd.so). Needs cc,
-# the Vulkan headers and libxcb/libxcb-shm (headers and libraries).
+# (the ICD built from src/ without libhybris, over tests/fake_icd.c as libfake_mali_icd.so), and
+# tests/load_skip_test.c (DROIDDECK_HYBRIS_LOAD_SKIP and DROIDDECK_HYBRIS_CMD_STATS the same way, in
+# its three modes). Needs cc, the Vulkan headers and libxcb/libxcb-shm (headers and libraries).
 #   sh tests/guards_test.sh        OUT (default ../out/tests) receives the binaries
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -27,7 +28,12 @@ $CC $CFLAGS -fPIC -fvisibility=hidden -shared -I"$SRC/compat" -I"$SRC" -I"$VORTE
 $CC $CFLAGS -fPIC -shared -o "$OUT/libfake_mali_icd.so" "$HERE/fake_icd.c"
 $CC $CFLAGS -I"$HERE" -o "$OUT/guards_icd_test" "$HERE/guards_icd_test.c" -L"$OUT" -lguards_icd -Wl,-rpath,'$ORIGIN' -ldl -lpthread
 $CC $CFLAGS -I"$HERE" -o "$OUT/event_sleep_test" "$HERE/event_sleep_test.c" -L"$OUT" -lguards_icd -Wl,-rpath,'$ORIGIN' -ldl -lpthread
+$CC $CFLAGS -I"$HERE" -I"$SRC" -o "$OUT/load_skip_test" "$HERE/load_skip_test.c" "$SRC/spirv_eval.c" -L"$OUT" -lguards_icd \
+    -Wl,-rpath,'$ORIGIN' -ldl -lpthread
 "$OUT/guards_test"
 "$OUT/crash_guard_test"
 DROIDDECK_HYBRIS_NEXT_ICD="$OUT/libfake_mali_icd.so" "$OUT/guards_icd_test"
 DROIDDECK_HYBRIS_NEXT_ICD="$OUT/libfake_mali_icd.so" "$OUT/event_sleep_test"
+for mode in all full off; do
+    DROIDDECK_HYBRIS_NEXT_ICD="$OUT/libfake_mali_icd.so" "$OUT/load_skip_test" $mode
+done

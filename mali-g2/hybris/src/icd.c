@@ -562,6 +562,7 @@ static void VKAPI_CALL DestroyDevice(VkDevice handle, const VkAllocationCallback
     if (!device) return;
     wsi_device_destroyed(device);
     mali_device_destroyed(device);
+    cmd_stats_flush();
     guards_device_destroyed(device);
     PipelineCache_deviceDestroyed(handle);
     pthread_mutex_lock(&registryLock);
@@ -721,8 +722,16 @@ static PFN_vkVoidFunction ownDeviceProc(VkDevice handle, const char* name) {
     return NULL;
 }
 
+static PFN_vkVoidFunction deviceProc(VkDevice handle, const char* name);
+
+/* DROIDDECK_HYBRIS_CMD_STATS and DROIDDECK_HYBRIS_LOAD_SKIP (cmd_stats.c) go in front of everything handed out. */
 static PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice handle, const char* name) {
     if (!name) return NULL;
+    PFN_vkVoidFunction f = deviceProc(handle, name);
+    return f && cmd_stats_on() ? cmd_stats_wrap(name, f) : f;
+}
+
+static PFN_vkVoidFunction deviceProc(VkDevice handle, const char* name) {
     PFN_vkVoidFunction own = ownDeviceProc(handle, name);
     if (own) return own;
     Device* device = icd_device(handle);

@@ -173,6 +173,11 @@ void mali_device_destroyed(Device* device);
 /* Every vkQueuePresentKHR (wsi.c): the stream output counts may be due for their line. */
 void mali_presented(void);
 
+/* cmd_stats.c: DROIDDECK_HYBRIS_CMD_STATS, DROIDDECK_HYBRIS_LOAD_SKIP */
+bool cmd_stats_on(void);
+PFN_vkVoidFunction cmd_stats_wrap(const char* name, PFN_vkVoidFunction next);
+void cmd_stats_flush(void);
+
 /* guards.c */
 PFN_vkVoidFunction guards_instance_proc(const char* name);
 PFN_vkVoidFunction guards_device_proc(VkDevice handle, const char* name);

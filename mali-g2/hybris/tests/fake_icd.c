@@ -1,11 +1,14 @@
 /*
- * A Vulkan driver of one device for tests/guards_icd_test.c and tests/event_sleep_test.c (see
- * tests/fake_icd.h): one queue family of FAKE_QUEUES queues, a device-local heap of FAKE_HEAP_MB and a
- * host heap, no extensions. Waits, idle waits, query reads and event status queries play their
- * FakeScript; vkEndCommandBuffer and pipeline creation fault on demand.
+ * A Vulkan driver of one device for tests/guards_icd_test.c, tests/event_sleep_test.c and
+ * tests/load_skip_test.c (see tests/fake_icd.h): one queue family of FAKE_QUEUES queues, a
+ * device-local heap of FAKE_HEAP_MB and a host heap, no extensions. Waits, idle waits, query reads
+ * and event status queries play their FakeScript; vkEndCommandBuffer and pipeline creation fault
+ * on demand. Objects are distinct handles; memory maps to host memory of its size; recorded
+ * commands do nothing but leave a trace of passes.
  */
 #include "fake_icd.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define EXPORT __attribute__((visibility("default")))
@@ -177,7 +180,8 @@ static VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer commandBuffer, VkC
 static VkResult createPipelines(uint32_t count, VkPipeline* pipelines) {
     fake_icd.pipelines++;
     if (fake_icd.pipelineFault) return *(volatile int*)fake_icd.pipelineFault;
-    for (uint32_t i = 0; i < count; i++) pipelines[i] = (VkPipeline)(uintptr_t)(0x7000 + i);
+    static uintptr_t next = 0x7000;
+    for (uint32_t i = 0; i < count; i++) pipelines[i] = (VkPipeline)next++;
     return VK_SUCCESS;
 }
 
@@ -193,6 +197,140 @@ static VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipelineCa
 }
 
 static void VKAPI_CALL DestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks* allocator) {
+}
+
+static uint64_t nextHandle = 0x100000;
+#define NEW(type) ((type)(uintptr_t)(nextHandle += 0x10))
+
+#define MEMORIES 256
+static struct {
+    VkDeviceMemory memory;
+    void* data;
+} memories[MEMORIES];
+
+static Object commandBufferObjects[1024];
+static int commandBufferCount;
+
+static void trace(char c) {
+    if (fake_icd.traceLen < (int)sizeof fake_icd.trace - 1) fake_icd.trace[fake_icd.traceLen++] = c;
+    fake_icd.trace[fake_icd.traceLen] = 0;
+}
+
+static VkResult VKAPI_CALL CreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo* i, const VkAllocationCallbacks* a, VkShaderModule* m) {
+    *m = NEW(VkShaderModule);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyShaderModule(VkDevice d, VkShaderModule m, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL CreateImage(VkDevice d, const VkImageCreateInfo* i, const VkAllocationCallbacks* a, VkImage* image) {
+    *image = NEW(VkImage);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyImage(VkDevice d, VkImage i, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL CreateImageView(VkDevice d, const VkImageViewCreateInfo* i, const VkAllocationCallbacks* a, VkImageView* v) {
+    *v = NEW(VkImageView);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyImageView(VkDevice d, VkImageView v, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL CreateBuffer(VkDevice d, const VkBufferCreateInfo* i, const VkAllocationCallbacks* a, VkBuffer* b) {
+    *b = NEW(VkBuffer);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL BindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o) {
+    return VK_SUCCESS;
+}
+static VkResult VKAPI_CALL AllocateMemory(VkDevice d, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* a, VkDeviceMemory* m) {
+    for (int i = 0; i < MEMORIES; i++) {
+        if (memories[i].memory) continue;
+        memories[i].data = calloc(1, info->allocationSize ? info->allocationSize : 1);
+        if (!memories[i].data) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        memories[i].memory = *m = NEW(VkDeviceMemory);
+        return VK_SUCCESS;
+    }
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+static void VKAPI_CALL FreeMemory(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks* a) {
+    for (int i = 0; i < MEMORIES; i++)
+        if (m && memories[i].memory == m) {
+            free(memories[i].data);
+            memories[i].memory = VK_NULL_HANDLE;
+        }
+}
+static VkResult VKAPI_CALL MapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize o, VkDeviceSize s, VkMemoryMapFlags f, void** data) {
+    for (int i = 0; i < MEMORIES; i++)
+        if (memories[i].memory == m) {
+            *data = (char*)memories[i].data + o;
+            return VK_SUCCESS;
+        }
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+static void VKAPI_CALL UnmapMemory(VkDevice d, VkDeviceMemory m) {
+}
+static VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* out) {
+    for (uint32_t i = 0; i < info->commandBufferCount; i++) {
+        if (commandBufferCount == 1024) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        out[i] = (VkCommandBuffer)&commandBufferObjects[commandBufferCount++];
+    }
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL FreeCommandBuffers(VkDevice d, VkCommandPool p, uint32_t n, const VkCommandBuffer* b) {
+}
+static VkResult VKAPI_CALL CreateCommandPool(VkDevice d, const VkCommandPoolCreateInfo* i, const VkAllocationCallbacks* a, VkCommandPool* p) {
+    *p = NEW(VkCommandPool);
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL DestroyCommandPool(VkDevice d, VkCommandPool p, const VkAllocationCallbacks* a) {
+}
+static VkResult VKAPI_CALL ResetCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolResetFlags f) {
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
+    fake_icd.renderings++;
+    fake_icd.lastColorLoad = info && info->colorAttachmentCount ? info->pColorAttachments[0].loadOp : VK_ATTACHMENT_LOAD_OP_MAX_ENUM;
+    trace('B');
+}
+static void VKAPI_CALL CmdEndRendering(VkCommandBuffer cb) {
+    trace('E');
+}
+static void VKAPI_CALL CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer* b) {
+    trace('X');
+}
+static void VKAPI_CALL CmdDraw(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    trace('D');
+}
+static void VKAPI_CALL CmdDrawIndexed(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) {
+    trace('D');
+}
+static void VKAPI_CALL CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+}
+static void VKAPI_CALL CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
+}
+static void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkBuffer* b, const VkDeviceSize* o) {
+}
+static void VKAPI_CALL CmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkBuffer* b, const VkDeviceSize* o,
+                                             const VkDeviceSize* s, const VkDeviceSize* st) {
+}
+static void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t) {
+}
+static void VKAPI_CALL CmdSetViewport(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkViewport* v) {
+}
+static void VKAPI_CALL CmdSetScissor(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkRect2D* s) {
+}
+static void VKAPI_CALL CmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
+}
+static void VKAPI_CALL CmdSetScissorWithCount(VkCommandBuffer cb, uint32_t n, const VkRect2D* s) {
+}
+static void VKAPI_CALL CmdSetCullMode(VkCommandBuffer cb, VkCullModeFlags m) {
+}
+static void VKAPI_CALL CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* i) {
+}
+static void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy* r) {
+}
+static void VKAPI_CALL CmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a, uint32_t rn, const VkClearRect* r) {
 }
 
 #define F(name, fn) {"vk" name, (PFN_vkVoidFunction)fn}
@@ -213,6 +351,19 @@ static const struct {
     F("BeginCommandBuffer", BeginCommandBuffer), F("EndCommandBuffer", EndCommandBuffer), F("ResetCommandBuffer", ResetCommandBuffer),
     F("CreateComputePipelines", CreateComputePipelines), F("CreateGraphicsPipelines", CreateGraphicsPipelines),
     F("DestroyPipeline", DestroyPipeline), F("GetEventStatus", GetEventStatus),
+    F("CreateShaderModule", CreateShaderModule), F("DestroyShaderModule", DestroyShaderModule), F("CreateImage", CreateImage),
+    F("DestroyImage", DestroyImage), F("CreateImageView", CreateImageView), F("DestroyImageView", DestroyImageView),
+    F("CreateBuffer", CreateBuffer), F("DestroyBuffer", DestroyBuffer), F("BindBufferMemory", BindBufferMemory),
+    F("AllocateMemory", AllocateMemory), F("FreeMemory", FreeMemory), F("MapMemory", MapMemory), F("UnmapMemory", UnmapMemory),
+    F("AllocateCommandBuffers", AllocateCommandBuffers), F("FreeCommandBuffers", FreeCommandBuffers),
+    F("CreateCommandPool", CreateCommandPool), F("DestroyCommandPool", DestroyCommandPool), F("ResetCommandPool", ResetCommandPool),
+    F("CmdBeginRendering", CmdBeginRendering), F("CmdEndRendering", CmdEndRendering), F("CmdExecuteCommands", CmdExecuteCommands),
+    F("CmdDraw", CmdDraw), F("CmdDrawIndexed", CmdDrawIndexed), F("CmdDispatch", CmdDispatch), F("CmdBindPipeline", CmdBindPipeline),
+    F("CmdBindVertexBuffers", CmdBindVertexBuffers), F("CmdBindVertexBuffers2", CmdBindVertexBuffers2),
+    F("CmdBindIndexBuffer", CmdBindIndexBuffer), F("CmdSetViewport", CmdSetViewport), F("CmdSetScissor", CmdSetScissor),
+    F("CmdSetViewportWithCount", CmdSetViewportWithCount), F("CmdSetScissorWithCount", CmdSetScissorWithCount),
+    F("CmdSetCullMode", CmdSetCullMode), F("CmdPipelineBarrier2", CmdPipelineBarrier2), F("CmdCopyBuffer", CmdCopyBuffer),
+    F("CmdClearAttachments", CmdClearAttachments),
 };
 
 EXPORT PFN_vkVoidFunction fake_icd_device_proc(const char* name) {

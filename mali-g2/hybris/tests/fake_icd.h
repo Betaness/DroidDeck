@@ -1,5 +1,6 @@
 /*
- * The driver below the ICD in tests/guards_icd_test.c and tests/event_sleep_test.c (tests/fake_icd.c,
+ * The driver below the ICD in tests/guards_icd_test.c, tests/event_sleep_test.c and
+ * tests/load_skip_test.c (tests/fake_icd.c,
  * built as libfake_mali_icd.so: the crash guard sees its functions in a library of the Mali driver).
  * Its state is shared with the test, which links it too.
  */
@@ -26,6 +27,12 @@ typedef struct {
     VkQueue lastIdleQueue;
     VkEvent lastEvent; /* vkGetEventStatus: the last call's event and answer */
     VkResult lastEventResult;
+    /* tests/load_skip_test.c: what vkCmdBeginRendering received, and the order of the commands
+     * of a pass (B begin rendering, X execute commands, E end rendering, D draw) */
+    int renderings;
+    VkAttachmentLoadOp lastColorLoad;
+    char trace[64];
+    int traceLen;
 } FakeIcd;
 
 extern FakeIcd fake_icd;
