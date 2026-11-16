@@ -21,6 +21,7 @@
  *                        given back: Position, ClipDistance, CullDistance, Layer, ViewportIndex.
  *                        32-bit integer and float arithmetic in IEEE single precision; 8- and
  *                        16-bit integers read from buffers only as far as a conversion to 32 bits.
+ *                        Results and variables decorated RelaxedPrecision are unknown.
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or later.

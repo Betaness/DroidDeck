@@ -48,7 +48,7 @@
  *               specialization constants (DXVK's D3D9 alpha test is one), nor write SampleMask
  *               (spv_fs_may_discard), nor read attachments (input attachments, tile images).
  *   viewport    viewport 0 contains every pixel centre of the render area, scissor 0 the area.
- *   geometry    the draw's vertices, read from host-mapped memory where the vertex and index buffers
+ *   geometry    the draw's vertices, read from host-mapped HOST_COHERENT memory where the vertex and index buffers
  *               are bound, are run through the vertex shader on the CPU (spv_vs_run) with its
  *               specialization constants, the push constants recorded in the secondary for the
  *               vertex stage, and the uniform and storage buffers it declares, read from host-mapped
@@ -59,13 +59,15 @@
  *               known, finite and within 1e6 w, clip and cull distances never written or not
  *               negative, Layer and ViewportIndex never written or 0, and the triangles cover every
  *               pixel centre (ls_cover: one triangle, or a quad of two triangles sharing an edge, with
- *               a margin). A position not known is kept for where it came from: vs-ubo-unmapped,
+ *               a margin). Results and variables decorated RelaxedPrecision are not known (the GPU
+ *               may compute them in 16 bits). A position not known is kept for where it came from: vs-ubo-unmapped,
  *               vs-ubo-pending-write, vs-ubo-range (past the descriptor's range or 16 KB),
  *               vs-descriptor, vs-push, vs-image, vs-input, vs-branch (a branch on a value the run
  *               does not compute), vs (anything else). A pipeline keeps its last run: the same
  *               vertices and the same bytes read for it are not run again. The data must not be
  *               written by the GPU in any command buffer not yet reset since (copies, fills,
- *               updates, query results, transform feedback, shaders that write memory). It is read
+ *               updates, query results, transform feedback, shaders that write memory), nor lie where
+ *               an image is bound (writes to images are not followed). It is read
  *               when the pass is recorded: it must not change before the pass runs (DXVK writes
  *               vertices and shader constants before it records the draw); at each submission it is
  *               read again and a change is counted (stale).
@@ -427,6 +429,9 @@ typedef struct {
     VkExtent3D extent;
     uint32_t mips;
     VkSampleCountFlagBits samples;
+    uint64_t memorySerial; /* the MemInfo it is bound in (0: none) */
+    VkDeviceMemory memory;
+    uint64_t id;
 } ImageInfo;
 
 typedef struct {
@@ -445,7 +450,20 @@ typedef struct {
     VkDeviceSize size;
     const uint8_t* ptr; /* the host address of mapOffset */
     VkDeviceSize mapOffset, mapSize;
+    bool coherent;      /* of a HOST_COHERENT type: what the CPU reads is what the GPU reads */
+    uint64_t serial;
+    /* the images bound in it: the GPU may write them in commands not seen as writes here */
+    struct MemImage {
+        VkDeviceSize lo, hi;
+        uint64_t id; /* the ImageInfo's; 0: an image not known here, never taken out */
+    }* images;
+    uint32_t imageCount, imageCap;
 } MemInfo;
+
+static void memFree(MemInfo* m) {
+    if (m) free(m->images);
+    free(m);
+}
 
 typedef struct {
     VkSpecializationInfo info;
@@ -817,7 +835,8 @@ enum {
     W_SET_RASTER_STREAM, W_BEGIN_CONDITIONAL, W_END_CONDITIONAL,
     W_CREATE_DSL, W_DESTROY_DSL, W_RESET_DPOOL, W_DESTROY_DPOOL, W_ALLOC_DSETS, W_FREE_DSETS, W_UPDATE_DSETS, W_CREATE_DUT,
     W_DESTROY_DUT, W_UPDATE_DSET_TEMPLATE, W_BIND_DSETS, W_BIND_DSETS2, W_PUSH_CONSTANTS, W_PUSH_CONSTANTS2, W_PUSH_DSET,
-    W_PUSH_DSET2, W_PUSH_DSET_TEMPLATE, W_PUSH_DSET_TEMPLATE2, W_SET_DB_OFFSETS, W_SET_DB_OFFSETS2,
+    W_PUSH_DSET2, W_PUSH_DSET_TEMPLATE, W_PUSH_DSET_TEMPLATE2, W_SET_DB_OFFSETS, W_SET_DB_OFFSETS2, W_BIND_IMAGE_MEMORY,
+    W_BIND_IMAGE_MEMORY2,
     W_COUNT
 };
 static const char* const wrapNames[W_COUNT] = {
@@ -856,7 +875,7 @@ static const char* const wrapNames[W_COUNT] = {
     "vkDestroyDescriptorUpdateTemplate", "vkUpdateDescriptorSetWithTemplate", "vkCmdBindDescriptorSets", "vkCmdBindDescriptorSets2",
     "vkCmdPushConstants", "vkCmdPushConstants2", "vkCmdPushDescriptorSet", "vkCmdPushDescriptorSet2",
     "vkCmdPushDescriptorSetWithTemplate", "vkCmdPushDescriptorSetWithTemplate2", "vkCmdSetDescriptorBufferOffsetsEXT",
-    "vkCmdSetDescriptorBufferOffsets2EXT"};
+    "vkCmdSetDescriptorBufferOffsets2EXT", "vkBindImageMemory", "vkBindImageMemory2"};
 /* aliases handled by the same wrapper slot */
 static const struct {
     const char* name;
@@ -877,7 +896,8 @@ static const struct {
     {"vkCreateDescriptorUpdateTemplateKHR", W_CREATE_DUT}, {"vkDestroyDescriptorUpdateTemplateKHR", W_DESTROY_DUT},
     {"vkUpdateDescriptorSetWithTemplateKHR", W_UPDATE_DSET_TEMPLATE}, {"vkCmdBindDescriptorSets2KHR", W_BIND_DSETS2},
     {"vkCmdPushConstants2KHR", W_PUSH_CONSTANTS2}, {"vkCmdPushDescriptorSetKHR", W_PUSH_DSET}, {"vkCmdPushDescriptorSet2KHR", W_PUSH_DSET2},
-    {"vkCmdPushDescriptorSetWithTemplateKHR", W_PUSH_DSET_TEMPLATE}, {"vkCmdPushDescriptorSetWithTemplate2KHR", W_PUSH_DSET_TEMPLATE2}};
+    {"vkCmdPushDescriptorSetWithTemplateKHR", W_PUSH_DSET_TEMPLATE}, {"vkCmdPushDescriptorSetWithTemplate2KHR", W_PUSH_DSET_TEMPLATE2},
+    {"vkBindImageMemory2KHR", W_BIND_IMAGE_MEMORY2}};
 
 static PFN_vkVoidFunction nextFn[W_COUNT];
 #define N(i, type) ((type)__atomic_load_n(&nextFn[i], __ATOMIC_ACQUIRE))
@@ -968,7 +988,8 @@ static VkResult VKAPI_CALL CreateImage(VkDevice d, const VkImageCreateInfo* info
         pthread_mutex_lock(&trk);
         free(mapDel(&images, H(*image)));
         if (i) {
-            *i = (ImageInfo){info->extent, info->mipLevels, info->samples};
+            static uint64_t ids;
+            *i = (ImageInfo){info->extent, info->mipLevels, info->samples, .id = ++ids};
             if (!mapPut(&images, H(*image), i)) free(i);
         }
         pthread_mutex_unlock(&trk);
@@ -976,13 +997,75 @@ static VkResult VKAPI_CALL CreateImage(VkDevice d, const VkImageCreateInfo* info
     return r;
 }
 
+/* trk held: the image no longer counts in the memory it was bound in */
+static void imageUnbound(ImageInfo* im) {
+    MemInfo* m = im && im->memorySerial ? mapGet(&memories, H(im->memory)) : NULL;
+    for (uint32_t i = 0; m && m->serial == im->memorySerial && i < m->imageCount; i++)
+        if (m->images[i].id == im->id) {
+            m->images[i] = m->images[--m->imageCount];
+            break;
+        }
+    if (im) im->memorySerial = 0;
+}
+
+/* trk held: whether an image is bound over [at, at + size) of m */
+static bool imageOver(const MemInfo* m, VkDeviceSize at, VkDeviceSize size) {
+    for (uint32_t i = 0; i < m->imageCount; i++)
+        if (at < m->images[i].hi && m->images[i].lo < at + size) return true;
+    return false;
+}
+
 static void VKAPI_CALL DestroyImage(VkDevice d, VkImage image, const VkAllocationCallbacks* a) {
     if (TRACK && image) {
         pthread_mutex_lock(&trk);
-        free(mapDel(&images, H(image)));
+        ImageInfo* im = mapDel(&images, H(image));
+        imageUnbound(im);
+        free(im);
         pthread_mutex_unlock(&trk);
     }
     N(W_DESTROY_IMAGE, PFN_vkDestroyImage)(d, image, a);
+}
+
+/* An image bound at `offset` of memory (after the bind: the size of an imported image is known only
+ * then): buffer data there may be written by the GPU (rendering, clears, copies, storage writes to the
+ * image are not followed as writes), so it is not read. Without its size (a plane of a disjoint image),
+ * up to the end of the memory. */
+static void imageBound(VkDevice d, VkImage image, VkDeviceMemory memory, VkDeviceSize offset, bool sized) {
+    if (!memory) return;
+    VkMemoryRequirements req = {0};
+    const Device* device = sized ? icd_device(d) : NULL;
+    if (device && device->GetImageMemoryRequirements) device->GetImageMemoryRequirements(d, image, &req);
+    pthread_mutex_lock(&trk);
+    ImageInfo* im = mapGet(&images, H(image));
+    imageUnbound(im);
+    MemInfo* m = mapGet(&memories, H(memory));
+    if (m && m->imageCount == m->imageCap) {
+        uint32_t cap = m->imageCap ? m->imageCap * 2 : 4;
+        struct MemImage* grown = realloc(m->images, cap * sizeof *grown);
+        if (grown) m->images = grown, m->imageCap = cap;
+    }
+    if (m && m->imageCount < m->imageCap) {
+        VkDeviceSize end = req.size && req.size <= m->size && offset <= m->size - req.size ? offset + req.size : m->size;
+        m->images[m->imageCount++] = (struct MemImage){offset, end, im ? im->id : 0};
+        if (im) im->memory = memory, im->memorySerial = m->serial;
+    } else if (m) {
+        m->coherent = false; /* not followed: the memory is not read */
+    }
+    pthread_mutex_unlock(&trk);
+}
+
+static VkResult VKAPI_CALL BindImageMemory(VkDevice d, VkImage image, VkDeviceMemory memory, VkDeviceSize offset) {
+    VkResult r = N(W_BIND_IMAGE_MEMORY, PFN_vkBindImageMemory)(d, image, memory, offset);
+    if (TRACK) imageBound(d, image, memory, offset, true);
+    return r;
+}
+
+static VkResult VKAPI_CALL BindImageMemory2(VkDevice d, uint32_t n, const VkBindImageMemoryInfo* infos) {
+    VkResult r = N(W_BIND_IMAGE_MEMORY2, PFN_vkBindImageMemory2)(d, n, infos);
+    for (uint32_t i = 0; TRACK && infos && i < n; i++)
+        imageBound(d, infos[i].image, infos[i].memory, infos[i].memoryOffset,
+                   !findNext(infos[i].pNext, VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO));
+    return r;
 }
 
 static VkResult VKAPI_CALL CreateImageView(VkDevice d, const VkImageViewCreateInfo* info, const VkAllocationCallbacks* a, VkImageView* view) {
@@ -1064,11 +1147,16 @@ static VkResult VKAPI_CALL AllocateMemory(VkDevice d, const VkMemoryAllocateInfo
     VkResult r = N(W_ALLOCATE_MEMORY, PFN_vkAllocateMemory)(d, info, a, memory);
     if (r == VK_SUCCESS && TRACK && info) {
         MemInfo* m = calloc(1, sizeof *m);
+        const Device* device = m ? icd_device(d) : NULL;
+        if (device && info->memoryTypeIndex < device->memory.memoryTypeCount)
+            m->coherent = device->memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         pthread_mutex_lock(&trk);
-        free(mapDel(&memories, H(*memory)));
+        memFree(mapDel(&memories, H(*memory)));
         if (m) {
+            static uint64_t serials;
             m->size = info->allocationSize;
-            if (!mapPut(&memories, H(*memory), m)) free(m);
+            m->serial = ++serials;
+            if (!mapPut(&memories, H(*memory), m)) memFree(m);
         }
         pthread_mutex_unlock(&trk);
     }
@@ -1077,7 +1165,7 @@ static VkResult VKAPI_CALL AllocateMemory(VkDevice d, const VkMemoryAllocateInfo
 
 static void VKAPI_CALL FreeMemory(VkDevice d, VkDeviceMemory memory, const VkAllocationCallbacks* a) {
     /* held across the call: no pass reads it meanwhile */
-    if (TRACK && memory) pthread_mutex_lock(&trk), free(mapDel(&memories, H(memory)));
+    if (TRACK && memory) pthread_mutex_lock(&trk), memFree(mapDel(&memories, H(memory)));
     N(W_FREE_MEMORY, PFN_vkFreeMemory)(d, memory, a);
     if (TRACK && memory) pthread_mutex_unlock(&trk);
 }
@@ -1221,6 +1309,11 @@ static VkResult VKAPI_CALL CreateDescriptorSetLayout(VkDevice d, const VkDescrip
         for (uint32_t i = 0; i < n; i++) {
             DslBinding* b = &l->b[i];
             if (i && b->binding == l->b[i - 1].binding) l->unknown = true;
+            /* counted even when not kept: the dynamic offsets of the sets bound after this one */
+            if (dynamicType(b->type)) {
+                b->dyn = l->dynamic;
+                l->dynamic = b->count > UINT32_MAX - l->dynamic ? UINT32_MAX : l->dynamic + b->count;
+            }
             if (bufferType(b->type) || b->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
                 if (b->count > LAYOUT_BUFFERS - l->buffers) {
                     l->unknown = true;
@@ -1228,10 +1321,6 @@ static VkResult VKAPI_CALL CreateDescriptorSetLayout(VkDevice d, const VkDescrip
                 }
                 b->buf = l->buffers;
                 l->buffers += b->count;
-            }
-            if (dynamicType(b->type)) {
-                b->dyn = l->dynamic;
-                l->dynamic += b->count;
             }
         }
     }
@@ -2478,8 +2567,9 @@ static int readBuffer(Cb* primary, VkBuffer buffer, VkDeviceSize offset, VkDevic
     if (offset > b->size || size > b->size - offset) return RB_RANGE;
     const MemInfo* m = mapGet(&memories, H(b->memory));
     VkDeviceSize at = b->offset + offset;
-    if (!m || !m->ptr || at < m->mapOffset || at - m->mapOffset > m->mapSize || size > m->mapSize - (at - m->mapOffset)) return RB_UNMAPPED;
-    if (tainted(b->memory, at, size)) return RB_PENDING;
+    if (!m || !m->ptr || !m->coherent || at < m->mapOffset || at - m->mapOffset > m->mapSize || size > m->mapSize - (at - m->mapOffset))
+        return RB_UNMAPPED;
+    if (imageOver(m, at, size) || tainted(b->memory, at, size)) return RB_PENDING;
     const uint8_t* src = m->ptr + (at - m->mapOffset);
     if (primary->depCount == primary->depCap) {
         uint32_t cap = primary->depCap ? primary->depCap * 2 : 16;
@@ -3331,7 +3421,8 @@ static const PFN_vkVoidFunction wrappers[W_COUNT] = {
     WR(W_BIND_DSETS, CmdBindDescriptorSets), WR(W_BIND_DSETS2, CmdBindDescriptorSets2), WR(W_PUSH_CONSTANTS, CmdPushConstants),
     WR(W_PUSH_CONSTANTS2, CmdPushConstants2), WR(W_PUSH_DSET, CmdPushDescriptorSet), WR(W_PUSH_DSET2, CmdPushDescriptorSet2),
     WR(W_PUSH_DSET_TEMPLATE, CmdPushDescriptorSetWithTemplate), WR(W_PUSH_DSET_TEMPLATE2, CmdPushDescriptorSetWithTemplate2),
-    WR(W_SET_DB_OFFSETS, CmdSetDescriptorBufferOffsetsEXT), WR(W_SET_DB_OFFSETS2, CmdSetDescriptorBufferOffsets2EXT)};
+    WR(W_SET_DB_OFFSETS, CmdSetDescriptorBufferOffsetsEXT), WR(W_SET_DB_OFFSETS2, CmdSetDescriptorBufferOffsets2EXT),
+    WR(W_BIND_IMAGE_MEMORY, BindImageMemory), WR(W_BIND_IMAGE_MEMORY2, BindImageMemory2)};
 
 _Static_assert(ARRAY_LEN(statNames) == S_COUNT, "statNames");
 _Static_assert(ARRAY_LEN(loadNames) == L_COUNT, "loadNames");

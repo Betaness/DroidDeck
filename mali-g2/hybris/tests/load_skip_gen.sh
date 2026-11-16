@@ -91,6 +91,24 @@ void main() {
     else gl_Position = cm * position;
 }
 GLSL
+# moved by a uniform of set 1 (behind a set 0 whose layout is not followed)
+shader vs_set1 vert <<'GLSL'
+#version 450
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec2 uv;
+layout(set = 1, binding = 0) uniform Offset { vec4 offset; };
+layout(location = 0) out vec2 outUv;
+void main() { gl_Position = position + offset; outUv = uv; }
+GLSL
+# moved by a uniform in mediump (RelaxedPrecision: the GPU may compute it in 16 bits)
+shader vs_relaxed vert <<'GLSL'
+#version 450
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec2 uv;
+layout(binding = 0) uniform Offset { vec4 offset; };
+layout(location = 0) out vec2 outUv;
+void main() { mediump vec4 p = position + offset; gl_Position = p; outUv = uv; }
+GLSL
 # the position moved by a texel: an image
 shader vs_image vert <<'GLSL'
 #version 450

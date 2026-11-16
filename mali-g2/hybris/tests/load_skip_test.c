@@ -165,7 +165,16 @@ static void resourceTests(SpvProgram* ubo) {
     memcpy(bytes + 2, &wTwo, 2);
     res.pushKnown = 1;
     CHECK(spv_vs_run(dxso, "main", NULL, &res, quad, 1, qout, NULL) == SPV_RUN_OK && near(qout[0].position[3], 2), "D3D9 shape: w scaled by 2");
-    spv_unref(push), spv_unref(mat), spv_unref(image), spv_unref(branch), spv_unref(dxso);
+
+    /* mediump (RelaxedPrecision): the GPU may compute it in 16 bits, the CPU does not know the result */
+    SpvProgram* relaxed = PROG(ls_vs_relaxed);
+    const float zero[4] = {0};
+    buffer = (SpvBuffer){0, 0, (const uint8_t*)zero, sizeof zero, 0};
+    res = (SpvResources){&buffer, 1, NULL, 0};
+    setPosition(&in[0], 0.5f, 0.5f, 0, 1);
+    CHECK(relaxed && spv_vs_run(relaxed, "main", NULL, &res, in, 1, out, NULL) == SPV_RUN_OK && !out[0].positionKnown,
+          "a position through a mediump variable: unknown");
+    spv_unref(push), spv_unref(mat), spv_unref(image), spv_unref(branch), spv_unref(dxso), spv_unref(relaxed);
 }
 
 static void evaluatorTests(void) {
@@ -391,11 +400,15 @@ typedef struct {
     int push;                /* its push constants pushed: 1 vkCmdPushConstants, 2 vkCmdPushConstants2KHR */
     float shift;             /* added to x by the uniform or push data */
     bool uboUnmapped, uboPending, uboStale, writtenAfterBind, pushDescriptor;
+    bool vertexNonCoherent, uboNonCoherent; /* in a memory type that is not HOST_COHERENT */
+    int imageOverUbo;        /* an image bound in the uniform's memory: 1 over it, 2 beside it, 3 over it and destroyed */
     bool bindBetween;        /* sets bound and constants pushed on the primary between the begin and the execute */
     bool shiftSecond;        /* with twice: the second pass's set points at data that shifts x by 1 */
 } Case;
 
-enum { UBO_NONE, UBO_SET, UBO_DYNAMIC, UBO_TEMPLATE, UBO_BIND2, UBO_DXSO };
+/* UBO_OVERFLOW: vs_set1's dynamic uniform at set 1, behind a set 0 of 256 storage buffers and a dynamic
+ * uniform (more buffers than the layout tracking keeps) */
+enum { UBO_NONE, UBO_SET, UBO_DYNAMIC, UBO_TEMPLATE, UBO_BIND2, UBO_DXSO, UBO_OVERFLOW };
 
 /* the descriptor sets a secondary binds */
 typedef struct {
@@ -503,14 +516,15 @@ static void recordDraw(const Case* k, VkCommandBuffer cb, VkPipeline pipe, VkBuf
     uint32_t w = k->width ? k->width : W, h = k->height ? k->height : H;
     DEV(CmdBindPipeline)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     if (bound && bound->count) {
-        uint32_t dyn = 256;
+        /* UBO_DYNAMIC: 256; UBO_OVERFLOW: 0 for set 0, 512 (the bad offset) for set 1 */
+        const uint32_t dyn[2] = {k->ubo == UBO_OVERFLOW ? 0 : 256, 512};
         if (k->ubo == UBO_BIND2) {
             VkBindDescriptorSetsInfoKHR info = {VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR, NULL, VK_SHADER_STAGE_ALL_GRAPHICS, VK_NULL_HANDLE,
                                                 bound->first, bound->count, bound->sets, 0, NULL};
             DEV(CmdBindDescriptorSets2KHR)(cb, &info);
         } else {
             DEV(CmdBindDescriptorSets)(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE, bound->first, bound->count, bound->sets,
-                                       bound->dynamic, &dyn);
+                                       bound->dynamic, dyn);
         }
         if (k->pushDescriptor) {
             VkDescriptorBufferInfo none = {VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
@@ -590,7 +604,7 @@ static void runCase(void* ctx) {
     CHECK(DEV(CreateImageView)(device, &vi, NULL, &depthView) == VK_SUCCESS, "depth view");
 
     /* vertex and index data in one host-mapped allocation */
-    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, 4096, 1};
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, 4096, k->vertexNonCoherent ? 2 : 1};
     VkDeviceMemory memory;
     void* ptr = NULL;
     CHECK(DEV(AllocateMemory)(device, &mi, NULL, &memory) == VK_SUCCESS && DEV(MapMemory)(device, memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS,
@@ -613,7 +627,8 @@ static void runCase(void* ctx) {
     VkDeviceMemory uboMemory = memory;
     VkDeviceSize uboBase = 2048;
     void* uboPtr = (char*)ptr + 2048;
-    if (k->uboUnmapped) {
+    if (k->uboUnmapped || k->uboNonCoherent) {
+        mi.memoryTypeIndex = k->uboNonCoherent ? 2 : 1;
         CHECK(DEV(AllocateMemory)(device, &mi, NULL, &uboMemory) == VK_SUCCESS && DEV(MapMemory)(device, uboMemory, 0, VK_WHOLE_SIZE, 0, &uboPtr) == VK_SUCCESS,
               "uniform memory");
         uboBase = 0;
@@ -631,6 +646,22 @@ static void runCase(void* ctx) {
         memcpy((char*)uboPtr + 512, bad, sizeof bad);
     }
     if (k->uboUnmapped) DEV(UnmapMemory)(device, uboMemory);
+    /* an image in the uniform's memory (the fake's images take 512 bytes): the GPU may write it */
+    VkImage aliasImage = VK_NULL_HANDLE;
+    if (k->imageOverUbo) {
+        VkImageCreateInfo ai3 = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ai3.imageType = VK_IMAGE_TYPE_2D, ai3.format = colorFormat, ai3.extent = (VkExtent3D){8, 8, 1}, ai3.mipLevels = 1, ai3.arrayLayers = 1;
+        ai3.samples = VK_SAMPLE_COUNT_1_BIT, ai3.tiling = VK_IMAGE_TILING_LINEAR, ai3.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        CHECK(DEV(CreateImage)(device, &ai3, NULL, &aliasImage) == VK_SUCCESS, "alias image");
+        VkDeviceSize at = k->imageOverUbo == 2 ? uboBase + 1024 : uboBase + 256;
+        if (k->imageOverUbo == 1) {
+            VkBindImageMemoryInfo bind = {VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, NULL, aliasImage, uboMemory, at};
+            CHECK(DEV(BindImageMemory2)(device, 1, &bind) == VK_SUCCESS, "alias image bound");
+        } else {
+            CHECK(DEV(BindImageMemory)(device, aliasImage, uboMemory, at) == VK_SUCCESS, "alias image bound");
+        }
+        if (k->imageOverUbo == 3) DEV(DestroyImage)(device, aliasImage, NULL), aliasImage = VK_NULL_HANDLE;
+    }
     if (k->unmapped) DEV(UnmapMemory)(device, memory);
 
     /* descriptor sets: one per pass (the second at 512 with shiftSecond); vs_dxso's at set 1, binding 3,
@@ -640,13 +671,16 @@ static void runCase(void* ctx) {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkDescriptorUpdateTemplate tmpl = VK_NULL_HANDLE;
     if (k->ubo) {
-        VkDescriptorSetLayoutBinding b = {k->ubo == UBO_DXSO ? 3 : 0, k->ubo == UBO_DYNAMIC ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        bool dynamic = k->ubo == UBO_DYNAMIC || k->ubo == UBO_OVERFLOW;
+        VkDescriptorSetLayoutBinding b = {k->ubo == UBO_DXSO ? 3 : 0, dynamic ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                           1, VK_SHADER_STAGE_VERTEX_BIT, NULL};
         VkDescriptorSetLayoutBinding sampler = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutBinding many[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256, VK_SHADER_STAGE_VERTEX_BIT, NULL},
+                                                {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL}};
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b};
         CHECK(DEV(CreateDescriptorSetLayout)(device, &li, NULL, &layouts[1]) == VK_SUCCESS, "set layout");
-        li.pBindings = &sampler;
-        CHECK(DEV(CreateDescriptorSetLayout)(device, &li, NULL, &layouts[0]) == VK_SUCCESS, "sampler set layout");
+        li.pBindings = k->ubo == UBO_OVERFLOW ? many : &sampler, li.bindingCount = k->ubo == UBO_OVERFLOW ? 2 : 1;
+        CHECK(DEV(CreateDescriptorSetLayout)(device, &li, NULL, &layouts[0]) == VK_SUCCESS, "set 0 layout");
         VkDescriptorPoolSize sizes[2] = {{b.descriptorType, 4}, {sampler.descriptorType, 4}};
         VkDescriptorPoolCreateInfo pi2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 8, 2, sizes};
         CHECK(DEV(CreateDescriptorPool)(device, &pi2, NULL, &dpool) == VK_SUCCESS, "descriptor pool");
@@ -658,12 +692,12 @@ static void runCase(void* ctx) {
         }
         for (int i = 0; i < (k->twice ? 2 : 1); i++) {
             Bound* bd = &bound[i];
-            bool dxso = k->ubo == UBO_DXSO;
+            bool dxso = k->ubo == UBO_DXSO || k->ubo == UBO_OVERFLOW;
             VkDescriptorSetLayout want[2] = {layouts[0], layouts[1]};
             VkDescriptorSetAllocateInfo ai2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dpool, dxso ? 2 : 1, dxso ? want : &want[1]};
             CHECK(DEV(AllocateDescriptorSets)(device, &ai2, bd->sets) == VK_SUCCESS, "sets");
-            bd->first = 0, bd->count = dxso ? 2 : 1, bd->dynamic = k->ubo == UBO_DYNAMIC;
-            VkDescriptorBufferInfo info = {ub, i && k->shiftSecond ? 512 : k->ubo == UBO_DYNAMIC || k->ubo == UBO_DXSO ? 0 : 256,
+            bd->first = 0, bd->count = dxso ? 2 : 1, bd->dynamic = k->ubo == UBO_OVERFLOW ? 2 : k->ubo == UBO_DYNAMIC;
+            VkDescriptorBufferInfo info = {ub, i && k->shiftSecond ? 512 : dynamic || k->ubo == UBO_DXSO ? 0 : 256,
                                            k->ubo == UBO_DXSO ? 80 : 16};
             VkDescriptorSet target = bd->sets[dxso ? 1 : 0];
             if (k->ubo == UBO_TEMPLATE) {
@@ -811,6 +845,7 @@ static void runCase(void* ctx) {
     if (tmpl) DEV(DestroyDescriptorUpdateTemplate)(device, tmpl, NULL);
     for (int i = 0; i < 2; i++)
         if (layouts[i]) DEV(DestroyDescriptorSetLayout)(device, layouts[i], NULL);
+    if (aliasImage) DEV(DestroyImage)(device, aliasImage, NULL);
     if (uboMemory != memory) DEV(FreeMemory)(device, uboMemory, NULL);
     DEV(FreeMemory)(device, memory, NULL);
     DEV(DestroyImageView)(device, view, NULL);
@@ -917,6 +952,13 @@ static const Case allCases[] = {
     {"D3D9 shape, translated", "geometry", VS(ls_vs_dxso), .ubo = UBO_DXSO, .push = 1, .quad = {0, 0, 1, 1}, .shift = 0.5f},
     {"D3D9 shape, push data not pushed", "vs-push", VS(ls_vs_dxso), .ubo = UBO_DXSO, .quad = {0, 0, 1, 1}},
     {"position moved by a texel", "vs-image", VS(ls_vs_image)},
+    {"set 1's dynamic offset behind a set 0 of more buffers than kept", "geometry", VS(ls_vs_set1), .ubo = UBO_OVERFLOW},
+    {"uniform memory not host-coherent", "vs-ubo-unmapped", VS(ls_vs_ubo), .ubo = UBO_SET, .uboNonCoherent = true},
+    {"vertex memory not host-coherent", "vertex", .vertexNonCoherent = true},
+    {"an image bound over the uniform", "vs-ubo-pending-write", VS(ls_vs_ubo), .ubo = UBO_SET, .imageOverUbo = 1},
+    {"an image bound beside the uniform", NULL, VS(ls_vs_ubo), .ubo = UBO_SET, .imageOverUbo = 2},
+    {"an image bound over the uniform, destroyed", NULL, VS(ls_vs_ubo), .ubo = UBO_SET, .imageOverUbo = 3},
+    {"uniform used in mediump", "vs", VS(ls_vs_relaxed), .ubo = UBO_SET},
     {"a branch on a square root", "vs-branch", VS(ls_vs_branch)},
     {"negative clip distance", "vs", VS(ls_vs_clip)},
     {"left half", "geometry", .quad = {-1, -1, 0, 1}},

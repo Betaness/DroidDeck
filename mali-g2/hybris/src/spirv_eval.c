@@ -58,7 +58,7 @@ enum {
     G_SClamp = 45, G_FMix = 46, G_Step = 48, G_Fma = 50, G_NMin = 79, G_NMax = 80, G_NClamp = 81,
 };
 enum {
-    DecSpecId = 1, DecBlock = 2, DecBufferBlock = 3, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
+    DecRelaxedPrecision = 0, DecSpecId = 1, DecBlock = 2, DecBufferBlock = 3, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
     DecBuiltIn = 11, DecLocation = 30, DecComponent = 31, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35,
 };
 enum {
@@ -88,6 +88,7 @@ typedef struct {
     uint32_t arrayStride;
     int32_t builtin, location, component, specId, set, binding;
     uint8_t kind, width, sign, cellsDone, block; /* block: 1 Block, 2 BufferBlock */
+    uint8_t relaxed;                             /* RelaxedPrecision */
 } IdInfo;
 
 /* Offset, MatrixStride, RowMajor or ColMajor of a struct member */
@@ -213,6 +214,7 @@ static uint32_t typeCells(SpvProgram* p, uint32_t t, int depth) {
 static bool decorate(SpvProgram* p, uint32_t target, uint32_t dec, const uint32_t* lit, uint32_t litCount) {
     if (target >= p->bound) return false;
     IdInfo* id = &p->ids[target];
+    if (dec == DecRelaxedPrecision) id->relaxed = 1;
     if (dec == DecBlock) id->block = 1;
     if (dec == DecBufferBlock) id->block = 2;
     if (!litCount) return true;
@@ -695,6 +697,7 @@ typedef struct {
     int32_t builtin; /* of the variable (not of members) */
     uint32_t type;   /* pointee */
     bool readable;   /* a buffer block filled from the caller's bytes */
+    bool relaxed;    /* RelaxedPrecision: what is stored in it is not known */
     uint8_t why;     /* loads from it when not readable */
 } Var;
 
@@ -746,6 +749,8 @@ static void commit(Ctx* c, uint32_t id, const Cell* v, uint32_t n) {
     uint32_t want = cellsOfType(c, i->type);
     Cell* dst = &c->cells[i->slot];
     if (c->mode == M_RUN) {
+        /* RelaxedPrecision: the GPU may compute it with 16 bits; not what the run computes */
+        if (i->relaxed && i->type < c->p->bound && c->p->ids[i->type].kind != T_POINTER) n = 0;
         for (uint32_t k = 0; k < want; k++) dst[k] = k < n ? v[k] : (Cell){0, 0, 0};
         return;
     }
@@ -1881,6 +1886,7 @@ static int runVertex(Ctx* c, const Fn* main, const SpvVertexIn* in, SpvVertexOut
         uint32_t var = newVar(c, pt->elem, w[3], p->ids[w[2]].builtin);
         if (var == NONE) return SPV_RUN_BUDGET;
         Var* v = &c->vars[var];
+        v->relaxed = p->ids[w[2]].relaxed;
         if (w[3] == ScInput) fillInput(c, var, w[2], in);
         if (w[3] == ScUniform || w[3] == ScStorageBuffer || w[3] == ScPushConstant) fillBuffer(c, var, w[2]);
         if (w[3] == ScUniformConstant) v->why = SPV_WHY_IMAGE;
@@ -1979,6 +1985,8 @@ static int runVertex(Ctx* c, const Fn* main, const SpvVertexIn* in, SpvVertexOut
             if (n < 4 || !pt || pt->kind != T_POINTER) return SPV_RUN_UNSUPPORTED;
             uint32_t var = newVar(c, pt->elem, w[3], -1);
             if (var == NONE) return SPV_RUN_BUDGET;
+            const IdInfo* vi = idOf(c, w[2]);
+            c->vars[var].relaxed = vi && vi->relaxed;
             if (n >= 5) {
                 const Cell* init = V(c, w[4]);
                 Var* v = &c->vars[var];
@@ -2057,7 +2065,7 @@ static int runVertex(Ctx* c, const Fn* main, const SpvVertexIn* in, SpvVertexOut
                 break;
             }
             for (uint32_t k = 0; k < sn; k++) {
-                c->mem[v->off + ptr->p + k] = src[k];
+                c->mem[v->off + ptr->p + k] = v->relaxed ? (Cell){0, 0, 0} : src[k];
                 c->mem[v->off + ptr->p + k].f |= F_W;
             }
             break;

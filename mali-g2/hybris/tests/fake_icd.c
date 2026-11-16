@@ -78,10 +78,12 @@ static void VKAPI_CALL GetMemoryProperties(VkPhysicalDevice physical, VkPhysical
     memory->memoryHeaps[0].size = FAKE_HEAP_MB << 20;
     memory->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
     memory->memoryHeaps[1].size = 2048ull << 20;
-    memory->memoryTypeCount = 2;
+    memory->memoryTypeCount = 3;
     memory->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     memory->memoryTypes[1].heapIndex = 1;
-    memory->memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    memory->memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    memory->memoryTypes[2].heapIndex = 1;
+    memory->memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 }
 
 static void VKAPI_CALL GetMemoryProperties2(VkPhysicalDevice physical, VkPhysicalDeviceMemoryProperties2* memory) {
@@ -227,6 +229,15 @@ static VkResult VKAPI_CALL CreateImage(VkDevice d, const VkImageCreateInfo* i, c
     return VK_SUCCESS;
 }
 static void VKAPI_CALL DestroyImage(VkDevice d, VkImage i, const VkAllocationCallbacks* a) {
+}
+static void VKAPI_CALL GetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements* r) {
+    *r = (VkMemoryRequirements){512, 256, 0x7};
+}
+static VkResult VKAPI_CALL BindImageMemory(VkDevice d, VkImage i, VkDeviceMemory m, VkDeviceSize o) {
+    return VK_SUCCESS;
+}
+static VkResult VKAPI_CALL BindImageMemory2(VkDevice d, uint32_t n, const VkBindImageMemoryInfo* infos) {
+    return VK_SUCCESS;
 }
 static VkResult VKAPI_CALL CreateImageView(VkDevice d, const VkImageViewCreateInfo* i, const VkAllocationCallbacks* a, VkImageView* v) {
     *v = NEW(VkImageView);
@@ -427,7 +438,8 @@ static const struct {
     F("CreateComputePipelines", CreateComputePipelines), F("CreateGraphicsPipelines", CreateGraphicsPipelines),
     F("DestroyPipeline", DestroyPipeline), F("GetEventStatus", GetEventStatus),
     F("CreateShaderModule", CreateShaderModule), F("DestroyShaderModule", DestroyShaderModule), F("CreateImage", CreateImage),
-    F("DestroyImage", DestroyImage), F("CreateImageView", CreateImageView), F("DestroyImageView", DestroyImageView),
+    F("DestroyImage", DestroyImage), F("GetImageMemoryRequirements", GetImageMemoryRequirements), F("BindImageMemory", BindImageMemory),
+    F("BindImageMemory2", BindImageMemory2), F("CreateImageView", CreateImageView), F("DestroyImageView", DestroyImageView),
     F("CreateBuffer", CreateBuffer), F("DestroyBuffer", DestroyBuffer), F("BindBufferMemory", BindBufferMemory),
     F("AllocateMemory", AllocateMemory), F("FreeMemory", FreeMemory), F("MapMemory", MapMemory), F("UnmapMemory", UnmapMemory),
     F("AllocateCommandBuffers", AllocateCommandBuffers), F("FreeCommandBuffers", FreeCommandBuffers),
